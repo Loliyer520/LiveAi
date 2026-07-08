@@ -1,0 +1,75 @@
+# LiveAi Configuration Template
+# Copy this file to config.yaml and fill in your credentials
+
+napcat:
+  ws_url: "ws://localhost:3001/ws"
+  http_url: "http://localhost:8080"
+  http_access_token: "your_token_here"
+  self_id: 1234567890
+
+satangyun:
+  target_group_id: 750742812
+  auth_api_base: "https://auth.example.com"
+  admin_token: "your_admin_token"
+  notice_image_url: "https://example.com/notice.jpg"
+  normal_draw_url: "https://example.com/generate"
+  normal_draw_token: "your_draw_token"
+  welcome_model: "gpt-4o-mini"
+
+ai:
+  enabled: true
+  admin_qq: 123456789
+  default_chat_profile: "claude"
+
+  # Flash model (default)
+  model_base_url: "https://api.deepseek.com/anthropic"
+  api_key: "sk-your-deepseek-key"
+  model_name: "deepseek-v4-flash"
+  model_messages_path: "/v1/messages"
+
+  # Pro model
+  pro_model_base_url: "https://api.deepseek.com/anthropic"
+  pro_api_key: "sk-your-deepseek-key"
+  pro_model_name: "deepseek-v4-pro"
+  pro_model_messages_path: "/v1/messages"
+
+  # Claude model
+  claude_model_base_url: "https://api.anthropic.com/v1"
+  claude_api_key: "sk-your-claude-key"
+  claude_model_name: "claude-sonnet-4"
+  claude_model_messages_path: "/messages"
+
+  # Claude Opus model
+  claude_opus_model_base_url: "https://api.anthropic.com/v1"
+  claude_opus_api_key: "sk-your-claude-key"
+  claude_opus_model_name: "claude-opus-4"
+  claude_opus_model_messages_path: "/messages"
+
+  # Vision model
+  vision_base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+  vision_api_key: "sk-your-vision-key"
+  vision_model_name: "qwen3.5-flash"
+
+  # Storage and prompts
+  storage_path: "data/msgs/ai_state.json"
+  main_prompt_path: "data/prompt/main.txt"
+  staff_prompt_path: "data/prompt/staff.txt"
+  char_prompt_path: "data/prompt/char.txt"
+  dev_agent_prompt_path: "data/prompt/dev_agent.txt"
+
+  # Runtime
+  worker_count: 2
+  history_limit: 500
+
+  # Search (火星引擎)
+  search_api_key: "your_search_api_key"
+  search_base_url: "https://open.feedcoopapi.com/search_api/global_search"
+  search_doc_count: 5
+
+  # GitHub
+  github_api_token: "ghp_your_github_token"
+
+webui:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8765

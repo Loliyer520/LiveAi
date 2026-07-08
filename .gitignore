@@ -1,0 +1,34 @@
+# Configuration with secrets
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data and state
+data/msgs/
+data/res/*.log
+
+# Archives
+*.rar
+*.zip
+*.tar.gz
+
+# OS
+.DS_Store
+Thumbs.db

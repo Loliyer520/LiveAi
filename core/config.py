@@ -1,0 +1,148 @@
+from dataclasses import dataclass, field
+import os
+from pathlib import Path
+import yaml
+
+
+def _load_yaml_config() -> dict:
+    """Load configuration from config.yaml if it exists"""
+    config_path = Path(__file__).resolve().parent.parent / 'config.yaml'
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            print(f'[Config] Failed to load config.yaml: {e}')
+            return {}
+    return {}
+
+
+_yaml_config = _load_yaml_config()
+
+
+def _get(section: str, key: str, env_key: str, default: str) -> str:
+    """Get config value: YAML > ENV > default"""
+    yaml_value = _yaml_config.get(section, {}).get(key)
+    if yaml_value is not None:
+        return str(yaml_value)
+    return os.getenv(env_key, default)
+
+
+def _get_int(section: str, key: str, env_key: str, default: int) -> int:
+    """Get integer config value: YAML > ENV > default"""
+    yaml_value = _yaml_config.get(section, {}).get(key)
+    if yaml_value is not None:
+        return int(yaml_value)
+    return int(os.getenv(env_key, str(default)))
+
+
+def _get_bool(section: str, key: str, env_key: str, default: bool) -> bool:
+    """Get boolean config value: YAML > ENV > default"""
+    yaml_value = _yaml_config.get(section, {}).get(key)
+    if yaml_value is not None:
+        return bool(yaml_value)
+    return os.getenv(env_key, '1' if default else '0') == '1'
+
+
+@dataclass
+class NapcatConfig:
+    ws_url: str = _get('napcat', 'ws_url', 'BOT_WS_URL', 'ws://localhost:3001/ws')
+    http_url: str = _get('napcat', 'http_url', 'BOT_HTTP_URL', 'http://localhost:8080')
+    http_access_token: str = _get('napcat', 'http_access_token', 'BOT_HTTP_ACCESS_TOKEN', 'your_token_here')
+    self_id: int = _get_int('napcat', 'self_id', 'BOT_SELF_ID', 1234567890)
+
+
+@dataclass
+class SatangyunConfig:
+    target_group_id: int = _get_int('satangyun', 'target_group_id', 'SATANGYUN_GROUP_ID', 750742812)
+    auth_api_base: str = _get('satangyun', 'auth_api_base', 'SATANGYUN_AUTH_BASE', 'https://auth.example.com')
+    admin_token: str = _get('satangyun', 'admin_token', 'SATANGYUN_ADMIN_TOKEN', 'your_admin_token')
+    notice_image_url: str = _get('satangyun', 'notice_image_url', 'SATANGYUN_NOTICE_IMAGE', 'https://example.com/notice.jpg')
+    normal_draw_url: str = _get('satangyun', 'normal_draw_url', 'SATANGYUN_DRAW_URL', 'https://example.com/generate')
+    normal_draw_token: str = _get('satangyun', 'normal_draw_token', 'SATANGYUN_DRAW_TOKEN', 'your_draw_token')
+    welcome_model: str = _get('satangyun', 'welcome_model', 'SATANGYUN_WELCOME_MODEL', 'gpt-4o-mini')
+
+
+@dataclass
+class AIConfig:
+    enabled: bool = _get_bool('ai', 'enabled', 'AI_ENABLED', True)
+    admin_qq: int = _get_int('ai', 'admin_qq', 'AI_ADMIN_QQ', 123456789)
+    default_chat_profile: str = _get('ai', 'default_chat_profile', 'AI_DEFAULT_CHAT_PROFILE', 'claude')
+    model_base_url: str = _get('ai', 'model_base_url', 'AI_MODEL_BASE_URL', 'https://api.deepseek.com/anthropic')
+    api_key: str = _get('ai', 'api_key', 'AI_MODEL_API_KEY', 'sk-your-deepseek-key')
+    model_name: str = _get('ai', 'model_name', 'AI_MODEL_NAME', 'deepseek-v4-flash')
+    model_messages_path: str = _get('ai', 'model_messages_path', 'AI_MODEL_MESSAGES_PATH', '/v1/messages')
+    pro_model_base_url: str = _get('ai', 'pro_model_base_url', 'AI_PRO_MODEL_BASE_URL', 'https://api.deepseek.com/anthropic')
+    pro_api_key: str = _get('ai', 'pro_api_key', 'AI_PRO_MODEL_API_KEY', 'sk-your-deepseek-key')
+    pro_model_name: str = _get('ai', 'pro_model_name', 'AI_PRO_MODEL_NAME', 'deepseek-v4-pro')
+    pro_model_messages_path: str = _get('ai', 'pro_model_messages_path', 'AI_PRO_MODEL_MESSAGES_PATH', '/v1/messages')
+    claude_model_base_url: str = _get('ai', 'claude_model_base_url', 'AI_CLAUDE_MODEL_BASE_URL', 'https://api.anthropic.com/v1')
+    claude_api_key: str = _get('ai', 'claude_api_key', 'AI_CLAUDE_MODEL_API_KEY', 'sk-your-claude-key')
+    claude_model_name: str = _get('ai', 'claude_model_name', 'AI_CLAUDE_MODEL_NAME', 'claude-sonnet-4')
+    claude_model_messages_path: str = _get('ai', 'claude_model_messages_path', 'AI_CLAUDE_MODEL_MESSAGES_PATH', '/messages')
+    claude_opus_model_base_url: str = _get('ai', 'claude_opus_model_base_url', 'AI_CLAUDE_OPUS_MODEL_BASE_URL', 'https://api.anthropic.com/v1')
+    claude_opus_api_key: str = _get('ai', 'claude_opus_api_key', 'AI_CLAUDE_OPUS_MODEL_API_KEY', _get('ai', 'claude_api_key', 'AI_CLAUDE_MODEL_API_KEY', 'sk-your-claude-key'))
+    claude_opus_model_name: str = _get('ai', 'claude_opus_model_name', 'AI_CLAUDE_OPUS_MODEL_NAME', 'claude-opus-4')
+    claude_opus_model_messages_path: str = _get('ai', 'claude_opus_model_messages_path', 'AI_CLAUDE_OPUS_MODEL_MESSAGES_PATH', '/messages')
+    vision_base_url: str = _get('ai', 'vision_base_url', 'AI_VISION_BASE_URL', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1')
+    vision_api_key: str = _get('ai', 'vision_api_key', 'AI_VISION_API_KEY', 'sk-your-vision-key')
+    vision_model_name: str = _get('ai', 'vision_model_name', 'AI_VISION_MODEL_NAME', 'qwen3.5-flash')
+    storage_path: str = _get('ai', 'storage_path', 'AI_STORAGE_PATH', 'data/msgs/ai_state.json')
+    main_prompt_path: str = _get('ai', 'main_prompt_path', 'AI_MAIN_PROMPT_PATH', 'data/prompt/main.txt')
+    staff_prompt_path: str = _get('ai', 'staff_prompt_path', 'AI_STAFF_PROMPT_PATH', 'data/prompt/staff.txt')
+    char_prompt_path: str = _get('ai', 'char_prompt_path', 'AI_CHAR_PROMPT_PATH', 'data/prompt/char.txt')
+    worker_count: int = _get_int('ai', 'worker_count', 'AI_WORKER_COUNT', 2)
+    history_limit: int = _get_int('ai', 'history_limit', 'AI_HISTORY_LIMIT', 500)
+    search_api_key: str = _get('ai', 'search_api_key', 'AI_SEARCH_API_KEY', 'your_search_api_key')
+    search_base_url: str = _get('ai', 'search_base_url', 'AI_SEARCH_BASE_URL', 'https://open.feedcoopapi.com/search_api/global_search')
+    search_doc_count: int = _get_int('ai', 'search_doc_count', 'AI_SEARCH_DOC_COUNT', 5)
+    github_api_token: str = _get('ai', 'github_api_token', 'AI_GITHUB_API_TOKEN', 'ghp_your_github_token')
+    dev_agent_prompt_path: str = _get('ai', 'dev_agent_prompt_path', 'AI_DEV_AGENT_PROMPT_PATH', 'data/prompt/dev_agent.txt')
+
+
+@dataclass
+class WebUIConfig:
+    enabled: bool = _get_bool('webui', 'enabled', 'WEBUI_ENABLED', True)
+    host: str = _get('webui', 'host', 'WEBUI_HOST', '127.0.0.1')
+    port: int = _get_int('webui', 'port', 'WEBUI_PORT', 8765)
+
+
+@dataclass
+class AppConfig:
+    napcat: NapcatConfig = field(default_factory=NapcatConfig)
+    satangyun: SatangyunConfig = field(default_factory=SatangyunConfig)
+    ai: AIConfig = field(default_factory=AIConfig)
+    webui: WebUIConfig = field(default_factory=WebUIConfig)
+
+
+def save_config_to_yaml(updates: dict):
+    """Save configuration updates back to config.yaml"""
+    config_path = Path(__file__).resolve().parent.parent / 'config.yaml'
+
+    # Load existing config or start fresh
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f) or {}
+        except Exception:
+            config = {}
+    else:
+        config = {}
+
+    # Deep merge updates
+    for section, values in updates.items():
+        if section not in config:
+            config[section] = {}
+        if isinstance(values, dict):
+            config[section].update(values)
+        else:
+            config[section] = values
+
+    # Write back
+    try:
+        with open(config_path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        return True
+    except Exception as e:
+        print(f'[Config] Failed to save config.yaml: {e}')
+        return False
