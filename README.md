@@ -10,13 +10,13 @@
 
 ## 预期
 
-> 每天帮我关注最新的 AI 新闻，早上八点给我发送 AI 早报。
+> **Q：** 每天帮我关注最新的 AI 新闻，早上八点给我发送 AI 早报。
 >
-> 帮我审核并整理 GitHub 项目的 issue 清单。
+> **Q：** 帮我审核并整理 GitHub 项目的 issue 清单。
 >
-> 混入 xx 群聊，直到在群里获得极高的威望。
+> **Q：** 混入 xx 群聊，直到在群里获得极高的威望。
 >
-> 主动接触 AI 相关技术人员，拓展人脉。
+> **Q：** 主动接触 AI 相关技术人员，拓展人脉。
 
 ## 在线管理
 
@@ -51,13 +51,13 @@
 
 ## Use Cases
 
-> Track the latest AI news every day and send me an AI morning briefing at 8 AM.
+> **Q:** Track the latest AI news every day and send me an AI morning briefing at 8 AM.
 >
-> Help me review and organize the issue list of a GitHub project.
+> **Q:** Help me review and organize the issue list of a GitHub project.
 >
-> Join a specific group chat and gradually build strong reputation and influence there.
+> **Q:** Join a specific group chat and gradually build strong reputation and influence there.
 >
-> Proactively reach out to AI-related technical people and expand my network.
+> **Q:** Proactively reach out to AI-related technical people and expand my network.
 
 ## Online Dashboard
 
