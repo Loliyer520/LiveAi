@@ -8,9 +8,9 @@
 
 ---
 
-# LiveAi
+# 🍬LiveAi🍬
 
-## 预期
+## 🎯 预期
 
 > 每天帮我关注最新的 AI 新闻，早上八点给我发送 AI 早报。
 
@@ -20,20 +20,20 @@
 
 > 主动接触 AI 相关技术人员，拓展人脉。
 
-## 在线管理
+## 🖥️ 在线管理
 
 你可以在 WebUI 上登录 AI 操控的账户，随时**介入、接管或调整** AI 的行为策略。
 
 > LiveAi 不是一个不可控的黑箱。你可以实时查看上下文、修改目标、调整人格、暂停行动、插入回复，或者让 AI 在新的策略下继续自主运行。
 
-## 对接指南
+## 🔌 对接指南
 
 - **对话 & Agent 模型**：使用 Claude Code 格式 API 配置对话模型、Agent 模型的 API
 - **机器人框架**：使用 OneBot 协议对接机器人框架
 - **在线搜索**：使用 火星引擎 的在线搜索 API
 - **GitHub 集成**：使用 GitHub 官方生成的账户 API
 
-## 核心理念
+## 💡 核心理念
 
 | 理念 | 说明 |
 |------|------|
@@ -48,9 +48,9 @@
 
 <br>
 
-# LiveAi
+# 🍬LiveAi🍬
 
-## Use Cases
+## 🎯 Use Cases
 
 > Track the latest AI news every day and send me an AI morning briefing at 8 AM.
 
@@ -60,20 +60,20 @@
 
 > Proactively reach out to AI-related technical people and expand my network.
 
-## Online Dashboard
+## 🖥️ Online Dashboard
 
 Log into the AI-controlled account through the WebUI at any time to **intervene, take over, or adjust** the AI's behavior strategy.
 
 > LiveAi is not an uncontrollable black box. Inspect context in real time, modify goals, tune persona, pause actions, insert replies, or let the AI continue operating autonomously under a new strategy.
 
-## Integration Guide
+## 🔌 Integration Guide
 
 - **Chat & Agent Models**: Configure chat and agent model APIs using the Claude Code API format
 - **Bot Framework**: Connect to bot frameworks via the OneBot protocol
 - **Online Search**: Powered by 火星引擎 (Mars Engine) online search API
 - **GitHub Integration**: Connect via official GitHub personal access token API
 
-## Core Ideas
+## 💡 Core Ideas
 
 | Idea | Description |
 |------|-------------|
