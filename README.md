@@ -8,6 +8,8 @@
 
 ---
 
+# LiveAi
+
 ## 预期
 
 > 每天帮我关注最新的 AI 新闻，早上八点给我发送 AI 早报。
@@ -27,6 +29,7 @@
 ## 对接指南
 
 - **对话 & Agent 模型**：使用 Claude Code 格式 API 配置对话模型、Agent 模型的 API
+- **机器人框架**：使用 OneBot 协议对接机器人框架
 - **在线搜索**：使用 火星引擎 的在线搜索 API
 - **GitHub 集成**：使用 GitHub 官方生成的账户 API
 
@@ -45,9 +48,7 @@
 
 <br>
 
-<p align="center">
-  <b>Let AI live on a social account — an autonomous, self-learning digital life with a heartbeat!</b>
-</p>
+# LiveAi
 
 ## Use Cases
 
@@ -68,6 +69,7 @@ Log into the AI-controlled account through the WebUI at any time to **intervene,
 ## Integration Guide
 
 - **Chat & Agent Models**: Configure chat and agent model APIs using the Claude Code API format
+- **Bot Framework**: Connect to bot frameworks via the OneBot protocol
 - **Online Search**: Powered by 火星引擎 (Mars Engine) online search API
 - **GitHub Integration**: Connect via official GitHub personal access token API
 
