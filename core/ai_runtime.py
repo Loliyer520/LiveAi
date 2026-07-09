@@ -135,7 +135,7 @@ class AIOrchestrator:
                     continue
                 try:
                     ch = channels[int(ch_idx)]
-                except (IndexError, TypeError):
+                except (IndexError, TypeError, ValueError):
                     continue
                 model_name = str(m.get('model_name') or '').strip()
                 ch_name = str(ch.get('name') or f'渠道{int(ch_idx)+1}').strip()
