@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 from core.ai_repository import AIRepository
 from core.ai_runtime import AIOrchestrator
+from pack.console_logger import ok
 
 
 class WebUIService:
@@ -27,7 +28,7 @@ class WebUIService:
         self.httpd = ThreadingHTTPServer((self.host, self.port), handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
-        print(f'[WebUI] listening on http://{self.host}:{self.port}')
+        ok(f'WebUI 管理面板 → http://{self.host}:{self.port}')
 
     def _build_handler(self):
         service = self

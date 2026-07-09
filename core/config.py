@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 import yaml
 
+from pack.console_logger import warn
+
 
 def _load_yaml_config() -> dict:
     """Load configuration from config.yaml if it exists"""
@@ -12,7 +14,7 @@ def _load_yaml_config() -> dict:
             with open(config_path, 'r', encoding='utf-8') as f:
                 return yaml.safe_load(f) or {}
         except Exception as e:
-            print(f'[Config] Failed to load config.yaml: {e}')
+            warn(f'加载 config.yaml 失败: {e}')
             return {}
     return {}
 
@@ -149,5 +151,5 @@ def save_config_to_yaml(updates: dict):
             yaml.safe_dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
         return True
     except Exception as e:
-        print(f'[Config] Failed to save config.yaml: {e}')
+        warn(f'保存 config.yaml 失败: {e}')
         return False

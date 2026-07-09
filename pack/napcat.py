@@ -9,6 +9,7 @@ import requests
 import websocket
 
 from core.events import ChatMessage, GroupIncreaseEvent
+from pack.console_logger import ok, warn, error as log_error
 
 
 class NapcatBot:
@@ -60,14 +61,14 @@ class NapcatBot:
         with self._recent_self_sent_lock:
             return message_id in self._recent_self_sent_ids
 
-    def _on_error(self, ws, error):
-        print(f'[Napcat][error] {error}')
+    def _on_error(self, ws, err):
+        log_error(f'Napcat WebSocket 错误: {err}')
 
     def _on_close(self, ws, close_status_code, close_msg):
-        print('[Napcat] connection closed')
+        warn(f'Napcat 连接已关闭 (code={close_status_code})')
 
     def _on_open(self, ws):
-        print('[Napcat] connection opened')
+        ok('Napcat WebSocket 连接已建立')
 
     def _dispatch(self, handlers, payload):
         for handler in handlers:
