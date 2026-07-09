@@ -143,7 +143,7 @@ class AIOrchestrator:
                 'base_url': str(ch.get('base_url') or '').strip(),
                 'api_key': str(ch.get('api_key') or '').strip(),
                 'model_name': model_name,
-                'messages_path': '',
+                'messages_path': str(ch.get('messages_path') or '').strip(),
                 'label': label,
             }
         if not profiles:
@@ -152,7 +152,7 @@ class AIOrchestrator:
                     'base_url': str(ch.get('base_url') or '').strip(),
                     'api_key': str(ch.get('api_key') or '').strip(),
                     'model_name': '',
-                    'messages_path': '',
+                    'messages_path': str(ch.get('messages_path') or '').strip(),
                     'label': str(ch.get('name') or f'渠道{idx+1}').strip(),
                 }
         return profiles

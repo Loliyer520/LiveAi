@@ -1612,13 +1612,17 @@
               <label>API Key</label>
               <input type="password" value="${escapeHtml(ch.api_key || '')}" onchange="updateChannelField(${idx}, 'api_key', this.value)" placeholder="sk-...">
             </div>
+            <div class="channel-field">
+              <label>Messages Path <span style="color:var(--text-muted);font-size:11px;">（Anthropic兼容接口填 /v1/messages，其余留空）</span></label>
+              <input type="text" value="${escapeHtml(ch.messages_path || '')}" onchange="updateChannelField(${idx}, 'messages_path', this.value)" placeholder="/v1/messages">
+            </div>
           </div>
         </div>
       `).join('');
     }
 
     function addChannel() {
-      modelsConfig.channels.push({ name: '', base_url: '', api_key: '' });
+      modelsConfig.channels.push({ name: '', base_url: '', api_key: '', messages_path: '' });
       renderChannels();
     }
 
