@@ -128,26 +128,25 @@ class AIOrchestrator:
             return {}
         main_models = (data.get('main') or {}).get('models') or []
         profiles: dict = {}
-        if main_models:
-            for idx, m in enumerate(main_models):
-                ch_idx = m.get('channel')
-                if ch_idx is None:
-                    continue
-                try:
-                    ch = channels[int(ch_idx)]
-                except (IndexError, TypeError, ValueError):
-                    continue
-                model_name = str(m.get('model_name') or '').strip()
-                ch_name = str(ch.get('name') or f'渠道{int(ch_idx)+1}').strip()
-                label = f'{ch_name} / {model_name}' if model_name else ch_name
-                profiles[f'm{idx}'] = {
-                    'base_url': str(ch.get('base_url') or '').strip(),
-                    'api_key': str(ch.get('api_key') or '').strip(),
-                    'model_name': model_name,
-                    'messages_path': '',
-                    'label': label,
-                }
-        else:
+        for idx, m in enumerate(main_models):
+            ch_idx = m.get('channel')
+            if ch_idx is None or str(ch_idx).strip() == '':
+                continue
+            try:
+                ch = channels[int(ch_idx)]
+            except (IndexError, TypeError, ValueError):
+                continue
+            model_name = str(m.get('model_name') or '').strip()
+            ch_name = str(ch.get('name') or f'渠道{int(ch_idx)+1}').strip()
+            label = f'{ch_name} / {model_name}' if model_name else ch_name
+            profiles[f'm{idx}'] = {
+                'base_url': str(ch.get('base_url') or '').strip(),
+                'api_key': str(ch.get('api_key') or '').strip(),
+                'model_name': model_name,
+                'messages_path': '',
+                'label': label,
+            }
+        if not profiles:
             for idx, ch in enumerate(channels):
                 profiles[f'ch{idx}'] = {
                     'base_url': str(ch.get('base_url') or '').strip(),
