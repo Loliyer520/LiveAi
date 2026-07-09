@@ -564,7 +564,10 @@ class WebUIService:
             with open(config_file, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
 
-            return True, '模型配置已保存'
+            result = self.orchestrator.reload_models_config()
+            if result.get('loaded'):
+                return True, f"模型配置已保存，已热加载 {result['count']} 个模型"
+            return True, '模型配置已保存（无有效渠道或主模型，保持原有配置）'
         except Exception as e:
             return False, f'保存失败: {e}'
 
