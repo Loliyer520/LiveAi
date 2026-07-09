@@ -4,6 +4,7 @@ import os
 
 from pack.anthropic_chat_model import AnthropicChatModel
 from pack.github_service import GitHubService
+from pack.console_logger import error
 
 MAX_ITERATIONS = 20
 MAX_FILE_BYTES = 40_000
@@ -705,5 +706,5 @@ async def run_dev_agent(
             messages.append({'role': 'user', 'content': result_blocks})
         return '已达到最大工具调用轮数上限，任务可能未完全完成，建议拆分成更小的任务重新委托。'
     except Exception as exc:
-        print(f'[DevAgent] 执行异常 iter消息数={len(messages)} 错误={exc}')
+        error(f'[DevAgent] 执行异常 iter消息数={len(messages)} 错误={exc}')
         return f'Dev agent 执行异常: {exc}'
