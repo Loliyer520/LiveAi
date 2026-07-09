@@ -78,6 +78,8 @@ class WebUIService:
                     return self._write_json({'items': service.list_knowledge()})
                 if parsed.path == '/api/relations':
                     return self._write_json(service.get_relations())
+                if parsed.path == '/api/models_config':
+                    return self._write_json(service.get_models_config())
                 return self._write_json({'error': 'not found'}, status=404)
 
             def do_POST(self):
@@ -115,6 +117,9 @@ class WebUIService:
                         payload.get('action', ''),
                         payload,
                     )
+                    return self._write_json({'ok': ok, 'message': message}, status=200 if ok else 400)
+                if parsed.path == '/api/models_config':
+                    ok, message = service.update_models_config(payload)
                     return self._write_json({'ok': ok, 'message': message}, status=200 if ok else 400)
                 return self._write_json({'error': 'not found'}, status=404)
 
@@ -527,6 +532,41 @@ class WebUIService:
             return True, '已更新用户关系数据。'
 
         return False, '不支持的操作。'
+
+    def get_models_config(self) -> dict:
+        """获取模型配置"""
+        from core.config import AppConfig
+        config = AppConfig()
+
+        # Load existing models config from a JSON file if it exists
+        config_file = Path(__file__).resolve().parent.parent / 'data' / 'models_config.json'
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+
+        # Return default structure
+        return {
+            'channels': [],
+            'vision': {'strategy': 'random', 'models': []},
+            'main': {'strategy': 'random', 'models': []},
+            'tiered': {'strategy': 'random', 'models': []},
+        }
+
+    def update_models_config(self, payload: dict) -> tuple[bool, str]:
+        """更新模型配置"""
+        try:
+            config_file = Path(__file__).resolve().parent.parent / 'data' / 'models_config.json'
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+
+            return True, '模型配置已保存'
+        except Exception as e:
+            return False, f'保存失败: {e}'
 
     def _serialize_task(self, item: dict) -> dict:
         return {
