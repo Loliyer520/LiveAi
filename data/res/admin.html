@@ -196,7 +196,7 @@
     <div class="sidebar">
       <div class="sidebar-header">
         <div class="search-bar-container">
-          <input id="searchInput" placeholder="搜索" oninput="filterAgents()">
+          <input id="searchInput" placeholder="搜索" oninput="onSidebarSearch()">
           <div class="search-plus">+</div>
         </div>
         <select id="scopeFilter" onchange="filterAgents()" style="display:none;">
@@ -207,6 +207,9 @@
         </select>
       </div>
       <div class="contact-list" id="agentsList">
+        <div class="empty-state" style="font-size:14px;">加载中...</div>
+      </div>
+      <div class="contact-list" id="contactsSidebarList" style="display:none;">
         <div class="empty-state" style="font-size:14px;">加载中...</div>
       </div>
     </div>
@@ -253,25 +256,53 @@
       </div>
     </div>
 
-    <!-- Contacts View -->
-    <div class="chat-area" id="contactsView" style="display: none; overflow-y: auto;">
+    <!-- Contacts Edit Area -->
+    <div class="chat-area" id="contactsEditArea" style="display: none;">
       <div class="chat-header">
-        <div class="chat-header-title">联系人管理</div>
-        <div style="display:flex;gap:12px;">
-          <input id="contactsSearch" placeholder="搜索联系人..." oninput="filterContacts()" style="padding:6px 12px;border-radius:4px;border:1px solid var(--border);background:var(--bg-nav);color:var(--text-main);outline:none;font-size:12px;width:200px;">
-          <button class="btn btn-primary btn-sm" onclick="refreshContactsView()">刷新</button>
+        <div class="chat-header-title" id="contactsEditTitle">联系人资料</div>
+      </div>
+      <div id="contactsEditEmpty" style="flex:1;display:flex;align-items:center;justify-content:center;">
+        <div class="empty-state" style="text-align:center;">
+          <div style="margin-bottom:16px;"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg></div>
+          <div>从左侧选择联系人查看和编辑</div>
         </div>
       </div>
-      <div style="padding:16px 24px;display:flex;flex-direction:column;gap:16px;flex:1;overflow-y:auto;">
-        <!-- Scopes Section -->
+      <div id="contactsEditForm" style="display:none;padding:24px;overflow-y:auto;flex:1;">
         <div class="turn-section">
-          <div class="turn-section-title">群聊 & 私聊</div>
-          <div id="contactsScopeList">加载中...</div>
+          <div class="turn-section-title" id="contactsFormScopeTitle" style="display:none;">会话信息</div>
+          <div class="turn-section-title" id="contactsFormUserTitle" style="display:none;">用户信息</div>
+          <div style="display:flex;flex-direction:column;gap:12px;max-width:500px;">
+            <div id="contactsFormImpressionField" style="display:none;">
+              <label style="font-size:12px;color:var(--text-muted);">印象备注</label>
+              <input type="text" id="contactsFormImpression" placeholder="AI对此会话的印象" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-main);color:var(--text-main);font-size:13px;">
+            </div>
+            <div>
+              <label style="font-size:12px;color:var(--text-muted);">管理员备注</label>
+              <input type="text" id="contactsFormNote" placeholder="备注信息" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-main);color:var(--text-main);font-size:13px;">
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+              <div>
+                <label style="font-size:12px;color:var(--text-muted);">好感度 (-100~100)</label>
+                <input type="number" id="contactsFormAffinity" min="-100" max="100" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-main);color:var(--text-main);font-size:13px;">
+              </div>
+              <div id="contactsFormRelevanceField" style="display:none;">
+                <label style="font-size:12px;color:var(--text-muted);">关联度 (0~100)</label>
+                <input type="number" id="contactsFormRelevance" min="0" max="100" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-main);color:var(--text-main);font-size:13px;">
+              </div>
+              <div id="contactsFormTrustField" style="display:none;">
+                <label style="font-size:12px;color:var(--text-muted);">信任度 (-100~100)</label>
+                <input type="number" id="contactsFormTrust" min="-100" max="100" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-main);color:var(--text-main);font-size:13px;">
+              </div>
+            </div>
+            <div>
+              <button class="btn btn-primary" onclick="saveContactsForm()">保存</button>
+              <span id="contactsFormSaveMsg" style="font-size:12px;color:var(--text-muted);margin-left:8px;"></span>
+            </div>
+          </div>
         </div>
-        <!-- Users Section -->
-        <div class="turn-section">
-          <div class="turn-section-title">用户</div>
-          <div id="contactsUserList">加载中...</div>
+        <div class="turn-section" id="contactsFormMetaSection" style="display:none;">
+          <div class="turn-section-title">详细信息</div>
+          <div id="contactsFormMeta" style="font-size:12px;color:var(--text-muted);line-height:1.8;"></div>
         </div>
       </div>
     </div>
@@ -677,7 +708,7 @@
       // Switch to chat view
       switchMainView('chat');
 
-      document.getElementById('contactsView').style.display = 'none';
+      document.getElementById('contactsEditArea').style.display = 'none';
       document.getElementById('chatEmptyState').style.display = 'none';
       document.getElementById('chatArea').style.display = 'flex';
       document.getElementById('detailPanel').style.display = 'flex';
@@ -1175,8 +1206,19 @@
       }
     }
 
+    // ── Sidebar Search ──
+    function onSidebarSearch() {
+      if (currentMainView === 'contacts') {
+        filterContactsSidebar();
+      } else {
+        filterAgents();
+      }
+    }
+
     // ── Main View Switching ──
     let currentMainView = 'chat';
+    let allContactsData = null;
+    let selectedContact = null;
 
     function switchMainView(view) {
       currentMainView = view;
@@ -1185,8 +1227,20 @@
       navChat.classList.toggle('active', view === 'chat');
       navContacts.classList.toggle('active', view === 'contacts');
 
+      const searchInput = document.getElementById('searchInput');
+      const scopeFilter = document.getElementById('scopeFilter');
+      const agentsList = document.getElementById('agentsList');
+      const contactsSidebarList = document.getElementById('contactsSidebarList');
+
       if (view === 'chat') {
-        document.getElementById('contactsView').style.display = 'none';
+        scopeFilter.style.display = 'none';
+        agentsList.style.display = '';
+        contactsSidebarList.style.display = 'none';
+        searchInput.placeholder = '搜索';
+        searchInput.value = '';
+
+        document.getElementById('contactsEditArea').style.display = 'none';
+        document.getElementById('detailPanel').style.display = 'none';
         if (currentAgent) {
           document.getElementById('chatEmptyState').style.display = 'none';
           document.getElementById('chatArea').style.display = 'flex';
@@ -1194,169 +1248,214 @@
         } else {
           document.getElementById('chatEmptyState').style.display = 'flex';
           document.getElementById('chatArea').style.display = 'none';
-          document.getElementById('detailPanel').style.display = 'none';
         }
+        filterAgents();
       } else if (view === 'contacts') {
+        scopeFilter.style.display = 'none';
+        agentsList.style.display = 'none';
+        contactsSidebarList.style.display = '';
+        searchInput.placeholder = '搜索联系人';
+        searchInput.value = '';
+
         document.getElementById('chatArea').style.display = 'none';
         document.getElementById('chatEmptyState').style.display = 'none';
         document.getElementById('detailPanel').style.display = 'none';
-        document.getElementById('contactsView').style.display = 'flex';
-        refreshContactsView();
+        document.getElementById('contactsEditArea').style.display = 'flex';
+        resetContactsForm();
+        loadContactsSidebar();
       }
     }
 
-    // ── Contacts View Functions ──
-    let allContactsData = null;
-
-    async function refreshContactsView() {
-      const scopeListEl = document.getElementById('contactsScopeList');
-      const userListEl = document.getElementById('contactsUserList');
-      scopeListEl.innerHTML = '<div style="font-size:12px;color:var(--text-muted);">加载中...</div>';
-      userListEl.innerHTML = '<div style="font-size:12px;color:var(--text-muted);">加载中...</div>';
-
+    // ── Contacts Sidebar ──
+    async function loadContactsSidebar() {
+      const el = document.getElementById('contactsSidebarList');
+      el.innerHTML = '<div class="empty-state" style="font-size:14px;">加载中...</div>';
       try {
         const data = await fetchJson('/api/relations');
         allContactsData = data;
-        renderContactsList();
+        renderContactsSidebar();
       } catch (err) {
-        scopeListEl.textContent = '加载失败: ' + err.message;
-        userListEl.textContent = '加载失败: ' + err.message;
+        el.innerHTML = `<div class="empty-state" style="font-size:14px;">加载失败: ${err.message}</div>`;
       }
     }
 
-    function renderContactsList() {
+    function filterContactsSidebar() {
+      renderContactsSidebar();
+    }
+
+    function renderContactsSidebar() {
       if (!allContactsData) return;
-      const q = (document.getElementById('contactsSearch')?.value || '').toLowerCase();
-      renderContactsScopeSection(allContactsData.scopes || [], q);
-      renderContactsUserSection(allContactsData.users || [], q);
-    }
+      const el = document.getElementById('contactsSidebarList');
+      const q = (document.getElementById('searchInput')?.value || '').toLowerCase();
 
-    function filterContacts() {
-      renderContactsList();
-    }
+      const scopeItems = (allContactsData.scopes || []).map(s => ({
+        type: 'scope',
+        id: s.scope_id,
+        key: s.scope_key,
+        scope_type: s.scope_type,
+        name: s.display_name || `${s.scope_type === 'group' ? '群聊' : '私聊'} - ${s.scope_id}`,
+        preview: s.impression || '暂无印象',
+        updated_at: s.updated_at,
+      }));
 
-    function renderContactsScopeSection(items, q) {
-      const el = document.getElementById('contactsScopeList');
-      const filtered = q ? items.filter(i => {
-        const haystack = `${i.display_name} ${i.scope_id} ${i.impression}`.toLowerCase();
+      const userItems = (allContactsData.users || []).map(u => ({
+        type: 'user',
+        id: u.user_id,
+        key: u.user_id,
+        name: `QQ: ${u.user_id}`,
+        preview: (u.aliases || []).join(', ') || '暂无昵称',
+        updated_at: u.updated_at,
+      }));
+
+      const allItems = [...scopeItems, ...userItems];
+      const filtered = q ? allItems.filter(i => {
+        const haystack = `${i.name} ${i.preview}`.toLowerCase();
         return haystack.includes(q);
-      }) : items;
+      }) : allItems;
 
       if (!filtered.length) {
-        el.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:8px;">无匹配结果</div>';
+        el.innerHTML = '<div class="empty-state" style="font-size:14px;">无匹配联系人</div>';
         return;
       }
 
-      el.innerHTML = filtered.map(item => `
-        <div class="note-item" style="margin-bottom:12px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-panel);">
-          <div style="font-weight:600;margin-bottom:4px;font-size:14px;">${item.display_name ? escapeHtml(item.display_name) : `${item.scope_type === 'group' ? '群聊' : '私聊'} - ${escapeHtml(item.scope_id)}`}</div>
-          <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">消息: ${item.message_count} | 更新: ${item.updated_at}</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px;">
-            <div>
-              <label style="font-size:11px;color:var(--text-muted);">印象/印象备注</label>
-              <input type="text" id="cs_imp_${item.scope_key}" value="${escapeHtml(item.impression || '')}" placeholder="AI对此会话的印象" style="width:100%;padding:5px;border:1px solid var(--border);border-radius:4px;background:var(--bg-main);color:var(--text-main);font-size:12px;">
-            </div>
-            <div>
-              <label style="font-size:11px;color:var(--text-muted);">管理员备注</label>
-              <input type="text" id="cs_note_${item.scope_key}" value="${escapeHtml(item.admin_note || '')}" placeholder="例如：主要活跃群" style="width:100%;padding:5px;border:1px solid var(--border);border-radius:4px;background:var(--bg-main);color:var(--text-main);font-size:12px;">
-            </div>
-            <div>
-              <label style="font-size:11px;color:var(--text-muted);">好感度 (-100~100)</label>
-              <input type="number" id="cs_aff_${item.scope_key}" value="${item.affinity ?? 0}" min="-100" max="100" style="width:100%;padding:5px;border:1px solid var(--border);border-radius:4px;background:var(--bg-main);color:var(--text-main);font-size:12px;">
-            </div>
-            <div>
-              <label style="font-size:11px;color:var(--text-muted);">关联度 (0~100)</label>
-              <input type="number" id="cs_rel_${item.scope_key}" value="${item.relevance ?? 50}" min="0" max="100" style="width:100%;padding:5px;border:1px solid var(--border);border-radius:4px;background:var(--bg-main);color:var(--text-main);font-size:12px;">
+      el.innerHTML = filtered.map(item => {
+        const isActive = selectedContact && selectedContact.type === item.type && selectedContact.key === item.key;
+        const avatarStr = item.type === 'scope' ? (item.scope_type === 'group' ? '群' : '私') : '用';
+        const bg = getAvatarColor(item.id);
+
+        return `
+          <div class="contact-item ${isActive ? 'active' : ''}" onclick="selectContact('${item.type}', '${escapeHtml(item.id)}', '${escapeHtml(item.key)}', '${item.type === 'scope' ? escapeHtml(item.scope_type || '') : ''}')">
+            <div class="avatar" style="background: ${bg}">${avatarStr}</div>
+            <div class="contact-info">
+              <div class="contact-name-row">
+                <div class="contact-name">${escapeHtml(item.name)}</div>
+                <div class="contact-time">${(item.updated_at || '').split(' ')[0]}</div>
+              </div>
+              <div class="contact-preview">${escapeHtml(item.preview)}</div>
             </div>
           </div>
-          <button class="btn" onclick="saveContactsScope('${item.scope_type}', '${escapeHtml(item.scope_id)}', '${item.scope_key}')">保存</button>
-        </div>
-      `).join('');
+        `;
+      }).join('');
     }
 
-    function renderContactsUserSection(items, q) {
-      const el = document.getElementById('contactsUserList');
-      const filtered = q ? items.filter(i => {
-        const haystack = `${i.user_id} ${i.aliases.join(' ')} ${i.admin_note}`.toLowerCase();
-        return haystack.includes(q);
-      }) : items;
+    // ── Contacts Edit Form ──
+    function selectContact(type, id, key, scopeType) {
+      if (!allContactsData) return;
 
-      if (!filtered.length) {
-        el.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:8px;">无匹配结果</div>';
-        return;
+      let data;
+      if (type === 'scope') {
+        data = (allContactsData.scopes || []).find(s => s.scope_key === key);
+      } else {
+        data = (allContactsData.users || []).find(u => u.user_id === key);
       }
+      if (!data) return;
 
-      el.innerHTML = filtered.map(item => `
-        <div class="note-item" style="margin-bottom:12px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-panel);">
-          <div style="font-weight:600;margin-bottom:4px;font-size:14px;">QQ: ${escapeHtml(item.user_id)}</div>
-          <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">昵称: ${(item.aliases || []).join(', ') || '无'} | Facts: ${item.fact_count || 0} | 更新: ${item.updated_at}</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px;">
-            <div>
-              <label style="font-size:11px;color:var(--text-muted);">好感度 (-100~100)</label>
-              <input type="number" id="cu_aff_${item.user_id}" value="${item.affinity ?? 0}" min="-100" max="100" style="width:100%;padding:5px;border:1px solid var(--border);border-radius:4px;background:var(--bg-main);color:var(--text-main);font-size:12px;">
-            </div>
-            <div>
-              <label style="font-size:11px;color:var(--text-muted);">信任度 (-100~100)</label>
-              <input type="number" id="cu_tr_${item.user_id}" value="${item.trust ?? 0}" min="-100" max="100" style="width:100%;padding:5px;border:1px solid var(--border);border-radius:4px;background:var(--bg-main);color:var(--text-main);font-size:12px;">
-            </div>
-            <div style="grid-column: 1 / -1;">
-              <label style="font-size:11px;color:var(--text-muted);">管理员备注</label>
-              <input type="text" id="cu_note_${item.user_id}" value="${escapeHtml(item.admin_note || '')}" placeholder="例如：王者荣耀的朋友" style="width:100%;padding:5px;border:1px solid var(--border);border-radius:4px;background:var(--bg-main);color:var(--text-main);font-size:12px;">
-            </div>
-          </div>
-          <button class="btn" onclick="saveContactsUser('${escapeHtml(item.user_id)}')">保存</button>
-        </div>
-      `).join('');
-    }
+      selectedContact = { type, id, key, scope_type: scopeType, data };
+      renderContactsSidebar();
 
-    async function saveContactsScope(scopeType, scopeId, scopeKey) {
-      const impression = document.getElementById(`cs_imp_${scopeKey}`).value.trim();
-      const affinity = parseFloat(document.getElementById(`cs_aff_${scopeKey}`).value);
-      const relevance = parseFloat(document.getElementById(`cs_rel_${scopeKey}`).value);
-      const adminNote = document.getElementById(`cs_note_${scopeKey}`).value.trim();
+      document.getElementById('contactsEditEmpty').style.display = 'none';
+      document.getElementById('contactsEditForm').style.display = '';
 
-      try {
-        await fetchJson('/api/relations', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({
-            action: 'update_scope',
-            scope_type: scopeType,
-            scope_id: scopeId,
-            impression: impression || undefined,
-            affinity: isNaN(affinity) ? undefined : affinity,
-            relevance: isNaN(relevance) ? undefined : relevance,
-            admin_note: adminNote || undefined,
-          }),
-        });
-        alert('保存成功');
-        await refreshContactsView();
-      } catch (err) {
-        alert('保存失败: ' + err.message);
+      const isScope = type === 'scope';
+      document.getElementById('contactsFormScopeTitle').style.display = isScope ? '' : 'none';
+      document.getElementById('contactsFormUserTitle').style.display = isScope ? 'none' : '';
+      document.getElementById('contactsFormImpressionField').style.display = isScope ? '' : 'none';
+      document.getElementById('contactsFormRelevanceField').style.display = isScope ? '' : 'none';
+      document.getElementById('contactsFormTrustField').style.display = isScope ? 'none' : '';
+      document.getElementById('contactsFormMetaSection').style.display = '';
+
+      document.getElementById('contactsEditTitle').textContent = isScope
+        ? (data.display_name || `${data.scope_type === 'group' ? '群聊' : '私聊'} - ${data.scope_id}`)
+        : `QQ: ${data.user_id}`;
+
+      document.getElementById('contactsFormImpression').value = data.impression || '';
+      document.getElementById('contactsFormNote').value = data.admin_note || '';
+      document.getElementById('contactsFormAffinity').value = data.affinity ?? 0;
+      if (isScope) {
+        document.getElementById('contactsFormRelevance').value = data.relevance ?? 50;
+      } else {
+        document.getElementById('contactsFormTrust').value = data.trust ?? 0;
+      }
+      document.getElementById('contactsFormSaveMsg').textContent = '';
+
+      // Meta info
+      const metaEl = document.getElementById('contactsFormMeta');
+      if (isScope) {
+        metaEl.innerHTML = `
+          类型: ${data.scope_type === 'group' ? '群聊' : '私聊'} &nbsp;|&nbsp;
+          ID: ${escapeHtml(data.scope_id)} &nbsp;|&nbsp;
+          消息数: ${data.message_count || 0} &nbsp;|&nbsp;
+          更新: ${data.updated_at || '-'}
+        `;
+      } else {
+        metaEl.innerHTML = `
+          用户ID: ${escapeHtml(data.user_id)} &nbsp;|&nbsp;
+          昵称: ${(data.aliases || []).join(', ') || '无'} &nbsp;|&nbsp;
+          Facts: ${data.fact_count || 0} &nbsp;|&nbsp;
+          更新: ${data.updated_at || '-'}
+        `;
       }
     }
 
-    async function saveContactsUser(userId) {
-      const affinity = parseFloat(document.getElementById(`cu_aff_${userId}`).value);
-      const trust = parseFloat(document.getElementById(`cu_tr_${userId}`).value);
-      const adminNote = document.getElementById(`cu_note_${userId}`).value.trim();
+    function resetContactsForm() {
+      selectedContact = null;
+      document.getElementById('contactsEditEmpty').style.display = 'flex';
+      document.getElementById('contactsEditForm').style.display = 'none';
+      document.getElementById('contactsFormMetaSection').style.display = 'none';
+      document.getElementById('contactsEditTitle').textContent = '联系人资料';
+    }
+
+    async function saveContactsForm() {
+      if (!selectedContact) return;
+      const msgEl = document.getElementById('contactsFormSaveMsg');
+      msgEl.textContent = '保存中...';
+
+      const affinity = parseFloat(document.getElementById('contactsFormAffinity').value);
+      const adminNote = document.getElementById('contactsFormNote').value.trim();
 
       try {
-        await fetchJson('/api/relations', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({
-            action: 'update_user',
-            user_id: userId,
-            affinity: isNaN(affinity) ? undefined : affinity,
-            trust: isNaN(trust) ? undefined : trust,
-            admin_note: adminNote || undefined,
-          }),
-        });
-        alert('保存成功');
-        await refreshContactsView();
+        if (selectedContact.type === 'scope') {
+          const impression = document.getElementById('contactsFormImpression').value.trim();
+          const relevance = parseFloat(document.getElementById('contactsFormRelevance').value);
+
+          await fetchJson('/api/relations', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              action: 'update_scope',
+              scope_type: selectedContact.scope_type,
+              scope_id: selectedContact.id,
+              impression: impression || undefined,
+              affinity: isNaN(affinity) ? undefined : affinity,
+              relevance: isNaN(relevance) ? undefined : relevance,
+              admin_note: adminNote || undefined,
+            }),
+          });
+        } else {
+          const trust = parseFloat(document.getElementById('contactsFormTrust').value);
+
+          await fetchJson('/api/relations', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              action: 'update_user',
+              user_id: selectedContact.id,
+              affinity: isNaN(affinity) ? undefined : affinity,
+              trust: isNaN(trust) ? undefined : trust,
+              admin_note: adminNote || undefined,
+            }),
+          });
+        }
+
+        msgEl.textContent = '已保存';
+        // Refresh data and sidebar
+        await loadContactsSidebar();
+        // Re-select to keep form in sync
+        if (selectedContact) {
+          selectContact(selectedContact.type, selectedContact.id, selectedContact.key, selectedContact.scope_type);
+        }
       } catch (err) {
-        alert('保存失败: ' + err.message);
+        msgEl.textContent = '保存失败: ' + err.message;
       }
     }
 
