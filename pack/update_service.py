@@ -116,6 +116,26 @@ class UpdateService:
             })
         return result
 
+    def check_now_sync(self) -> dict:
+        """同步版本检查，供启动时使用。返回 {current, latest, has_update, ...} 或空。"""
+        self._current_commit = self._get_local_commit()
+        current = self._current_commit
+        latest_data = self._github_get_json(f'/repos/{self.repo_owner}/{self.repo_name}/commits/main')
+        result = {
+            'current_version': current[:7] if current else 'unknown',
+        }
+        if latest_data:
+            latest_sha = latest_data.get('sha', '')
+            result.update({
+                'latest_version': latest_sha[:7] if latest_sha else '?',
+                'latest_message': (latest_data.get('commit') or {}).get('message', ''),
+                'has_update': bool(current and latest_sha and current != latest_sha),
+            })
+        else:
+            result['latest_version'] = '?'
+            result['has_update'] = False
+        return result
+
     async def execute_update(self) -> dict:
         return await self._to_thread(self._execute_update_sync)
 
