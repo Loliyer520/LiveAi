@@ -23,6 +23,7 @@ ENV/
 # Data and state
 data/msgs/
 data/res/*.log
+data/github_update_workflow.md
 
 # Archives
 *.rar
