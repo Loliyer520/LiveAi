@@ -104,6 +104,70 @@ class AIOrchestrator:
         self._active_chat_profile = default_profile if default_profile in self._chat_profiles else 'claude'
         self._chat_profile_defaults = copy.deepcopy(self._chat_profiles)
         self._apply_profile_overrides()
+        _mc = self._build_profiles_from_models_config()
+        if _mc:
+            self._chat_profiles = _mc
+            self._chat_profile_defaults = copy.deepcopy(_mc)
+            if self._active_chat_profile not in self._chat_profiles:
+                self._active_chat_profile = next(iter(self._chat_profiles))
+
+    def _build_profiles_from_models_config(self) -> dict:
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'data', 'models_config.json',
+        )
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            return {}
+        channels = data.get('channels') or []
+        if not channels:
+            return {}
+        main_models = (data.get('main') or {}).get('models') or []
+        profiles: dict = {}
+        if main_models:
+            for idx, m in enumerate(main_models):
+                ch_idx = m.get('channel')
+                if ch_idx is None:
+                    continue
+                try:
+                    ch = channels[int(ch_idx)]
+                except (IndexError, TypeError):
+                    continue
+                model_name = str(m.get('model_name') or '').strip()
+                ch_name = str(ch.get('name') or f'渠道{int(ch_idx)+1}').strip()
+                label = f'{ch_name} / {model_name}' if model_name else ch_name
+                profiles[f'm{idx}'] = {
+                    'base_url': str(ch.get('base_url') or '').strip(),
+                    'api_key': str(ch.get('api_key') or '').strip(),
+                    'model_name': model_name,
+                    'messages_path': '',
+                    'label': label,
+                }
+        else:
+            for idx, ch in enumerate(channels):
+                profiles[f'ch{idx}'] = {
+                    'base_url': str(ch.get('base_url') or '').strip(),
+                    'api_key': str(ch.get('api_key') or '').strip(),
+                    'model_name': '',
+                    'messages_path': '',
+                    'label': str(ch.get('name') or f'渠道{idx+1}').strip(),
+                }
+        return profiles
+
+    def reload_models_config(self) -> dict:
+        profiles = self._build_profiles_from_models_config()
+        if not profiles:
+            return {'loaded': False, 'message': 'models_config.json 无有效渠道，保持原有配置'}
+        self._chat_profiles = profiles
+        self._chat_profile_defaults = copy.deepcopy(profiles)
+        if self._active_chat_profile not in self._chat_profiles:
+            self._active_chat_profile = next(iter(self._chat_profiles))
+        info(f'[AI] models_config.json 已热加载，共 {len(profiles)} 个模型')
+        return {'loaded': True, 'count': len(profiles), 'profiles': list(profiles.keys())}
 
     def start(self):
         if self.thread:
@@ -225,10 +289,12 @@ class AIOrchestrator:
     def switch_model_profile(self, requested: str) -> tuple[bool, str]:
         requested = self._normalize_model_profile(requested)
         if requested not in self._chat_profiles:
-            return False, '可用模型: flash / pro(ds) / claude / opus'
+            available = ' / '.join(self._chat_profiles.keys())
+            return False, f'可用模型: {available}'
         self._active_chat_profile = requested
         profile = self._chat_profiles[requested]
-        return True, f"已切到 {requested}，当前走 {profile['model_name']}"
+        label = profile.get('label') or profile['model_name']
+        return True, f"已切到 {requested} ({label})"
 
     def _profile_override_key(self, name: str) -> str:
         return f'model_profile_override_{name}'
@@ -499,16 +565,17 @@ class AIOrchestrator:
         parts = cleaned.split()
         if len(parts) == 1:
             profile = self._chat_profiles[self._active_chat_profile]
-            self.bot.send_text(
-                message.chat_type,
-                message.chat_id,
-                f"当前模型: {self._active_chat_profile} -> {profile['model_name']}",
-            )
+            lines = [f"当前: {self._active_chat_profile} → {profile.get('label') or profile['model_name']}\n\n可用模型:"]
+            for name, p in self._chat_profiles.items():
+                marker = '▶' if name == self._active_chat_profile else '  '
+                lines.append(f"  {marker} {name}: {p.get('label') or p['model_name']}")
+            self.bot.send_text(message.chat_type, message.chat_id, '\n'.join(lines))
             return
 
         requested = self._normalize_model_profile(parts[1])
         if requested not in self._chat_profiles:
-            self.bot.send_text(message.chat_type, message.chat_id, '可用模型: flash / pro(ds) / claude / opus')
+            available = ' / '.join(self._chat_profiles.keys())
+            self.bot.send_text(message.chat_type, message.chat_id, f'可用模型: {available}')
             return
 
         self._active_chat_profile = requested
@@ -516,7 +583,7 @@ class AIOrchestrator:
         self.bot.send_text(
             message.chat_type,
             message.chat_id,
-            f"已切到 {requested}，当前走 {profile['model_name']}",
+            f"已切到 {requested} ({profile.get('label') or profile['model_name']})",
         )
 
     def _is_admin_message(self, message: ChatMessage) -> bool:
