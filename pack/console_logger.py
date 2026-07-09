@@ -30,26 +30,33 @@ if sys.platform == 'win32':
         pass
 
 
+def _ts() -> str:
+    return datetime.now().strftime('%H:%M:%S')
+
+
+def _prefix(icon: str, color: str) -> str:
+    return f"  {_s(_ts(), 'gray')}  {_s(icon, color)}"
+
+
 def info(msg: str):
-    _w(msg)
+    _w(f"  {_s(_ts(), 'gray')}  {msg}")
 
 
 def ok(msg: str):
-    _w(f"  {_s('✓', 'green')}  {msg}")
+    _w(f"{_prefix('✓', 'green')}  {msg}")
 
 
 def warn(msg: str):
-    _w(f"  {_s('⚠', 'yellow')}  {_D}{msg}{_R}")
+    _w(f"{_prefix('⚠', 'yellow')}  {_D}{msg}{_R}")
 
 
 def error(msg: str):
-    ts = datetime.now().strftime('%H:%M:%S')
-    _w(f"  {_s('✘', 'red')}  {msg}  {_s(ts, 'gray')}")
+    _w(f"{_prefix('✘', 'red')}  {msg}")
 
 
 def debug(msg: str):
     if os.getenv('DEBUG'):
-        _w(f"  {_s('·', 'gray')}  {_D}{msg}{_R}")
+        _w(f"{_prefix('·', 'gray')}  {_D}{msg}{_R}")
 
 
 def section(title: str):

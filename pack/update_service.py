@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import threading
+from pack.console_logger import error
 import time
 import urllib.request
 from typing import Optional
@@ -54,7 +55,7 @@ class UpdateService:
             with urllib.request.urlopen(request, timeout=30) as response:
                 return json.loads(response.read().decode('utf-8'))
         except Exception as e:
-            print(f'[UpdateService] GitHub 请求失败: {e}')
+            error(f'[UpdateService] GitHub 请求失败: {e}')
             return None
 
     async def get_latest_commit(self) -> Optional[dict]:
