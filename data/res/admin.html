@@ -1294,7 +1294,10 @@
         key: s.scope_key,
         scope_type: s.scope_type,
         name: s.display_name || `${s.scope_type === 'group' ? '群聊' : '私聊'} - ${s.scope_id}`,
-        preview: s.impression || '暂无印象',
+        preview: `对话 ${s.message_count || 0} 次 · 好感 ${s.affinity ?? 0}`,
+        avatar_url: s.scope_type === 'group'
+          ? `http://p.qlogo.cn/gh/${s.scope_id}/${s.scope_id}/100/`
+          : `http://q2.qlogo.cn/headimg_dl?dst_uin=${s.scope_id}&spec=100`,
         updated_at: s.updated_at,
       }));
 
@@ -1302,8 +1305,9 @@
         type: 'user',
         id: u.user_id,
         key: u.user_id,
-        name: `QQ: ${u.user_id}`,
-        preview: (u.aliases || []).join(', ') || '暂无昵称',
+        name: (u.aliases || []).join(', ') || `用户${u.user_id.slice(-4)}`,
+        preview: `Facts ${u.fact_count || 0} · 好感 ${u.affinity ?? 0}`,
+        avatar_url: `http://q2.qlogo.cn/headimg_dl?dst_uin=${u.user_id}&spec=100`,
         updated_at: u.updated_at,
       }));
 
@@ -1320,12 +1324,12 @@
 
       el.innerHTML = filtered.map(item => {
         const isActive = selectedContact && selectedContact.type === item.type && selectedContact.key === item.key;
-        const avatarStr = item.type === 'scope' ? (item.scope_type === 'group' ? '群' : '私') : '用';
         const bg = getAvatarColor(item.id);
+        const fallback = item.type === 'scope' ? (item.scope_type === 'group' ? '群' : '私') : '用';
 
         return `
           <div class="contact-item ${isActive ? 'active' : ''}" onclick="selectContact('${item.type}', '${escapeHtml(item.id)}', '${escapeHtml(item.key)}', '${item.type === 'scope' ? escapeHtml(item.scope_type || '') : ''}')">
-            <div class="avatar" style="background: ${bg}">${avatarStr}</div>
+            <img src="${item.avatar_url}" class="avatar" style="object-fit: cover; background: ${bg};" loading="lazy" onerror="this.outerHTML='<div class=\\'avatar\\' style=\\'background: ${bg}\\'>${fallback}</div>'">
             <div class="contact-info">
               <div class="contact-name-row">
                 <div class="contact-name">${escapeHtml(item.name)}</div>
