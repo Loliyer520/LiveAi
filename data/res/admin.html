@@ -408,8 +408,6 @@
             <button class="btn" onclick="saveAutoUpdateSettings()">保存</button>
           </div>
         </div>
-        <div class="turn-section-title" style="margin-top:16px;">AI 模型接口</div>
-        <div id="modelProfilesList">加载中...</div>
       </div>
     </div>
   </div>
@@ -982,38 +980,10 @@
         document.getElementById('updateRepoOwnerInput').value = data.update_repo_owner || 'Loliyer520';
         document.getElementById('updateRepoNameInput').value = data.update_repo_name || 'LiveAi';
 
-        renderModelProfiles(data.model_profiles || []);
       } catch (err) {
         document.getElementById('searchKeyStatus').textContent = '加载失败: ' + err.message;
         document.getElementById('githubTokenStatus').textContent = '加载失败: ' + err.message;
-        document.getElementById('modelProfilesList').textContent = '加载失败: ' + err.message;
       }
-    }
-
-    function renderModelProfiles(profiles) {
-      const container = document.getElementById('modelProfilesList');
-      if (!profiles.length) {
-        container.innerHTML = '<div style="font-size:12px;color:var(--text-muted);">暂无模型档位</div>';
-        return;
-      }
-      container.innerHTML = profiles.map(p => {
-        const overridden = new Set(p.overridden_fields || []);
-        const mark = (field) => overridden.has(field) ? ' (已自定义)' : '';
-        return `
-        <div class="turn-section" style="margin-top:8px;">
-          <div class="turn-section-title">${escapeHtml(p.label)} ${p.active ? '<span style="color:var(--accent);font-size:12px;">[当前使用]</span>' : ''}</div>
-          <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">API Key: ${p.api_key_set ? escapeHtml(p.api_key_masked) : '未配置'}</div>
-          <div style="display:flex;flex-direction:column;gap:6px;">
-            <input id="profile_${p.name}_base_url" type="text" placeholder="Base URL${mark('base_url')}" value="${escapeHtml(p.base_url || '')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-main);color:var(--text-main);font-family:inherit;">
-            <input id="profile_${p.name}_model_name" type="text" placeholder="Model Name${mark('model_name')}" value="${escapeHtml(p.model_name || '')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-main);color:var(--text-main);font-family:inherit;">
-            <input id="profile_${p.name}_messages_path" type="text" placeholder="Messages Path (可留空)${mark('messages_path')}" value="${escapeHtml(p.messages_path || '')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-main);color:var(--text-main);font-family:inherit;">
-            <input id="profile_${p.name}_api_key" type="text" placeholder="输入新的 API Key，留空则不修改${mark('api_key')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-main);color:var(--text-main);font-family:inherit;">
-          </div>
-          <div class="flex-row">
-            <button class="btn" onclick="saveModelProfile('${p.name}')">保存</button>
-          </div>
-        </div>`;
-      }).join('');
     }
 
     function closeSettingsModal(event) {
@@ -1093,26 +1063,6 @@
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ update_repo_owner: body.update_repo_owner, update_repo_name: body.update_repo_name }),
-        });
-        alert(data.message);
-        await openSettingsModal();
-      } catch (err) {
-        alert('保存失败: ' + err.message);
-      }
-    }
-
-    async function saveModelProfile(name) {
-      const base_url = document.getElementById(`profile_${name}_base_url`).value;
-      const model_name = document.getElementById(`profile_${name}_model_name`).value;
-      const messages_path = document.getElementById(`profile_${name}_messages_path`).value;
-      const api_key = document.getElementById(`profile_${name}_api_key`).value;
-      const body = { model_profile: name, base_url, model_name, messages_path };
-      if (api_key) body.api_key = api_key;
-      try {
-        const data = await fetchJson('/api/settings', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(body),
         });
         alert(data.message);
         await openSettingsModal();
