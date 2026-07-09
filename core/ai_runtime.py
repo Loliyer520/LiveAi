@@ -14,6 +14,7 @@ from pack.anthropic_chat_model import AnthropicChatModel, AnthropicReply
 from pack.search_service import DoubaoSearchService
 from pack.vision_model import OpenAICompatibleVisionModel
 from pack.update_service import UpdateService
+from pack.console_logger import info, warn, error, debug
 from core.ai_repository import AIRepository
 from core.ai_tools_schema import LOOP_TOOL_NAMES, build_tools
 from core.config import AIConfig
@@ -425,7 +426,7 @@ class AIOrchestrator:
         item.setdefault('deferred_count', 0)
         item.setdefault('trigger_messages', [])
         if scope_key in self._active_scope_turns:
-            print(f'[AI][reserve] scope busy, deferring: {scope_key}')
+            info(f'[AI][reserve] scope busy, deferring: {scope_key}')
             pending = self._pending_scope_turns.get(scope_key)
             if pending:
                 pending['message'] = item['message']
@@ -542,7 +543,7 @@ class AIOrchestrator:
         command = str(cleaned or '').strip().lower()
         if command == '/stop':
             self._cancel_active_requests()
-            print('[AI] /stop requested, exiting process immediately')
+            warn('[AI] /stop requested, exiting process immediately')
             os._exit(0)
 
         if command == '/on':
@@ -595,7 +596,7 @@ class AIOrchestrator:
                 temperature,
             )
         except Exception as exc:
-            print(
+            error(
                 '[AI][model] request failed '
                 f"profile={self._active_chat_profile} "
                 f"model={profile['model_name']} "
@@ -815,9 +816,9 @@ class AIOrchestrator:
         scope_key = self._scope_key(scope_type, scope_id)
         if scope_key in self._active_scope_turns:
             self._pending_self_interrupts.setdefault(scope_key, []).append(entry)
-            print(f'[AI][self_message] mid-turn interrupt scope={scope_key} text={text[:40]}')
+            info(f'[AI][self_message] mid-turn interrupt scope={scope_key} text={text[:40]}')
         else:
-            print(f'[AI][self_message] recorded scope={scope_key} text={text[:40]}')
+            info(f'[AI][self_message] recorded scope={scope_key} text={text[:40]}')
 
     async def _worker(self):
         while True:
@@ -831,7 +832,7 @@ class AIOrchestrator:
                 elif kind == 'task':
                     await self._process_task(item)
             except Exception as exc:
-                print(f'[AI][worker] {exc}')
+                error(f'[AI][worker] {exc}')
             finally:
                 self.queue.task_done()
 
@@ -1052,7 +1053,7 @@ class AIOrchestrator:
             if name:
                 self.repo.update_agent_display_name(scope_type, scope_id, name)
         except Exception as exc:
-            print(f'[AI][display_name] resolve failed scope={key} error={exc}')
+            warn(f'[AI][display_name] resolve failed scope={key} error={exc}')
 
     def _should_trigger(self, message: ChatMessage, cleaned: str, agent) -> bool:
         if message.chat_type == 'private':
@@ -1060,14 +1061,14 @@ class AIOrchestrator:
                 return False
             return True
         if message.mentions_self:
-            print(f'[AI][trigger] mentions_self=True scope={message.chat_type}:{message.chat_id} user={message.user_id}')
+            info(f'[AI][trigger] mentions_self=True scope={message.chat_type}:{message.chat_id} user={message.user_id}')
             return True
         lowered = cleaned.lower()
         if any(word.lower() in lowered for word in agent.trigger_words):
             return True
         result = random.random() < agent.trigger_rate
         if not result and message.chat_type == 'group':
-            print(f'[AI][trigger] skipped by trigger_rate={agent.trigger_rate} scope={message.chat_type}:{message.chat_id}')
+            debug(f'[AI][trigger] skipped by trigger_rate={agent.trigger_rate} scope={message.chat_type}:{message.chat_id}')
         return result
 
     async def _process_message(self, item: dict):
@@ -1105,7 +1106,7 @@ class AIOrchestrator:
         image_context = None
         global_identity_context = self._build_global_identity_context_for_message(message, combined_trigger_text or cleaned)
         if image_refs:
-            print(
+            info(
                 '[AI][image] detected '
                 f'count={len(image_refs)} scope={scope_type}:{scope_id} '
                 f'source={self._message_source_label(message)} '
@@ -1113,21 +1114,21 @@ class AIOrchestrator:
             )
         if image_refs:
             try:
-                print(f'[AI][image] describing scope={scope_type}:{scope_id}')
+                info(f'[AI][image] describing scope={scope_type}:{scope_id}')
                 image_context = await asyncio.to_thread(
                     self.vision_model.describe_images,
                     image_refs,
                     '请详细描述图片，尤其关注人物、文字、场景、动作、情绪和梗。',
                 )
                 if image_context:
-                    print(
+                    info(
                         '[AI][image] describe success '
                         f'scope={scope_type}:{scope_id} chars={len(image_context)}'
                     )
                 else:
-                    print(f'[AI][image] describe empty scope={scope_type}:{scope_id}')
+                    warn(f'[AI][image] describe empty scope={scope_type}:{scope_id}')
             except Exception as exc:
-                print(f'[AI][image] describe failed scope={scope_type}:{scope_id} error={exc}')
+                error(f'[AI][image] describe failed scope={scope_type}:{scope_id} error={exc}')
                 image_context = f'图片解析失败: {exc}'
 
         generation_ms = None
@@ -1185,7 +1186,7 @@ class AIOrchestrator:
                 if str(entry.get('text') or '').strip()
             )
             global_identity_context = self._build_global_identity_context_for_message(message, combined_trigger_text or cleaned)
-            print(
+            info(
                 '[AI][message] pending messages arrived after tool use, rerun '
                 f'scope={scope_type}:{scope_id} trigger_count={len(trigger_messages)}'
             )
@@ -1911,7 +1912,9 @@ class AIOrchestrator:
             if not reply.tool_calls:
                 if forced_digest_round:
                     # 这一轮被临时摘掉了发送类工具，只是让模型先消化中断提醒；
-                    # 不追加这轮内容，直接进入下一轮，恢复正常工具集重新决策。
+                    # 模型没调用工具 = 已经消化完毕，进入下一轮恢复正常工具集重新决策。
+                    model_messages.append({'role': 'assistant', 'content': reply.raw_content})
+                    model_messages.append({'role': 'user', 'content': '好的，现在可以正常回复了。'})
                     continue
                 final_reply = '\n'.join(entry['text'] for entry in sent_entries)
                 think_note = self._normalize_think_note(reply.text)
@@ -2874,7 +2877,7 @@ class AIOrchestrator:
                 master_messages.append({'role': 'assistant', 'content': master_reply.raw_content})
                 master_messages.append({'role': 'user', 'content': result_blocks})
         except Exception as exc:
-            print(f'[AI][master] {exc}')
+            error(f'[AI][master] {exc}')
 
         created_task_ids = []
         if master_reply:
@@ -3799,13 +3802,13 @@ class AIOrchestrator:
                 0.2,
             )
         except Exception as exc:
-            print(f'[AI][impression] refresh failed scope={scope_type}:{scope_id} error={exc}')
+            error(f'[AI][impression] refresh failed scope={scope_type}:{scope_id} error={exc}')
             return f'更新印象失败: {exc}'
         impression = (reply.text if reply else '').strip()
         if not impression:
             return f'会话 {scope_type}:{scope_id} 的印象结果为空。'
         self.repo.update_agent_impression(scope_type, scope_id, impression)
-        print(f'[AI][impression] refreshed scope={scope_type}:{scope_id} chars={len(impression)}')
+        info(f'[AI][impression] refreshed scope={scope_type}:{scope_id} chars={len(impression)}')
         return f'已更新会话 {scope_type}:{scope_id} 的长期印象。'
 
     def _impression_system_prompt(self) -> str:
@@ -4098,7 +4101,7 @@ class AIOrchestrator:
                         except Exception:
                             pass
         except Exception as e:
-            print(f'[AI][recurring] load failed: {e}')
+            error(f'[AI][recurring] load failed: {e}')
             self._recurring_tasks = {}
 
     def _save_recurring_tasks(self) -> None:
@@ -4108,7 +4111,7 @@ class AIOrchestrator:
             with open(self._recurring_tasks_path, 'w', encoding='utf-8') as f:
                 _json.dump({'tasks': self._recurring_tasks}, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f'[AI][recurring] save failed: {e}')
+            error(f'[AI][recurring] save failed: {e}')
 
     def _calc_next_cron_run(self, schedule: str, after: float | None = None) -> float:
         from croniter import croniter
@@ -4132,26 +4135,26 @@ class AIOrchestrator:
                             task['last_run'] = now
                             task['next_run'] = self._calc_next_cron_run(task['schedule'], now)
                             changed = True
-                            print(f"[AI][recurring] triggered task {task['id'][:8]}, next={task['next_run']:.0f}")
+                            info(f"[AI][recurring] triggered task {task['id'][:8]}, next={task['next_run']:.0f}")
                         except Exception as e:
-                            print(f"[AI][recurring] trigger error task={task.get('id','?')}: {e}")
+                            error(f"[AI][recurring] trigger error task={task.get('id','?')}: {e}")
                 if changed:
                     self._save_recurring_tasks()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f'[AI][recurring] scheduler error: {e}')
+                error(f'[AI][recurring] scheduler error: {e}')
 
     def _trigger_recurring_task(self, task: dict) -> None:
         target_scope = task.get('target_scope') or task.get('creator_scope', '')
         if ':' not in target_scope:
-            print(f"[AI][recurring] invalid target_scope: {target_scope}")
+            warn(f"[AI][recurring] invalid target_scope: {target_scope}")
             return
         chat_type, chat_id_str = target_scope.split(':', 1)
         try:
             chat_id = int(chat_id_str)
         except ValueError:
-            print(f"[AI][recurring] invalid chat_id in target_scope: {target_scope}")
+            warn(f"[AI][recurring] invalid chat_id in target_scope: {target_scope}")
             return
         synthetic = ChatMessage(
             chat_type=chat_type,
@@ -4201,4 +4204,4 @@ class AIOrchestrator:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f'[AI][auto-update] check error: {e}')
+                error(f'[AI][auto-update] check error: {e}')
