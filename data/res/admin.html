@@ -302,6 +302,27 @@
             <button class="btn" onclick="saveGithubApiToken()">保存</button>
           </div>
         </div>
+        <div class="turn-section">
+          <div class="turn-section-title">主人账户</div>
+          <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">配置后，AI 会把这个 QQ 识别为“主人”。</div>
+          <input id="masterQqInput" type="number" placeholder="主人 QQ 号，0 表示未配置" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-main);color:var(--text-main);font-family:inherit;">
+          <div class="flex-row">
+            <button class="btn" onclick="saveMasterQq()">保存</button>
+          </div>
+        </div>
+        <div class="turn-section">
+          <div class="turn-section-title">自动更新</div>
+          <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">每天检查 GitHub 最新版本，发现更新后唤醒主 AI 决策。</div>
+          <label style="font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+            <input id="autoUpdateEnabledInput" type="checkbox"> 启用自动更新检查
+          </label>
+          <input id="autoUpdateHourInput" type="number" min="0" max="23" placeholder="每天检查小时（0-23）" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-main);color:var(--text-main);font-family:inherit;margin-bottom:6px;">
+          <input id="updateRepoOwnerInput" type="text" placeholder="GitHub Owner" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-main);color:var(--text-main);font-family:inherit;margin-bottom:6px;">
+          <input id="updateRepoNameInput" type="text" placeholder="GitHub Repo" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-main);color:var(--text-main);font-family:inherit;">
+          <div class="flex-row">
+            <button class="btn" onclick="saveAutoUpdateSettings()">保存</button>
+          </div>
+        </div>
         <div class="turn-section-title" style="margin-top:16px;">AI 模型接口</div>
         <div id="modelProfilesList">加载中...</div>
       </div>
@@ -781,6 +802,11 @@
           githubStatusText = '尚未配置，GitHub 相关工具不可用';
         }
         document.getElementById('githubTokenStatus').textContent = githubStatusText;
+        document.getElementById('masterQqInput').value = data.master_qq || 0;
+        document.getElementById('autoUpdateEnabledInput').checked = !!data.auto_update_enabled;
+        document.getElementById('autoUpdateHourInput').value = data.auto_update_check_hour ?? 4;
+        document.getElementById('updateRepoOwnerInput').value = data.update_repo_owner || 'Loliyer520';
+        document.getElementById('updateRepoNameInput').value = data.update_repo_name || 'LiveAi';
 
         renderModelProfiles(data.model_profiles || []);
       } catch (err) {
@@ -848,6 +874,51 @@
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ github_api_token: value }),
+        });
+        alert(data.message);
+        await openSettingsModal();
+      } catch (err) {
+        alert('保存失败: ' + err.message);
+      }
+    }
+
+    async function saveMasterQq() {
+      const value = Number(document.getElementById('masterQqInput').value || 0);
+      try {
+        const data = await fetchJson('/api/settings', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ master_qq: value }),
+        });
+        alert(data.message);
+        await openSettingsModal();
+      } catch (err) {
+        alert('保存失败: ' + err.message);
+      }
+    }
+
+    async function saveAutoUpdateSettings() {
+      const body = {
+        auto_update_enabled: document.getElementById('autoUpdateEnabledInput').checked,
+        auto_update_check_hour: Number(document.getElementById('autoUpdateHourInput').value || 4),
+        update_repo_owner: document.getElementById('updateRepoOwnerInput').value,
+        update_repo_name: document.getElementById('updateRepoNameInput').value,
+      };
+      try {
+        let data = await fetchJson('/api/settings', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ auto_update_enabled: body.auto_update_enabled }),
+        });
+        data = await fetchJson('/api/settings', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ auto_update_check_hour: body.auto_update_check_hour }),
+        });
+        data = await fetchJson('/api/settings', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ update_repo_owner: body.update_repo_owner, update_repo_name: body.update_repo_name }),
         });
         alert(data.message);
         await openSettingsModal();

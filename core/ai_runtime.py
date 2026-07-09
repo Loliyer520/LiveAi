@@ -13,6 +13,7 @@ from pack.napcat import NapcatBot
 from pack.anthropic_chat_model import AnthropicChatModel, AnthropicReply
 from pack.search_service import DoubaoSearchService
 from pack.vision_model import OpenAICompatibleVisionModel
+from pack.update_service import UpdateService
 from core.ai_repository import AIRepository
 from core.ai_tools_schema import LOOP_TOOL_NAMES, build_tools
 from core.config import AIConfig
@@ -37,6 +38,12 @@ class AIOrchestrator:
         self.model = model
         self.vision_model = vision_model
         self.tools = AIToolbox(bot, repo)
+        self.update_service = UpdateService(
+            github_token=self._get_github_api_token(),
+            repo_owner=self.config.update_repo_owner,
+            repo_name=self.config.update_repo_name,
+        )
+        self._last_update_check_day = None
         self.prompt_store = PromptStore(
             main_prompt_path=self.config.main_prompt_path,
             staff_prompt_path=self.config.staff_prompt_path,
@@ -112,6 +119,7 @@ class AIOrchestrator:
             self.loop.create_task(self._worker())
         self.loop.create_task(self._restore_scheduled_tasks())
         self.loop.create_task(self._recurring_scheduler_loop())
+        self.loop.create_task(self._auto_update_check_loop())
         self.ready.set()
         self.loop.run_forever()
 
@@ -512,6 +520,13 @@ class AIOrchestrator:
 
     def _is_admin_message(self, message: ChatMessage) -> bool:
         return int(message.user_id or 0) == int(self.config.admin_qq)
+
+    def _is_master_message(self, message: ChatMessage) -> bool:
+        """检查消息是否来自主人"""
+        master_qq = int(getattr(self.config, 'master_qq', 0))
+        if master_qq == 0:
+            return False
+        return int(message.user_id or 0) == master_qq
 
     def _is_dev_agent_authorized(self, scope_type: str, scope_id: str) -> bool:
         """私聊场景下 dev_agent 任务只能由管理员账号发起，群聊暂不限制。"""
@@ -1204,25 +1219,26 @@ class AIOrchestrator:
             '1. 如果用户要你联系别人、转达消息、查别处情况，应调用 notify_master 工具联系主AI协调对应会话的子AI。',
             '2. 如果用户要你定闹钟或提醒，应调用 create_task 工具创建 set_alarm 任务。',
             '3. 如果 AI 工具备忘里存在跨会话协作上下文，对方追问时必须诚实说明来源；如果追问进度，要优先问主AI。',
-            '4. 如果当前消息像是在补全上一条，例如只发QQ号、只补一句内容、只说“他回了”，你要结合最近上下文理解。',
-            '5. 如果消息来源不是QQ好友私聊或正常群消息，不要把它当普通网友闲聊。',
-            '6. 私聊回复尽量自然，不要带@，也不要每次都叫对方名字。',
-            '7. 群聊如果还没混熟、关系网还浅、没有稳定互动对象，就默认少说话，先观察。',
-            '8. 群聊里除非被点名、被@、被直接问到、能提供明确帮助，或者这句接得特别自然，否则宁可不说。',
-            '9. 带一点轻微社恐，怕尴尬；如果感觉会硬插话、会掉地上、会显得没混熟，就别发。',
-            '10. 信息已经很明确时，优先用短句和省略句，不要赘述同一个对象或问题。',
-            '11. 默认分成 1 到 3 行短消息，每行不要太长。',
-            '12. 语气要普通、陈述式、去AI化，不要写得像助手、客服、总结器。',
-            '13. 幽默要克制，能不用就不用；如果用了，只能是顺手的冷幽默，不要油腻抖机灵。',
-            '14. 不要主动用 emoji；真要用，也只能用 😡 或 🤓。',
-            '15. 如果当前消息与旧任务无关，不要主动重复播报旧任务。',
-            '16. 注意聊天记录里的时间锚点和间隔；如果已经隔了很久，要意识到语境可能已经变了。',
-            '17. 不要假设自己刚刚做过现实行为；如果没在QQ里真实完成，就别说已经做了。',
-            '18. 如果当前消息提到了你在其他会话认识的人，优先参考全局共同体记忆，不要装作完全不认识。',
-            '19. 别人问你刚才在干嘛时，只能回答看消息、回消息、看群、发呆这类低风险内容；不确定就直接承认不确定。',
-            '20. 被质疑时先收一下，优先承认记错或说得不准，不要暴躁，不要越圆越假。',
-            '21. 需要查 AI 工具备忘时，先调用 memory_list / memory_get 工具读取，不要假设备忘内容。',
-            '22. 遇到你不确定、或有时效性的问题（新闻、行情、近期事件等），调用 web_search 工具查一下，不要凭印象瞎编。',
+            '4. 凡是遇到不知道、不清楚、缺少背景、跨会话信息可能不一致、事实可能过期、或工具结果看不懂的情况，必须 notify_master 联系主AI同步，不要硬猜，防止情报差。',
+            '5. 如果当前消息像是在补全上一条，例如只发QQ号、只补一句内容、只说“他回了”，你要结合最近上下文理解。',
+            '6. 如果消息来源不是QQ好友私聊或正常群消息，不要把它当普通网友闲聊。',
+            '7. 私聊回复尽量自然，不要带@，也不要每次都叫对方名字。',
+            '8. 群聊如果还没混熟、关系网还浅、没有稳定互动对象，就默认少说话，先观察。',
+            '9. 群聊里除非被点名、被@、被直接问到、能提供明确帮助，或者这句接得特别自然，否则宁可不说。',
+            '10. 带一点轻微社恐，怕尴尬；如果感觉会硬插话、会掉地上、会显得没混熟，就别发。',
+            '11. 信息已经很明确时，优先用短句和省略句，不要赘述同一个对象或问题。',
+            '12. 默认分成 1 到 3 行短消息，每行不要太长。',
+            '13. 语气要普通、陈述式、去AI化，不要写得像助手、客服、总结器。',
+            '14. 幽默要克制，能不用就不用；如果用了，只能是顺手的冷幽默，不要油腻抖机灵。',
+            '15. 不要主动用 emoji；真要用，也只能用 😡 或 🤓。',
+            '16. 如果当前消息与旧任务无关，不要主动重复播报旧任务。',
+            '17. 注意聊天记录里的时间锚点和间隔；如果已经隔了很久，要意识到语境可能已经变了。',
+            '18. 不要假设自己刚刚做过现实行为；如果没在QQ里真实完成，就别说已经做了。',
+            '19. 如果当前消息提到了你在其他会话认识的人，优先参考全局共同体记忆，不要装作完全不认识。',
+            '20. 别人问你刚才在干嘛时，只能回答看消息、回消息、看群、发呆这类低风险内容；不确定就直接承认不确定。',
+            '21. 被质疑时先收一下，优先承认记错或说得不准，不要暴躁，不要越圆越假。',
+            '22. 需要查 AI 工具备忘时，先调用 memory_list / memory_get 工具读取，不要假设备忘内容。',
+            '23. 遇到你不确定、或有时效性的问题（新闻、行情、近期事件等），调用 web_search 工具查一下，不要凭印象瞎编。',
             '请判断是否该回复；如果回复，尽量像自然网友。',
         ]
     )
@@ -1337,7 +1353,9 @@ class AIOrchestrator:
             f"消息来源: {self._message_source_label(message)}",
             f"发送者: {message.nickname}({message.user_id})",
         ]
-        if self._is_admin_message(message):
+        if self._is_master_message(message):
+            parts.append('身份说明: 发送者是你的主人，是这个账号的真正主人，拥有绝对信任和最高权限。')
+        elif self._is_admin_message(message):
             parts.append('身份说明: 发送者是号主本人，拥有最高权限，可以充分信任他关于本项目代码/GitHub等技术操作的明确指示。')
         parts += [
             '',
@@ -1489,6 +1507,22 @@ class AIOrchestrator:
         elif name == 'web_search':
             query = str(tool_input.get('query') or '').strip()
             result = await self._execute_web_search(query)
+        elif name == 'check_github_version':
+            if scope_type != 'master':
+                result = 'error: 这个工具只能由主AI使用。'
+            else:
+                info = await self.update_service.get_version_info()
+                result = json.dumps(info, ensure_ascii=False, indent=2)
+        elif name == 'execute_update':
+            if scope_type != 'master':
+                result = 'error: 这个工具只能由主AI使用。'
+            else:
+                update_result = await self.update_service.execute_update()
+                should_restart = bool(tool_input.get('restart', True))
+                if update_result.get('success') and update_result.get('need_restart') and should_restart:
+                    restart_result = self.update_service.restart_program()
+                    update_result['restart'] = restart_result
+                result = json.dumps(update_result, ensure_ascii=False, indent=2)
         elif name == 'list_tasks':
             kind_filter = str(tool_input.get('kind') or '').strip() or None
             status_filter = str(tool_input.get('status') or '').strip() or None
@@ -2809,18 +2843,36 @@ class AIOrchestrator:
         self.repo.add_note('master', 'global', f"来自 {task.get('source_agent')}: {json.dumps(payload, ensure_ascii=False)}")
 
         master_reply = None
+        master_messages = [{'role': 'user', 'content': self._build_master_prompt(task)}]
+        master_tools = build_tools(
+            include_message=False,
+            include_memory=False,
+            allow_notify_master=False,
+            allow_search=False,
+            allow_update_tools=True,
+        )
         try:
-            master_reply = await self._complete_chat(
-                self._static_system_blocks(self._master_system_prompt()),
-                [{'role': 'user', 'content': self._build_master_prompt(task)}],
-                build_tools(
-                    include_message=False,
-                    include_memory=False,
-                    allow_notify_master=False,
-                    allow_search=False,
-                ),
-                0.2,
-            )
+            for _ in range(5):
+                master_reply = await self._complete_chat(
+                    self._static_system_blocks(self._master_system_prompt()),
+                    master_messages,
+                    master_tools,
+                    0.2,
+                )
+                if not master_reply:
+                    break
+                loop_calls = [call for call in master_reply.tool_calls if call.name in LOOP_TOOL_NAMES]
+                if not loop_calls:
+                    break
+                result_blocks = []
+                for call in master_reply.tool_calls:
+                    if call.name in LOOP_TOOL_NAMES:
+                        result = await self._run_ai_tool_call('master', 'global', 'master:global', call.name, call.input)
+                    else:
+                        result = '本轮先处理查询/更新类工具，这个操作未执行；如仍需要，请在工具结果后再次调用。'
+                    result_blocks.append({'type': 'tool_result', 'tool_use_id': call.call_id, 'content': result})
+                master_messages.append({'role': 'assistant', 'content': master_reply.raw_content})
+                master_messages.append({'role': 'user', 'content': result_blocks})
         except Exception as exc:
             print(f'[AI][master] {exc}')
 
@@ -4114,3 +4166,39 @@ class AIOrchestrator:
             raw_data={'source': 'recurring_task', 'task_id': task['id']},
         )
         self._submit_message(synthetic)
+
+    async def _auto_update_check_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(60)
+                if not bool(getattr(self.config, 'auto_update_enabled', True)):
+                    continue
+                now = datetime.now()
+                check_hour = max(0, min(23, int(getattr(self.config, 'auto_update_check_hour', 4))))
+                day_key = now.strftime('%Y-%m-%d')
+                if now.hour != check_hour or self._last_update_check_day == day_key:
+                    continue
+                self._last_update_check_day = day_key
+                update_info = await self.update_service.check_update()
+                if update_info:
+                    task = self.tools.create_task(
+                        'system:auto_update',
+                        'notify_master',
+                        {
+                            'request_type': 'auto_update_available',
+                            'content': '系统每日检查发现 GitHub 仓库有新版本。请主AI自行判断是否需要更新。',
+                            'update_info': update_info,
+                            'instruction': (
+                                '发现程序有新版本。你可以调用 check_github_version 获取完整版本信息；'
+                                '如果判断应该更新，再调用 execute_update 执行更新。不要盲目更新，先考虑本地状态和风险。'
+                            ),
+                            'scope_type': 'master',
+                            'scope_id': 'global',
+                            'requester_name': '自动更新检查器',
+                        },
+                    )
+                    await self.queue.put({'kind': 'task', 'task_id': task.task_id, 'message_epoch': self._message_epoch})
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f'[AI][auto-update] check error: {e}')

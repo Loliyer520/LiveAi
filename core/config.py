@@ -67,6 +67,7 @@ class SatangyunConfig:
 class AIConfig:
     enabled: bool = _get_bool('ai', 'enabled', 'AI_ENABLED', True)
     admin_qq: int = _get_int('ai', 'admin_qq', 'AI_ADMIN_QQ', 123456789)
+    master_qq: int = _get_int('ai', 'master_qq', 'AI_MASTER_QQ', 0)
     default_chat_profile: str = _get('ai', 'default_chat_profile', 'AI_DEFAULT_CHAT_PROFILE', 'claude')
     model_base_url: str = _get('ai', 'model_base_url', 'AI_MODEL_BASE_URL', 'https://api.deepseek.com/anthropic')
     api_key: str = _get('ai', 'api_key', 'AI_MODEL_API_KEY', 'sk-your-deepseek-key')
@@ -97,6 +98,10 @@ class AIConfig:
     search_base_url: str = _get('ai', 'search_base_url', 'AI_SEARCH_BASE_URL', 'https://open.feedcoopapi.com/search_api/global_search')
     search_doc_count: int = _get_int('ai', 'search_doc_count', 'AI_SEARCH_DOC_COUNT', 5)
     github_api_token: str = _get('ai', 'github_api_token', 'AI_GITHUB_API_TOKEN', 'ghp_your_github_token')
+    update_repo_owner: str = _get('ai', 'update_repo_owner', 'AI_UPDATE_REPO_OWNER', 'Loliyer520')
+    update_repo_name: str = _get('ai', 'update_repo_name', 'AI_UPDATE_REPO_NAME', 'LiveAi')
+    auto_update_enabled: bool = _get_bool('ai', 'auto_update_enabled', 'AI_AUTO_UPDATE_ENABLED', True)
+    auto_update_check_hour: int = _get_int('ai', 'auto_update_check_hour', 'AI_AUTO_UPDATE_CHECK_HOUR', 4)
     dev_agent_prompt_path: str = _get('ai', 'dev_agent_prompt_path', 'AI_DEV_AGENT_PROMPT_PATH', 'data/prompt/dev_agent.txt')
 
 

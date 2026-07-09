@@ -297,6 +297,11 @@ class WebUIService:
             'github_api_token_set': bool(active_github_token),
             'github_api_token_masked': self._mask_secret(active_github_token),
             'github_api_token_source': 'settings' if stored_github_token else ('env' if github_env_default else 'none'),
+            'master_qq': getattr(self.orchestrator.config, 'master_qq', 0),
+            'auto_update_enabled': getattr(self.orchestrator.config, 'auto_update_enabled', True),
+            'auto_update_check_hour': getattr(self.orchestrator.config, 'auto_update_check_hour', 4),
+            'update_repo_owner': getattr(self.orchestrator.config, 'update_repo_owner', 'Loliyer520'),
+            'update_repo_name': getattr(self.orchestrator.config, 'update_repo_name', 'LiveAi'),
             'model_profiles': self.orchestrator.get_model_profiles_info(),
         }
 
@@ -313,11 +318,38 @@ class WebUIService:
         if 'github_api_token' in payload:
             value = str(payload.get('github_api_token') or '').strip()
             self.repo.set_setting('github_api_token', value)
-            # Persist to config.yaml
             from core.config import save_config_to_yaml
             if value:
                 save_config_to_yaml({'ai': {'github_api_token': value}})
             return True, '已更新 GitHub API Token。' if value else '已清空 GitHub API Token（将回退到环境变量默认值）。'
+        if 'master_qq' in payload:
+            value = int(payload.get('master_qq') or 0)
+            self.orchestrator.config.master_qq = value
+            from core.config import save_config_to_yaml
+            save_config_to_yaml({'ai': {'master_qq': value}})
+            return True, '已更新主人 QQ。'
+        if 'auto_update_enabled' in payload:
+            value = bool(payload.get('auto_update_enabled'))
+            self.orchestrator.config.auto_update_enabled = value
+            from core.config import save_config_to_yaml
+            save_config_to_yaml({'ai': {'auto_update_enabled': value}})
+            return True, '已更新自动更新开关。'
+        if 'auto_update_check_hour' in payload:
+            value = max(0, min(23, int(payload.get('auto_update_check_hour') or 4)))
+            self.orchestrator.config.auto_update_check_hour = value
+            from core.config import save_config_to_yaml
+            save_config_to_yaml({'ai': {'auto_update_check_hour': value}})
+            return True, '已更新自动检查时间。'
+        if 'update_repo_owner' in payload or 'update_repo_name' in payload:
+            owner = str(payload.get('update_repo_owner') or getattr(self.orchestrator.config, 'update_repo_owner', 'Loliyer520')).strip()
+            name = str(payload.get('update_repo_name') or getattr(self.orchestrator.config, 'update_repo_name', 'LiveAi')).strip()
+            self.orchestrator.config.update_repo_owner = owner
+            self.orchestrator.config.update_repo_name = name
+            self.orchestrator.update_service.repo_owner = owner
+            self.orchestrator.update_service.repo_name = name
+            from core.config import save_config_to_yaml
+            save_config_to_yaml({'ai': {'update_repo_owner': owner, 'update_repo_name': name}})
+            return True, '已更新自动更新仓库。'
         if 'model_profile' in payload:
             name = str(payload.get('model_profile') or '').strip()
             if not name:

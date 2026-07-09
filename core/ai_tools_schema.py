@@ -1,7 +1,7 @@
 import copy
 
 # 循环型工具：执行后把 tool_result 回填给模型继续本回合
-LOOP_TOOL_NAMES = {'memory_list', 'memory_get', 'memory_add', 'memory_update', 'web_search', 'list_tasks', 'get_task', 'download_file'}
+LOOP_TOOL_NAMES = {'memory_list', 'memory_get', 'memory_add', 'memory_update', 'web_search', 'list_tasks', 'get_task', 'download_file', 'check_github_version', 'execute_update'}
 
 # 指令型工具：终结本回合，由运行时按结构化入参执行
 DIRECTIVE_TOOL_NAMES = {'send_message', 'remember', 'notify_master', 'create_task', 'recall_message'}
@@ -187,6 +187,28 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
             'required': ['file_id', 'file_name'],
         },
     },
+    'check_github_version': {
+        'name': 'check_github_version',
+        'description': (
+            '主AI专用：手动检查当前程序的 GitHub 版本信息，返回本地版本、远程最新版、是否有更新。'
+            '当系统提示发现更新、主人询问版本、或你需要确认是否该更新时调用。'
+        ),
+        'input_schema': {'type': 'object', 'properties': {}, 'required': []},
+    },
+    'execute_update': {
+        'name': 'execute_update',
+        'description': (
+            '主AI专用：执行自动更新程序。会先检查本地未提交修改，再 git pull origin main。'
+            '如果更新成功且 restart=true，会启动新进程并重启当前程序。只有你判断应该更新时才调用。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'restart': {'type': 'boolean', 'description': '更新成功后是否自动重启，默认 true'},
+            },
+            'required': [],
+        },
+    },
     'create_recurring_task': {
         'name': 'create_recurring_task',
         'description': (
@@ -257,6 +279,7 @@ def build_tools(
     allow_search: bool = True,
     include_download_file: bool = True,
     allow_recurring_tasks: bool = True,
+    allow_update_tools: bool = False,
     cache_last: bool = True,
     immediate_mode: bool = False,
 ) -> list[dict]:
@@ -275,6 +298,8 @@ def build_tools(
         names.append('create_task')
     if allow_recurring_tasks:
         names.extend(['create_recurring_task', 'list_recurring_tasks', 'update_recurring_task', 'delete_recurring_task'])
+    if allow_update_tools:
+        names.extend(['check_github_version', 'execute_update'])
     if include_message:
         names.append('send_message')
     if include_message and immediate_mode:

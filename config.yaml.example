@@ -19,6 +19,7 @@ satangyun:
 ai:
   enabled: true
   admin_qq: 123456789
+  master_qq: 123456789  # 主人QQ号，AI会识别为"主人"并给予最高信任
   default_chat_profile: "claude"
 
   # Flash model (default)
@@ -68,6 +69,12 @@ ai:
 
   # GitHub
   github_api_token: "ghp_your_github_token"
+
+  # Auto update
+  update_repo_owner: "Loliyer520"
+  update_repo_name: "LiveAi"
+  auto_update_enabled: true
+  auto_update_check_hour: 4
 
 webui:
   enabled: true
