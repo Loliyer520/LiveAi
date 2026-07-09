@@ -174,9 +174,10 @@ class UpdateService:
                 time.sleep(max(0.1, float(delay_seconds)))
                 if sys.platform == 'win32':
                     subprocess.Popen([python, main_script], cwd=self.repo_dir, creationflags=subprocess.CREATE_NEW_CONSOLE)
+                    os._exit(0)
                 else:
-                    subprocess.Popen([python, main_script], cwd=self.repo_dir)
-                os._exit(0)
+                    # 原地替换进程，保持在 screen/systemd 会话内
+                    os.execv(python, [python, main_script])
 
             threading.Thread(target=_restart, daemon=False).start()
             return {'success': True, 'message': f'将在 {delay_seconds:.1f} 秒后重启程序'}
