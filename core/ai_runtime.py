@@ -1238,6 +1238,7 @@ class AIOrchestrator:
             }
         )
         messages = self._build_char_prefill_messages(persona)
+        messages += self._build_tool_prefill_messages()
         messages += self._build_role_based_history_messages(history)
         messages.append(
             {
@@ -1246,6 +1247,30 @@ class AIOrchestrator:
             }
         )
         return {'system': system_blocks, 'messages': messages}
+
+    def _build_tool_prefill_messages(self) -> list[dict]:
+        """注入一段伪造对话，强化模型记住必须用 send_message 工具发消息。"""
+        return [
+            {
+                'role': 'user',
+                'content': (
+                    '请牢记一条核心规则：你输出的普通文字是内心想法，不会发送给用户。'
+                    '想要发消息，必须调用 send_message 工具，传入 content 参数。'
+                    '即使只想说一句"好的"，也必须通过 send_message 发出，不能直接写在回复里。'
+                    '如果你决定不回复，什么都不做即可，不要把理由写成文字输出出来。'
+                ),
+            },
+            {
+                'role': 'assistant',
+                'content': (
+                    '好的，我记住了。'
+                    '在接下来的所有对话中，我将严格遵守：'
+                    '只要需要发消息，必须调用 send_message 工具；'
+                    '直接输出的文字只是内心想法，用户看不到，不能用来代替工具调用。'
+                    '如果我决定不回复，我会直接结束本轮，不会把不回复的理由写成文字。'
+                ),
+            },
+        ]
 
     def _build_char_prefill_messages(self, persona: str) -> list[dict]:
         """Return a fictitious user/assistant exchange where the assistant explicitly
