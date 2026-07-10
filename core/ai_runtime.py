@@ -1863,7 +1863,7 @@ class AIOrchestrator:
                         'tool_calls': iteration_calls,
                     }
                 )
-                model_messages.append({'role': 'assistant', 'content': reply.raw_content})
+                model_messages.append({'role': 'assistant', 'content': self._filter_thinking_blocks(reply.raw_content)})
                 model_messages.append({'role': 'user', 'content': result_blocks})
                 continue
 
@@ -1872,7 +1872,7 @@ class AIOrchestrator:
                 if forced_digest_round:
                     # 这一轮被临时摘掉了发送类工具，只是让模型先消化中断提醒；
                     # 模型没调用工具 = 已经消化完毕，进入下一轮恢复正常工具集重新决策。
-                    model_messages.append({'role': 'assistant', 'content': reply.raw_content})
+                    model_messages.append({'role': 'assistant', 'content': self._filter_thinking_blocks(reply.raw_content)})
                     model_messages.append({'role': 'user', 'content': '好的，现在可以正常回复了。'})
                     continue
 
@@ -1886,7 +1886,7 @@ class AIOrchestrator:
                         break
                     warn('[AI][fallback] 模型未调用 send_message，re-prompt 重新决策')
                     fallback_prompted = True
-                    model_messages.append({'role': 'assistant', 'content': reply.raw_content})
+                    model_messages.append({'role': 'assistant', 'content': self._filter_thinking_blocks(reply.raw_content)})
                     model_messages.append({'role': 'user', 'content': '如果你决定回复，请调用 send_message 工具发送；如果决定不回复，什么都不输出即可。'})
                     continue
 
@@ -1938,7 +1938,7 @@ class AIOrchestrator:
                     'tool_calls': iteration_calls,
                 }
             )
-            model_messages.append({'role': 'assistant', 'content': reply.raw_content})
+            model_messages.append({'role': 'assistant', 'content': self._filter_thinking_blocks(reply.raw_content)})
             model_messages.append({'role': 'user', 'content': result_blocks})
 
             scope_key = self._scope_key(scope_type, scope_id)
@@ -2053,6 +2053,16 @@ class AIOrchestrator:
         content = re.sub(r'<thinking>.*?</thinking>', '', content, flags=re.DOTALL | re.IGNORECASE)
         content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
         return content.strip()
+
+    def _filter_thinking_blocks(self, raw_content):
+        """过滤中转站/平台附加的 extended thinking block，避免回填历史时干扰模型。"""
+        if isinstance(raw_content, list):
+            filtered = [b for b in raw_content if not (isinstance(b, dict) and b.get('type') == 'thinking')]
+            # 如果过滤后只剩一个 text block，展开为字符串（更通用）
+            if len(filtered) == 1 and isinstance(filtered[0], dict) and filtered[0].get('type') == 'text':
+                return filtered[0].get('text', '')
+            return filtered if filtered else ''
+        return raw_content
 
     def _send_scope_message(self, message: ChatMessage, content: str) -> list[dict]:
         content = self._strip_send_message_thinking(content)
@@ -2849,7 +2859,7 @@ class AIOrchestrator:
                     else:
                         result = '本轮先处理查询/更新类工具，这个操作未执行；如仍需要，请在工具结果后再次调用。'
                     result_blocks.append({'type': 'tool_result', 'tool_use_id': call.call_id, 'content': result})
-                master_messages.append({'role': 'assistant', 'content': master_reply.raw_content})
+                master_messages.append({'role': 'assistant', 'content': self._filter_thinking_blocks(master_reply.raw_content)})
                 master_messages.append({'role': 'user', 'content': result_blocks})
         except Exception as exc:
             error(f'[AI][master] {exc}')
