@@ -350,7 +350,15 @@
 
   <div class="status-bar">
     <div id="statusLine">状态: 正在连接...</div>
-    <div id="modelLine"></div>
+    <div id="modelLine" style="display:flex;align-items:center;gap:8px;">
+      <span id="modelLineText"></span>
+      <button id="modelSwitchBtn" class="btn btn-secondary" style="padding:2px 8px;font-size:11px;display:none;" onclick="openModelSwitchPanel()">切换</button>
+    </div>
+  </div>
+  <div id="modelSwitchPanel" style="display:none;position:fixed;bottom:48px;right:16px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:12px;z-index:200;min-width:260px;box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">选择模型（立即切换）</div>
+    <div id="modelSwitchList"></div>
+    <button class="btn btn-secondary" style="margin-top:8px;width:100%;font-size:12px;" onclick="closeModelSwitchPanel()">关闭</button>
   </div>
   </div>
 
@@ -559,7 +567,13 @@
         const data = await fetchJson('/api/overview');
         const runtime = data.runtime;
         document.getElementById('statusLine').textContent = `队列: ${runtime.queue_size} | Workers: ${runtime.worker_count}`;
-        document.getElementById('modelLine').textContent = `模型: ${runtime.active_profile} (${runtime.active_model})`;
+        const models = runtime.available_models || [];
+        const active = models.find(m => m.active);
+        document.getElementById('modelLineText').textContent = active
+          ? `模型: ${active.display_name}`
+          : `模型: ${runtime.active_profile}`;
+        document.getElementById('modelSwitchBtn').style.display = models.length > 1 ? '' : 'none';
+        window._availableModels = models;
         if (data.bot_id) {
             botId = data.bot_id;
             const avatarEl = document.querySelector('.nav-avatar');
@@ -1711,6 +1725,43 @@
     setInterval(loadOverview, 5000);
     setInterval(loadAgents, 5000);
     setInterval(refreshCurrentAgent, 5000);
+
+    function openModelSwitchPanel() {
+      const models = window._availableModels || [];
+      const list = document.getElementById('modelSwitchList');
+      list.innerHTML = models.map(m => `
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 8px;border-radius:6px;background:${m.active ? 'var(--bg-main)' : 'transparent'};margin-bottom:4px;">
+          <div>
+            <div style="font-size:13px;">${escapeHtml(m.display_name)}${m.active ? ' <span style="color:var(--accent);font-size:11px;">[当前]</span>' : ''}</div>
+            <div style="font-size:11px;color:var(--text-muted);">${escapeHtml(m.model_id)}</div>
+          </div>
+          ${!m.active ? `<button class="btn btn-secondary" style="padding:2px 8px;font-size:11px;" onclick="switchToModel('${escapeHtml(m.display_name)}')">切换</button>` : ''}
+        </div>
+      `).join('') || '<div style="font-size:12px;color:var(--text-muted);">无可用模型</div>';
+      document.getElementById('modelSwitchPanel').style.display = 'block';
+    }
+
+    function closeModelSwitchPanel() {
+      document.getElementById('modelSwitchPanel').style.display = 'none';
+    }
+
+    async function switchToModel(displayName) {
+      try {
+        const data = await fetchJson('/api/model', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ profile: displayName }),
+        });
+        if (data.ok) {
+          closeModelSwitchPanel();
+          await loadOverview();
+        } else {
+          alert('切换失败: ' + data.message);
+        }
+      } catch (err) {
+        alert('切换失败: ' + err.message);
+      }
+    }
   </script>
 </body>
 </html>

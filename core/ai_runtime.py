@@ -191,16 +191,7 @@ class AIOrchestrator:
 
     def get_runtime_status(self) -> dict:
         current = self.model_manager.get_current_model()
-        channels = self.model_manager.config.get('channels', [])
-        profiles = {}
-        for ch in channels:
-            for m in ch.get('models', []):
-                key = f"{ch['name']}/{m['name']}"
-                profiles[key] = {
-                    'model_name': m['model_id'],
-                    'label': m['name'],
-                    'base_url': ch['base_url'],
-                }
+        available = self.model_manager.available_models
         return {
             'enabled': self.config.enabled,
             'ready': bool(self.loop and self.queue),
@@ -210,7 +201,16 @@ class AIOrchestrator:
             'queue_size': self.queue.qsize() if self.queue else 0,
             'worker_count': max(1, self.config.worker_count),
             'scheduled_alarm_count': len(self._scheduled_alarm_ids),
-            'profiles': profiles,
+            'available_models': [
+                {
+                    'index': idx,
+                    'display_name': m['display_name'],
+                    'model_id': m['model_id'],
+                    'base_url': m['base_url'],
+                    'active': idx == self.model_manager.current_model_index,
+                }
+                for idx, m in enumerate(available)
+            ],
         }
 
     def switch_model_profile(self, requested: str) -> tuple[bool, str]:
@@ -512,24 +512,34 @@ class AIOrchestrator:
         tools: list[dict] | None = None,
         temperature: float = 0.7,
     ) -> AnthropicReply | None:
-        try:
-            return await asyncio.to_thread(
-                self.model.complete,
-                system_blocks,
-                messages,
-                tools,
-                self.model.model_name,
-                temperature,
-            )
-        except Exception as exc:
+        total_models = len(self.model_manager.available_models)
+        for attempt in range(max(1, total_models)):
             current = self.model_manager.get_current_model()
-            error(
-                '[AI][model] request failed '
-                f"model={current['display_name'] if current else 'unknown'} "
-                f"base_url={self.model.base_url} "
-                f'error={exc}'
-            )
-            raise
+            try:
+                return await asyncio.to_thread(
+                    self.model.complete,
+                    system_blocks,
+                    messages,
+                    tools,
+                    self.model.model_name,
+                    temperature,
+                )
+            except Exception as exc:
+                error(
+                    '[AI][model] request failed '
+                    f"model={current['display_name'] if current else 'unknown'} "
+                    f"base_url={self.model.base_url} "
+                    f'error={exc}'
+                )
+                if attempt < total_models - 1:
+                    next_model = self.model_manager.switch_next_model()
+                    if next_model:
+                        self._update_model_from_config(next_model)
+                        warn(f'[AI][failover] 切换到 {next_model["display_name"]} 重试')
+                    else:
+                        raise
+                else:
+                    raise
 
     async def _enqueue_message(self, message: ChatMessage):
         scope_type = message.chat_type
