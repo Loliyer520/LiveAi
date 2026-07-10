@@ -21,6 +21,7 @@ from core.config import AIConfig
 from core.dev_agent import run_dev_agent
 from core.events import ChatMessage
 from core.prompt_store import PromptStore, default_char_prompt
+from core.model_manager import ModelManager
 from tool.ai_toolbox import AIToolbox
 
 
@@ -39,6 +40,7 @@ class AIOrchestrator:
         self.model = model
         self.vision_model = vision_model
         self.tools = AIToolbox(bot, repo)
+        self.model_manager = ModelManager('data/models_config.json')
         self.update_service = UpdateService(
             github_token=self._get_github_api_token(),
             repo_owner=self.config.update_repo_owner,
@@ -70,103 +72,32 @@ class AIOrchestrator:
             'data', 'recurring_tasks.json',
         )
         self._load_recurring_tasks()
-        self._chat_profiles = {
-            'flash': {
-                'base_url': self.config.model_base_url,
-                'api_key': self.config.api_key,
-                'model_name': self.config.model_name,
-                'messages_path': self.config.model_messages_path,
-                'label': 'DeepSeek Flash',
-            },
-            'pro': {
-                'base_url': self.config.pro_model_base_url,
-                'api_key': self.config.pro_api_key,
-                'model_name': self.config.pro_model_name,
-                'messages_path': self.config.pro_model_messages_path,
-                'label': 'DeepSeek Pro',
-            },
-            'claude': {
-                'base_url': self.config.claude_model_base_url,
-                'api_key': self.config.claude_api_key,
-                'model_name': self.config.claude_model_name,
-                'messages_path': self.config.claude_model_messages_path,
-                'label': 'Claude Sonnet',
-            },
-            'opus': {
-                'base_url': self.config.claude_opus_model_base_url,
-                'api_key': self.config.claude_opus_api_key,
-                'model_name': self.config.claude_opus_model_name,
-                'messages_path': self.config.claude_opus_model_messages_path,
-                'label': 'Claude Opus',
-            },
-        }
-        default_profile = str(getattr(self.config, 'default_chat_profile', 'claude') or 'claude').strip().lower()
-        self._active_chat_profile = default_profile if default_profile in self._chat_profiles else 'claude'
-        self._chat_profile_defaults = copy.deepcopy(self._chat_profiles)
-        self._apply_profile_overrides()
-        _mc = self._build_profiles_from_models_config()
-        if _mc:
-            self._chat_profiles = _mc
-            self._chat_profile_defaults = copy.deepcopy(_mc)
-            if self._active_chat_profile not in self._chat_profiles:
-                self._active_chat_profile = next(iter(self._chat_profiles))
-
-    def _build_profiles_from_models_config(self) -> dict:
-        path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'data', 'models_config.json',
-        )
-        if not os.path.exists(path):
-            return {}
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception:
-            return {}
-        channels = data.get('channels') or []
-        if not channels:
-            return {}
-        main_models = (data.get('main') or {}).get('models') or []
-        profiles: dict = {}
-        for idx, m in enumerate(main_models):
-            ch_idx = m.get('channel')
-            if ch_idx is None or str(ch_idx).strip() == '':
-                continue
-            try:
-                ch = channels[int(ch_idx)]
-            except (IndexError, TypeError, ValueError):
-                continue
-            model_name = str(m.get('model_name') or '').strip()
-            ch_name = str(ch.get('name') or f'渠道{int(ch_idx)+1}').strip()
-            label = f'{ch_name} / {model_name}' if model_name else ch_name
-            profiles[f'm{idx}'] = {
-                'base_url': str(ch.get('base_url') or '').strip(),
-                'api_key': str(ch.get('api_key') or '').strip(),
-                'model_name': model_name,
-                'messages_path': str(ch.get('messages_path') or '').strip(),
-                'label': label,
-            }
-        if not profiles:
-            for idx, ch in enumerate(channels):
-                profiles[f'ch{idx}'] = {
-                    'base_url': str(ch.get('base_url') or '').strip(),
-                    'api_key': str(ch.get('api_key') or '').strip(),
-                    'model_name': '',
-                    'messages_path': str(ch.get('messages_path') or '').strip(),
-                    'label': str(ch.get('name') or f'渠道{idx+1}').strip(),
-                }
-        return profiles
+        # 初始化模型配置（用新的 ModelManager 替换旧的 profile 系统）
+        current_model = self.model_manager.get_current_model()
+        if current_model:
+            info(f'[AI] 使用模型配置 {current_model["display_name"]}')
+            self._update_model_from_config(current_model)
+        else:
+            warn('[AI] models_config.json 为空，使用传入的默认模型')
+        # 更新 vision 模型
+        vision_config = self.model_manager.get_vision_model()
+        if vision_config:
+            self.vision_model = OpenAICompatibleVisionModel(
+                base_url=vision_config['base_url'],
+                api_key=vision_config['api_key'],
+                model_name=vision_config['model_name'],
+            )
 
     def reload_models_config(self) -> dict:
-        profiles = self._build_profiles_from_models_config()
-        if not profiles:
-            return {'loaded': False, 'message': 'models_config.json 无有效渠道，保持原有配置'}
-        self._chat_profiles = profiles
-        self._chat_profile_defaults = copy.deepcopy(profiles)
-        if self._active_chat_profile not in self._chat_profiles:
-            self._active_chat_profile = next(iter(self._chat_profiles))
-        info(f'[AI] models_config.json 已热加载，共 {len(profiles)} 个模型')
-        return {'loaded': True, 'count': len(profiles), 'profiles': list(profiles.keys())}
+        """热重载 models_config.json"""
+        self.model_manager.reload_config()
+        current = self.model_manager.get_current_model()
+        if current:
+            self._update_model_from_config(current)
+            info(f'[AI] models_config.json 已热加载，当前模型: {current["display_name"]}')
+            return {'loaded': True, 'current': current['display_name']}
+        else:
+            return {'loaded': False, 'message': 'models_config.json 无有效渠道'}
 
     def start(self):
         if self.thread:
@@ -259,51 +190,46 @@ class AIOrchestrator:
         self._submit_message(report_message)
 
     def get_runtime_status(self) -> dict:
-        profile = self._chat_profiles[self._active_chat_profile]
+        current = self.model_manager.get_current_model()
+        channels = self.model_manager.config.get('channels', [])
+        profiles = {}
+        for ch in channels:
+            for m in ch.get('models', []):
+                key = f"{ch['name']}/{m['name']}"
+                profiles[key] = {
+                    'model_name': m['model_id'],
+                    'label': m['name'],
+                    'base_url': ch['base_url'],
+                }
         return {
             'enabled': self.config.enabled,
             'ready': bool(self.loop and self.queue),
-            'active_profile': self._active_chat_profile,
-            'active_model': profile['model_name'],
-            'active_label': profile.get('label') or self._active_chat_profile,
+            'active_profile': current['display_name'] if current else 'none',
+            'active_model': current['model_name'] if current else 'none',
+            'active_label': current['display_name'] if current else 'none',
             'queue_size': self.queue.qsize() if self.queue else 0,
             'worker_count': max(1, self.config.worker_count),
             'scheduled_alarm_count': len(self._scheduled_alarm_ids),
-            'profiles': {
-                name: {
-                    'model_name': item['model_name'],
-                    'label': item.get('label') or name,
-                    'base_url': item['base_url'],
-                }
-                for name, item in self._chat_profiles.items()
-            },
+            'profiles': profiles,
         }
 
-    _MODEL_ALIASES = {'flase': 'flash', 'ds': 'pro', 'deepseek': 'pro'}
-
-    def _normalize_model_profile(self, requested: str) -> str:
-        requested = (requested or '').strip().lower()
-        return self._MODEL_ALIASES.get(requested, requested)
-
     def switch_model_profile(self, requested: str) -> tuple[bool, str]:
-        requested = self._normalize_model_profile(requested)
-        if requested not in self._chat_profiles:
-            available = ' / '.join(self._chat_profiles.keys())
-            return False, f'可用模型: {available}'
-        self._active_chat_profile = requested
-        profile = self._chat_profiles[requested]
-        label = profile.get('label') or profile['model_name']
-        return True, f"已切到 {requested} ({label})"
+        """兼容旧 API，实际调用 ModelManager"""
+        success, msg = self.model_manager.switch_model(requested)
+        if success:
+            current = self.model_manager.get_current_model()
+            if current:
+                self._update_model_from_config(current)
+        return success, msg
 
-    def _profile_override_key(self, name: str) -> str:
-        return f'model_profile_override_{name}'
-
-    def _apply_profile_overrides(self):
-        for name, defaults in self._chat_profile_defaults.items():
-            override = self.repo.get_setting(self._profile_override_key(name), None) or {}
-            merged = dict(defaults)
-            merged.update({field: value for field, value in override.items() if value})
-            self._chat_profiles[name] = merged
+    def _update_model_from_config(self, model_config: dict):
+        """根据 ModelManager 提供的配置更新 self.model"""
+        self.model = AnthropicChatModel(
+            base_url=model_config['base_url'],
+            api_key=model_config['api_key'],
+            model_name=model_config['model_name'],
+            messages_path=model_config['messages_path'],
+        )
 
     @staticmethod
     def _mask_secret(value: str) -> str:
@@ -315,76 +241,27 @@ class AIOrchestrator:
         return f'{value[:4]}{"*" * (len(value) - 8)}{value[-4:]}'
 
     def get_model_profiles_info(self) -> list[dict]:
+        """兼容旧 API，从 ModelManager 构造返回值"""
         result = []
-        for name, profile in self._chat_profiles.items():
-            override = self.repo.get_setting(self._profile_override_key(name), None) or {}
-            result.append({
-                'name': name,
-                'label': profile.get('label') or name,
-                'active': name == self._active_chat_profile,
-                'base_url': profile.get('base_url', ''),
-                'model_name': profile.get('model_name', ''),
-                'messages_path': profile.get('messages_path') or '',
-                'api_key_set': bool(profile.get('api_key')),
-                'api_key_masked': self._mask_secret(profile.get('api_key', '')),
-                'overridden_fields': sorted(override.keys()),
-            })
+        channels = self.model_manager.config.get('channels', [])
+        current = self.model_manager.get_current_model()
+        current_display = current['display_name'] if current else ''
+
+        for ch in channels:
+            for m in ch.get('models', []):
+                display = f"{ch['name']}/{m['name']}"
+                result.append({
+                    'name': display,
+                    'label': m['name'],
+                    'active': display == current_display,
+                    'base_url': ch['base_url'],
+                    'model_name': m['model_id'],
+                    'messages_path': '/v1/messages',
+                    'api_key_set': bool(ch.get('api_key')),
+                    'api_key_masked': self._mask_secret(ch.get('api_key', '')),
+                    'overridden_fields': [],
+                })
         return result
-
-    def update_model_profile(
-        self,
-        name: str,
-        base_url: str | None = None,
-        api_key: str | None = None,
-        model_name: str | None = None,
-        messages_path: str | None = None,
-    ) -> tuple[bool, str]:
-        name = self._normalize_model_profile(name)
-        if name not in self._chat_profile_defaults:
-            return False, f'未知模型档位: {name}，可用: flash / pro(ds) / claude / opus'
-
-        key = self._profile_override_key(name)
-        override = dict(self.repo.get_setting(key, {}) or {})
-        for field, value in (
-            ('base_url', base_url),
-            ('api_key', api_key),
-            ('model_name', model_name),
-            ('messages_path', messages_path),
-        ):
-            if value is None:
-                continue
-            value = str(value).strip()
-            if value:
-                override[field] = value
-            else:
-                override.pop(field, None)
-
-        self.repo.set_setting(key, override)
-        self._apply_profile_overrides()
-
-        # Persist to config.yaml
-        from core.config import save_config_to_yaml
-        profile_map = {
-            'flash': ('model_base_url', 'api_key', 'model_name', 'model_messages_path'),
-            'pro': ('pro_model_base_url', 'pro_api_key', 'pro_model_name', 'pro_model_messages_path'),
-            'claude': ('claude_model_base_url', 'claude_api_key', 'claude_model_name', 'claude_model_messages_path'),
-            'opus': ('claude_opus_model_base_url', 'claude_opus_api_key', 'claude_opus_model_name', 'claude_opus_model_messages_path'),
-        }
-        if name in profile_map:
-            fields = profile_map[name]
-            ai_updates = {}
-            if base_url is not None and base_url.strip():
-                ai_updates[fields[0]] = base_url.strip()
-            if api_key is not None and api_key.strip():
-                ai_updates[fields[1]] = api_key.strip()
-            if model_name is not None and model_name.strip():
-                ai_updates[fields[2]] = model_name.strip()
-            if messages_path is not None and messages_path.strip():
-                ai_updates[fields[3]] = messages_path.strip()
-            if ai_updates:
-                save_config_to_yaml({'ai': ai_updates})
-
-        return True, f'已更新 {name} 档位的接口配置。'
 
     def get_command_catalog(self) -> list[dict]:
         return [
@@ -563,27 +440,19 @@ class AIOrchestrator:
 
         parts = cleaned.split()
         if len(parts) == 1:
-            profile = self._chat_profiles[self._active_chat_profile]
-            lines = [f"当前: {self._active_chat_profile} → {profile.get('label') or profile['model_name']}\n\n可用模型:"]
-            for name, p in self._chat_profiles.items():
-                marker = '▶' if name == self._active_chat_profile else '  '
-                lines.append(f"  {marker} {name}: {p.get('label') or p['model_name']}")
-            self.bot.send_text(message.chat_type, message.chat_id, '\n'.join(lines))
+            # 列出所有模型
+            list_text = self.model_manager.list_models()
+            self.bot.send_text(message.chat_type, message.chat_id, list_text)
             return
 
-        requested = self._normalize_model_profile(parts[1])
-        if requested not in self._chat_profiles:
-            available = ' / '.join(self._chat_profiles.keys())
-            self.bot.send_text(message.chat_type, message.chat_id, f'可用模型: {available}')
-            return
-
-        self._active_chat_profile = requested
-        profile = self._chat_profiles[requested]
-        self.bot.send_text(
-            message.chat_type,
-            message.chat_id,
-            f"已切到 {requested} ({profile.get('label') or profile['model_name']})",
-        )
+        target = parts[1]
+        success, msg = self.model_manager.switch_model(target)
+        if success:
+            # 更新实际的模型实例
+            current = self.model_manager.get_current_model()
+            if current:
+                self._update_model_from_config(current)
+        self.bot.send_text(message.chat_type, message.chat_id, msg)
 
     def _is_admin_message(self, message: ChatMessage) -> bool:
         return int(message.user_id or 0) == int(self.config.admin_qq)
@@ -628,8 +497,6 @@ class AIOrchestrator:
             self._cancel_active_requests()
             self._recent_message_keys.clear()
             self._scheduled_alarm_ids.clear()
-            default_profile = str(getattr(self.config, 'default_chat_profile', 'claude') or 'claude').strip().lower()
-            self._active_chat_profile = default_profile if default_profile in self._chat_profiles else 'claude'
             self.config.enabled = True
             self.bot.send_text(
                 message.chat_type,
@@ -645,28 +512,21 @@ class AIOrchestrator:
         tools: list[dict] | None = None,
         temperature: float = 0.7,
     ) -> AnthropicReply | None:
-        profile = self._chat_profiles[self._active_chat_profile]
-        backend = self.model.with_config(
-            base_url=profile['base_url'],
-            api_key=profile['api_key'],
-            model_name=profile['model_name'],
-            messages_path=profile.get('messages_path'),
-        )
         try:
             return await asyncio.to_thread(
-                backend.complete,
+                self.model.complete,
                 system_blocks,
                 messages,
                 tools,
-                profile['model_name'],
+                self.model.model_name,
                 temperature,
             )
         except Exception as exc:
+            current = self.model_manager.get_current_model()
             error(
                 '[AI][model] request failed '
-                f"profile={self._active_chat_profile} "
-                f"model={profile['model_name']} "
-                f"base_url={profile['base_url']} "
+                f"model={current['display_name'] if current else 'unknown'} "
+                f"base_url={self.model.base_url} "
                 f'error={exc}'
             )
             raise
@@ -1805,20 +1665,13 @@ class AIOrchestrator:
             '请基于以上内容用中文写一段简明摘要，涵盖关键信息点，末尾列出引用到的链接（如果原始数据里有 URL 字段）。'
             '如果原始数据里解析不出有效结果，直接说明搜索没有找到有效内容，不要编造。'
         )
-        profile = self._chat_profiles['flash']
-        backend = self.model.with_config(
-            base_url=profile['base_url'],
-            api_key=profile['api_key'],
-            model_name=profile['model_name'],
-            messages_path=profile.get('messages_path'),
-        )
         try:
             reply = await asyncio.to_thread(
-                backend.complete,
+                self.model.complete,
                 self._static_system_blocks('你是一个搜索结果摘要助手，只根据给定的搜索数据做客观摘要，不要编造信息。'),
                 [{'role': 'user', 'content': summary_prompt}],
                 None,
-                profile['model_name'],
+                self.model.model_name,
                 0.3,
             )
         except Exception as exc:
@@ -2952,7 +2805,6 @@ class AIOrchestrator:
             f"群聊/私聊关系网（好感度、关联度、备注）:\n{chr(10).join(scope_relation_lines) if scope_relation_lines else '暂无'}\n\n"
             f"用户关系网（好感度、备注）:\n{chr(10).join(user_relation_lines) if user_relation_lines else '暂无'}\n\n"
             f"主AI备忘（带时间标记，注意判断时效性）:\n{chr(10).join(note_lines) if note_lines else '暂无'}\n\n"
-            f"当前模型档位: {self._active_chat_profile} -> {self._chat_profiles[self._active_chat_profile]['model_name']}\n\n"
             "如果这是跨会话联系请求，优先用 create_task 创建 delegate_to_child 任务，而不是直接 message_scope。"
             "如果这是进度追问，优先依据已有事实回传，不要猜测对方态度。"
             "你输出的普通文字会作为补充情报回传给来源子AI。"
