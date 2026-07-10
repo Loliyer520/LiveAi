@@ -63,7 +63,8 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
     'send_message': {
         'name': 'send_message',
         'description': (
-            '发送消息给用户。这是唯一真正发送消息的方式——你输出的普通文字只是内心想法，不会被发送。'
+            '发送消息给用户。这是唯一真正发送消息的方式——你输出的普通文字不会被发送。'
+            '如果需要先思考，把思考写在 content 的 <thinking>...</thinking> 内；系统会自动过滤这部分，用户只看到标签外内容。'
             '收到用户请求时，优先快速回应确认，不要让用户等待。'
             '如果任务需要时间（如 dev_agent），先发消息告知用户"好的，马上帮你查/等我改一下"，'
             '然后任务会在后续轮次中处理（当用户继续说话或系统触发时）。'
@@ -74,7 +75,7 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
             'properties': {
                 'content': {
                     'type': 'string',
-                    'description': '要发送的消息内容；换行会被拆成多条独立消息分别发送，用换行分隔 1 到 3 条短句',
+                    'description': '要发送的消息内容；可以包含 <thinking>...</thinking> 思考区，发送前会自动移除；换行会被拆成多条独立消息分别发送，用换行分隔 1 到 3 条短句',
                 },
             },
             'required': ['content'],
