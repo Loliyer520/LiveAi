@@ -581,6 +581,29 @@ class WebUIService:
         except Exception as e:
             return False, f'保存失败: {e}'
 
+    def _extract_model_ids(self, data) -> list[str]:
+        models: list[str] = []
+
+        def visit(value):
+            if isinstance(value, list):
+                for item in value:
+                    visit(item)
+                return
+            if not isinstance(value, dict):
+                return
+
+            model_id = value.get('id') or value.get('model') or value.get('model_id') or value.get('name')
+            if isinstance(model_id, str) and model_id.strip():
+                models.append(model_id.strip())
+
+            for key in ('data', 'models', 'result', 'results', 'items'):
+                nested = value.get(key)
+                if isinstance(nested, (list, dict)):
+                    visit(nested)
+
+        visit(data)
+        return sorted(set(models))
+
     def fetch_channel_models(self, payload: dict) -> tuple[bool, list[str] | str]:
         """从渠道接口拉取模型列表"""
         base_url = str((payload or {}).get('base_url') or '').strip().rstrip('/')
@@ -600,28 +623,19 @@ class WebUIService:
                 if response.status_code >= 400:
                     errors.append(f'{path}: HTTP {response.status_code}')
                     continue
-                data = response.json()
-                raw_models = data.get('data') if isinstance(data, dict) else data
-                if raw_models is None and isinstance(data, dict):
-                    raw_models = data.get('models')
-                models = []
-                for item in raw_models or []:
-                    if isinstance(item, str):
-                        model_id = item
-                    elif isinstance(item, dict):
-                        model_id = str(item.get('id') or item.get('model') or item.get('name') or '')
-                    else:
-                        model_id = ''
-                    model_id = model_id.strip()
-                    if model_id:
-                        models.append(model_id)
-                models = sorted(set(models))
+                try:
+                    data = response.json()
+                except ValueError:
+                    errors.append(f'{path}: 返回内容不是 JSON')
+                    continue
+                models = self._extract_model_ids(data)
                 if models:
                     return True, models
                 errors.append(f'{path}: 未解析到模型')
             except Exception as exc:
                 errors.append(f'{path}: {exc}')
         return False, '；'.join(errors) or '拉取失败。'
+
 
     def _serialize_task(self, item: dict) -> dict:
         return {
