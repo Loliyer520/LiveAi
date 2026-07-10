@@ -1195,8 +1195,9 @@ class AIOrchestrator:
                     '',
                     self.CHILD_RULES_PROMPT,
                     '',
-                    '发言方式：【关键】要发消息给用户，必须调用 send_message 工具，只有它的内容会真的发出去。'
-                    '你自己输出的普通文字（type: text）只是内心备注，不会被发送，也不要把心理活动写进 send_message。'
+                    '发言方式：【关键】要发消息给用户，必须调用 send_message 工具。'
+                    '如果需要思考分析，用 <thinking>...</thinking> 包裹写在 send_message 的 content 里，'
+                    '这部分会自动过滤掉不会发给用户，用户只看到思考标签外的正常内容。'
                     '如果觉得现在不该说话，就不要调用 send_message。',
                 ]
             )
@@ -1254,10 +1255,11 @@ class AIOrchestrator:
             {
                 'role': 'user',
                 'content': (
-                    '请牢记一条核心规则：你输出的普通文字是内心想法，不会发送给用户。'
+                    '请牢记一条核心规则：你输出的普通文字不会发送给用户。'
                     '想要发消息，必须调用 send_message 工具，传入 content 参数。'
-                    '即使只想说一句"好的"，也必须通过 send_message 发出，不能直接写在回复里。'
-                    '如果你决定不回复，什么都不做即可，不要把理由写成文字输出出来。'
+                    '如果需要先思考，把思考写进 send_message 的 content 里，并用 <thinking>...</thinking> 包裹；'
+                    '系统会自动过滤 thinking 标签，用户只会看到标签外的正常回复。'
+                    '如果你决定不回复，什么都不做即可，不要把理由写成普通文字输出。'
                 ),
             },
             {
@@ -1266,8 +1268,9 @@ class AIOrchestrator:
                     '好的，我记住了。'
                     '在接下来的所有对话中，我将严格遵守：'
                     '只要需要发消息，必须调用 send_message 工具；'
-                    '直接输出的文字只是内心想法，用户看不到，不能用来代替工具调用。'
-                    '如果我决定不回复，我会直接结束本轮，不会把不回复的理由写成文字。'
+                    '如果需要思考，我会把思考放在 send_message content 的 <thinking>...</thinking> 内；'
+                    '真正想发给用户看的话，写在 thinking 标签外面。'
+                    '如果我决定不回复，我会直接结束本轮，不会把不回复的理由写成普通文字。'
                 ),
             },
         ]
@@ -2045,8 +2048,14 @@ class AIOrchestrator:
 
         return '\n'.join(part for part in message_parts if part).strip()
 
+    def _strip_send_message_thinking(self, content: str) -> str:
+        content = str(content or '')
+        content = re.sub(r'<thinking>.*?</thinking>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        return content.strip()
+
     def _send_scope_message(self, message: ChatMessage, content: str) -> list[dict]:
-        content = str(content or '').strip()
+        content = self._strip_send_message_thinking(content)
         content = re.sub(r'\[\[.*?\]\]', '', content).strip()
         if message.chat_type == 'private':
             content = re.sub(r'\[CQ:at,qq=\d+\]', '', content).strip()
