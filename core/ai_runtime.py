@@ -1840,12 +1840,18 @@ class AIOrchestrator:
                 # ── 兜底逻辑：模型遗漏 send_message 时自动补发 ────────────────────────
                 # 某些模型（如 DeepSeek v4-pro）偶尔会忘记调用 send_message，直接把回复写到 text block。
                 # 检测到这种情况时：
-                # 1. 提取 text 内容作为消息发送
+                # 1. 提取 text 内容作为消息发送（移除 thinking 标签）
                 # 2. 把模型的原始输出改写成正确的工具调用格式（send_message），避免污染后续上下文
                 # 3. 记录 note 标记这是兜底修正
                 if not sent_entries and len(reply.text.strip()) > 4:
                     warn('[AI][fallback] 模型遗漏 send_message，自动补发并修正上下文')
-                    content = reply.text.strip()
+                    # 移除 thinking 标签，避免把内部思考发送出去
+                    content = re.sub(r'<thinking>.*?</thinking>', '', reply.text.strip(), flags=re.DOTALL).strip()
+                    if not content:
+                        # 如果移除 thinking 后没有内容，说明模型只输出了思考，不应该发送
+                        model_messages.append({'role': 'assistant', 'content': reply.raw_content})
+                        model_messages.append({'role': 'user', 'content': '请使用 send_message 工具发送你的回复。'})
+                        continue
                     entries = self._send_scope_message(live_message, content)
                     sent_entries.extend(entries)
                     final_reply = content
