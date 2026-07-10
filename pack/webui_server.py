@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 import threading
 import time
+import requests
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -121,6 +122,14 @@ class WebUIService:
                 if parsed.path == '/api/models_config':
                     ok, message = service.update_models_config(payload)
                     return self._write_json({'ok': ok, 'message': message}, status=200 if ok else 400)
+                if parsed.path == '/api/channel_models':
+                    ok, result = service.fetch_channel_models(payload)
+                    body = {'ok': ok}
+                    if ok:
+                        body['models'] = result
+                    else:
+                        body['message'] = result
+                    return self._write_json(body, status=200 if ok else 400)
                 return self._write_json({'error': 'not found'}, status=404)
 
             def _read_json(self):
@@ -566,10 +575,53 @@ class WebUIService:
 
             result = self.orchestrator.reload_models_config()
             if result.get('loaded'):
-                return True, f"模型配置已保存，已热加载 {result['count']} 个模型"
+                current = result.get('current') or '当前模型'
+                return True, f'模型配置已保存，已热加载：{current}'
             return True, '模型配置已保存（无有效渠道或主模型，保持原有配置）'
         except Exception as e:
             return False, f'保存失败: {e}'
+
+    def fetch_channel_models(self, payload: dict) -> tuple[bool, list[str] | str]:
+        """从渠道接口拉取模型列表"""
+        base_url = str((payload or {}).get('base_url') or '').strip().rstrip('/')
+        api_key = str((payload or {}).get('api_key') or '').strip()
+        if not base_url:
+            return False, '缺少 Base URL。'
+
+        headers = {'Accept': 'application/json'}
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+            headers['x-api-key'] = api_key
+
+        errors = []
+        for path in ('/models', '/v1/models'):
+            try:
+                response = requests.get(f'{base_url}{path}', headers=headers, timeout=20)
+                if response.status_code >= 400:
+                    errors.append(f'{path}: HTTP {response.status_code}')
+                    continue
+                data = response.json()
+                raw_models = data.get('data') if isinstance(data, dict) else data
+                if raw_models is None and isinstance(data, dict):
+                    raw_models = data.get('models')
+                models = []
+                for item in raw_models or []:
+                    if isinstance(item, str):
+                        model_id = item
+                    elif isinstance(item, dict):
+                        model_id = str(item.get('id') or item.get('model') or item.get('name') or '')
+                    else:
+                        model_id = ''
+                    model_id = model_id.strip()
+                    if model_id:
+                        models.append(model_id)
+                models = sorted(set(models))
+                if models:
+                    return True, models
+                errors.append(f'{path}: 未解析到模型')
+            except Exception as exc:
+                errors.append(f'{path}: {exc}')
+        return False, '；'.join(errors) or '拉取失败。'
 
     def _serialize_task(self, item: dict) -> dict:
         return {
