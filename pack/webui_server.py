@@ -611,6 +611,22 @@ class WebUIService:
             return text
         return text[:limit] + '...'
 
+    @staticmethod
+    def _model_list_base_candidates(base_url: str) -> list[str]:
+        base = str(base_url or '').strip().rstrip('/')
+        candidates = [base]
+        for suffix in ('/anthropic', '/v1'):
+            if base.endswith(suffix):
+                candidates.append(base[: -len(suffix)])
+        if base.endswith('/compatible-mode/v1'):
+            candidates.append(base[: -len('/v1')])
+        result = []
+        for item in candidates:
+            item = item.rstrip('/')
+            if item and item not in result:
+                result.append(item)
+        return result
+
     def fetch_channel_models(self, payload: dict) -> tuple[bool, list[str] | str]:
         """从渠道接口拉取模型列表"""
         base_url = str((payload or {}).get('base_url') or '').strip().rstrip('/')
@@ -624,29 +640,31 @@ class WebUIService:
             headers['x-api-key'] = api_key
 
         errors = []
-        for path in ('/models', '/v1/models'):
-            try:
-                response = requests.get(f'{base_url}{path}', headers=headers, timeout=20)
-                if response.status_code >= 400:
-                    preview = self._preview_response_text(response.text)
-                    warn(f'[WebUI][models] {path} HTTP {response.status_code}: {preview}')
-                    errors.append(f'{path}: HTTP {response.status_code}，预览: {preview[:200]}')
-                    continue
+        for candidate_base in self._model_list_base_candidates(base_url):
+            for path in ('/models', '/v1/models'):
+                label = f'{candidate_base}{path}'
                 try:
-                    data = response.json()
-                except ValueError:
+                    response = requests.get(label, headers=headers, timeout=20)
+                    if response.status_code >= 400:
+                        preview = self._preview_response_text(response.text)
+                        warn(f'[WebUI][models] {label} HTTP {response.status_code}: {preview}')
+                        errors.append(f'{label}: HTTP {response.status_code}，预览: {preview[:200]}')
+                        continue
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        preview = self._preview_response_text(response.text)
+                        warn(f'[WebUI][models] {label} 非 JSON 响应: {preview}')
+                        errors.append(f'{label}: 返回内容不是 JSON，预览: {preview[:200]}')
+                        continue
+                    models = self._extract_model_ids(data)
+                    if models:
+                        return True, models
                     preview = self._preview_response_text(response.text)
-                    warn(f'[WebUI][models] {path} 非 JSON 响应: {preview}')
-                    errors.append(f'{path}: 返回内容不是 JSON，预览: {preview[:200]}')
-                    continue
-                models = self._extract_model_ids(data)
-                if models:
-                    return True, models
-                preview = self._preview_response_text(response.text)
-                warn(f'[WebUI][models] {path} 未解析到模型: {preview}')
-                errors.append(f'{path}: 未解析到模型，预览: {preview[:200]}')
-            except Exception as exc:
-                errors.append(f'{path}: {exc}')
+                    warn(f'[WebUI][models] {label} 未解析到模型: {preview}')
+                    errors.append(f'{label}: 未解析到模型，预览: {preview[:200]}')
+                except Exception as exc:
+                    errors.append(f'{label}: {exc}')
         return False, '；'.join(errors) or '拉取失败。'
 
 
