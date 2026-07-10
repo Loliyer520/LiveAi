@@ -1740,6 +1740,7 @@ class AIOrchestrator:
         started_at = time.perf_counter()
         used_tools = False
         sent_entries: list[dict] = []
+        fallback_prompted = False
         max_iterations = 8 if live_message is not None else 6
         for _ in range(max_iterations):
             if self._is_epoch_stale(run_epoch):
@@ -1842,9 +1843,13 @@ class AIOrchestrator:
                 # 直接自动发送文本会把模型的内心独白泄露给用户，因此改为 re-prompt。
                 # 模型重新决策后：如果决定回复 → 调用 send_message；如果决定不回复 → 什么都不做，轮次正常结束。
                 if not sent_entries and reply.text.strip():
+                    if fallback_prompted:
+                        # 已经 re-prompt 过一次，模型仍不调工具，静默结束本轮
+                        break
                     warn('[AI][fallback] 模型未调用 send_message，re-prompt 重新决策')
+                    fallback_prompted = True
                     model_messages.append({'role': 'assistant', 'content': reply.raw_content})
-                    model_messages.append({'role': 'user', 'content': '如果你决定回复，请调用 send_message 工具发送；如果决定不回复，请调用 noop 工具结束本轮。'})
+                    model_messages.append({'role': 'user', 'content': '如果你决定回复，请调用 send_message 工具发送；如果决定不回复，什么都不输出即可。'})
                     continue
 
                 final_reply = '\n'.join(entry['text'] for entry in sent_entries)
