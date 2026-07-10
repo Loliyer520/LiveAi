@@ -10,7 +10,7 @@ class ModelManager:
     def __init__(self, config_path: str = 'data/models_config.json'):
         self.config_path = Path(config_path)
         self.config = self._load_config()
-        self.current_channel_index = 0
+        self.available_models: list[dict] = []
         self.current_model_index = 0
         self._select_initial_model()
 
@@ -34,140 +34,155 @@ class ModelManager:
         self.config = self._load_config()
         self._select_initial_model()
 
-    def _select_initial_model(self):
-        """根据 main.default_channel 和 default_model 选择初始模型"""
-        channels = self.config.get('channels', [])
-        if not channels:
-            warn('[ModelManager] 无可用渠道')
+    def _rebuild_available_models(self):
+        self.available_models = []
+        channels = self.config.get('channels') or []
+        main_models = (self.config.get('main') or {}).get('models') or []
+
+        for item in main_models:
+            try:
+                channel_idx = int(item.get('channel'))
+            except (TypeError, ValueError):
+                continue
+            if channel_idx < 0 or channel_idx >= len(channels):
+                continue
+            channel = channels[channel_idx]
+            model_id = str(item.get('model_name') or item.get('model_id') or item.get('name') or '').strip()
+            if not model_id:
+                continue
+            channel_name = str(channel.get('name') or f'渠道{channel_idx + 1}').strip()
+            display_model = str(item.get('name') or model_id).strip()
+            self.available_models.append(self._build_model_entry(channel_idx, channel_name, display_model, model_id, channel))
+
+        if self.available_models:
             return
 
-        main_config = self.config.get('main', {})
-        default_channel = main_config.get('default_channel')
-        default_model = main_config.get('default_model')
+        for channel_idx, channel in enumerate(channels):
+            channel_name = str(channel.get('name') or f'渠道{channel_idx + 1}').strip()
+            for model in channel.get('models') or []:
+                model_name = str(model.get('name') or model.get('model_id') or '').strip()
+                model_id = str(model.get('model_id') or model_name).strip()
+                if not model_id:
+                    continue
+                self.available_models.append(self._build_model_entry(channel_idx, channel_name, model_name or model_id, model_id, channel))
 
-        # 查找默认渠道
-        if default_channel:
-            for idx, ch in enumerate(channels):
-                if ch.get('name') == default_channel:
-                    self.current_channel_index = idx
-                    break
+    def _build_model_entry(self, channel_idx: int, channel_name: str, model_name: str, model_id: str, channel: dict) -> dict:
+        return {
+            'channel_index': channel_idx,
+            'channel_name': channel_name,
+            'model_name': model_name,
+            'model_id': model_id,
+            'base_url': str(channel.get('base_url') or '').strip().rstrip('/'),
+            'api_key': str(channel.get('api_key') or '').strip(),
+            'messages_path': str(channel.get('messages_path') or '/v1/messages').strip() or '/v1/messages',
+            'display_name': f'{channel_name}/{model_name}',
+        }
 
-        # 查找默认模型
-        current_channel = channels[self.current_channel_index]
-        models = current_channel.get('models', [])
-        if default_model and models:
-            for idx, m in enumerate(models):
-                if m.get('name') == default_model:
+    def _select_initial_model(self):
+        """根据 main.default_channel/default_model 或 main.models 选择初始模型"""
+        self._rebuild_available_models()
+        if not self.available_models:
+            warn('[ModelManager] 无可用模型')
+            return
+
+        self.current_model_index = min(self.current_model_index, len(self.available_models) - 1)
+        main_config = self.config.get('main') or {}
+        default_channel = str(main_config.get('default_channel') or '').strip()
+        default_model = str(main_config.get('default_model') or '').strip()
+
+        if default_channel or default_model:
+            for idx, item in enumerate(self.available_models):
+                channel_ok = not default_channel or item['channel_name'] == default_channel
+                model_ok = not default_model or item['model_name'] == default_model or item['model_id'] == default_model
+                if channel_ok and model_ok:
                     self.current_model_index = idx
                     break
 
-        info(
-            f'[ModelManager] 当前模型 '
-            f'channel={current_channel.get("name")} '
-            f'model={models[self.current_model_index].get("name") if models else "none"}'
-        )
+        current = self.available_models[self.current_model_index]
+        info(f'[ModelManager] 当前模型 {current["display_name"]} id={current["model_id"]}')
 
     def get_current_model(self) -> Optional[dict]:
         """获取当前选中的模型配置"""
-        channels = self.config.get('channels', [])
-        if not channels or self.current_channel_index >= len(channels):
+        if not self.available_models or self.current_model_index >= len(self.available_models):
             return None
-
-        channel = channels[self.current_channel_index]
-        models = channel.get('models', [])
-        if not models or self.current_model_index >= len(models):
-            return None
-
-        model = models[self.current_model_index]
+        model = self.available_models[self.current_model_index]
         return {
-            'base_url': channel['base_url'].rstrip('/'),
-            'api_key': channel['api_key'],
+            'base_url': model['base_url'],
+            'api_key': model['api_key'],
             'model_name': model['model_id'],
-            'messages_path': '/v1/messages',  # Anthropic 兼容接口固定路径
-            'display_name': f"{channel['name']}/{model['name']}",
+            'messages_path': model['messages_path'],
+            'display_name': model['display_name'],
         }
 
     def get_vision_model(self) -> Optional[dict]:
         """获取视觉模型配置"""
         vision = self.config.get('vision', {})
-        if not vision.get('base_url') or not vision.get('model_id'):
-            return None
+        if vision.get('base_url') and vision.get('model_id'):
+            return {
+                'base_url': vision['base_url'].rstrip('/'),
+                'api_key': vision.get('api_key', ''),
+                'model_name': vision['model_id'],
+            }
 
+        channels = self.config.get('channels') or []
+        models = vision.get('models') or []
+        if not models:
+            return None
+        item = models[0]
+        try:
+            channel_idx = int(item.get('channel'))
+        except (TypeError, ValueError):
+            return None
+        if channel_idx < 0 or channel_idx >= len(channels):
+            return None
+        model_id = str(item.get('model_name') or '').strip()
+        if not model_id:
+            return None
+        channel = channels[channel_idx]
         return {
-            'base_url': vision['base_url'].rstrip('/'),
-            'api_key': vision.get('api_key', ''),
-            'model_name': vision['model_id'],
+            'base_url': str(channel.get('base_url') or '').strip().rstrip('/'),
+            'api_key': str(channel.get('api_key') or '').strip(),
+            'model_name': model_id,
         }
 
     def switch_model(self, target: str) -> tuple[bool, str]:
-        """切换模型
+        """切换模型，支持 channel/model、model 或列表序号"""
+        target = str(target or '').strip()
+        if not self.available_models:
+            return False, '无可用模型'
+        if not target:
+            return False, '缺少模型名称'
 
-        Args:
-            target: 格式 "channel/model" 或 "model"（当前渠道）
+        if target.isdigit():
+            idx = int(target)
+            if 0 <= idx < len(self.available_models):
+                self.current_model_index = idx
+                return True, f'已切换到 {self.available_models[idx]["display_name"]}'
 
-        Returns:
-            (成功, 消息)
-        """
-        channels = self.config.get('channels', [])
-        if not channels:
-            return False, '无可用渠道'
+        for idx, item in enumerate(self.available_models):
+            if target in {item['display_name'], item['model_name'], item['model_id']}:
+                self.current_model_index = idx
+                return True, f'已切换到 {item["display_name"]}'
 
-        parts = target.split('/', 1)
-        if len(parts) == 2:
-            channel_name, model_name = parts
-            # 查找渠道
-            channel_idx = None
-            for idx, ch in enumerate(channels):
-                if ch.get('name') == channel_name:
-                    channel_idx = idx
-                    break
-            if channel_idx is None:
-                return False, f'渠道不存在: {channel_name}'
+        return False, f'模型不存在: {target}'
 
-            # 查找模型
-            models = channels[channel_idx].get('models', [])
-            model_idx = None
-            for idx, m in enumerate(models):
-                if m.get('name') == model_name:
-                    model_idx = idx
-                    break
-            if model_idx is None:
-                return False, f'模型不存在: {model_name}'
-
-            self.current_channel_index = channel_idx
-            self.current_model_index = model_idx
-            return True, f'已切换到 {channel_name}/{model_name}'
-
-        else:
-            model_name = parts[0]
-            current_channel = channels[self.current_channel_index]
-            models = current_channel.get('models', [])
-            model_idx = None
-            for idx, m in enumerate(models):
-                if m.get('name') == model_name:
-                    model_idx = idx
-                    break
-            if model_idx is None:
-                return False, f'当前渠道无此模型: {model_name}'
-
-            self.current_model_index = model_idx
-            return True, f'已切换到 {current_channel.get("name")}/{model_name}'
+    def switch_next_model(self) -> Optional[dict]:
+        """切换到下一个模型，用于失败自动轮询"""
+        if len(self.available_models) <= 1:
+            return None
+        self.current_model_index = (self.current_model_index + 1) % len(self.available_models)
+        current = self.get_current_model()
+        if current:
+            warn(f'[ModelManager] 自动切换到 {current["display_name"]}')
+        return current
 
     def list_models(self) -> str:
         """列出所有可用模型"""
-        channels = self.config.get('channels', [])
-        if not channels:
-            return '无可用渠道'
+        if not self.available_models:
+            return '无可用模型'
 
         lines = ['可用模型:']
-        current = self.get_current_model()
-        current_display = current['display_name'] if current else ''
-
-        for ch in channels:
-            lines.append(f"\n渠道: {ch['name']}")
-            for m in ch.get('models', []):
-                display = f"{ch['name']}/{m['name']}"
-                marker = ' [当前]' if display == current_display else ''
-                lines.append(f"  · {m['name']}{marker}")
-
+        for idx, item in enumerate(self.available_models):
+            marker = ' [当前]' if idx == self.current_model_index else ''
+            lines.append(f"  {idx}. {item['display_name']} ({item['model_id']}){marker}")
         return '\n'.join(lines)
