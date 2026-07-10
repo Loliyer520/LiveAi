@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 from core.ai_repository import AIRepository
 from core.ai_runtime import AIOrchestrator
-from pack.console_logger import ok
+from pack.console_logger import ok, warn
 
 
 class WebUIService:
@@ -604,6 +604,13 @@ class WebUIService:
         visit(data)
         return sorted(set(models))
 
+    @staticmethod
+    def _preview_response_text(text: str, limit: int = 800) -> str:
+        text = str(text or '').replace('\n', ' ').replace('\r', ' ').strip()
+        if len(text) <= limit:
+            return text
+        return text[:limit] + '...'
+
     def fetch_channel_models(self, payload: dict) -> tuple[bool, list[str] | str]:
         """从渠道接口拉取模型列表"""
         base_url = str((payload or {}).get('base_url') or '').strip().rstrip('/')
@@ -621,17 +628,23 @@ class WebUIService:
             try:
                 response = requests.get(f'{base_url}{path}', headers=headers, timeout=20)
                 if response.status_code >= 400:
-                    errors.append(f'{path}: HTTP {response.status_code}')
+                    preview = self._preview_response_text(response.text)
+                    warn(f'[WebUI][models] {path} HTTP {response.status_code}: {preview}')
+                    errors.append(f'{path}: HTTP {response.status_code}，预览: {preview[:200]}')
                     continue
                 try:
                     data = response.json()
                 except ValueError:
-                    errors.append(f'{path}: 返回内容不是 JSON')
+                    preview = self._preview_response_text(response.text)
+                    warn(f'[WebUI][models] {path} 非 JSON 响应: {preview}')
+                    errors.append(f'{path}: 返回内容不是 JSON，预览: {preview[:200]}')
                     continue
                 models = self._extract_model_ids(data)
                 if models:
                     return True, models
-                errors.append(f'{path}: 未解析到模型')
+                preview = self._preview_response_text(response.text)
+                warn(f'[WebUI][models] {path} 未解析到模型: {preview}')
+                errors.append(f'{path}: 未解析到模型，预览: {preview[:200]}')
             except Exception as exc:
                 errors.append(f'{path}: {exc}')
         return False, '；'.join(errors) or '拉取失败。'
