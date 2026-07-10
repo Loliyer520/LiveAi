@@ -88,9 +88,15 @@ class AnthropicChatModel:
                 f'anthropic request failed status={response.status_code} body={response.text[:500]}'
             )
         data = response.json()
-        content = data.get('content') or []
-        if not isinstance(content, list):
-            return None
+
+        # 优先尝试 Anthropic 格式（content 字段为 block 列表）
+        raw = data.get('content')
+        if isinstance(raw, list) and raw:
+            content = [b for b in raw if isinstance(b, dict) and b.get('type') != 'thinking']
+            stop_reason = str(data.get('stop_reason') or '')
+        else:
+            # 降级：OpenAI 格式（choices[0].message）
+            content, stop_reason = self._parse_openai_response(data)
 
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
@@ -117,6 +123,46 @@ class AnthropicChatModel:
         return AnthropicReply(
             text='\n'.join(part for part in text_parts if part).strip(),
             tool_calls=tool_calls,
-            stop_reason=str(data.get('stop_reason') or ''),
+            stop_reason=stop_reason,
             raw_content=content,
         )
+
+    def _parse_openai_response(self, data: dict) -> tuple[list[dict], str]:
+        """将 OpenAI 格式响应转换为 Anthropic content blocks 列表。"""
+        choices = data.get('choices') or []
+        if not choices:
+            return [], ''
+        choice = choices[0]
+        msg = choice.get('message') or {}
+        finish_reason = str(choice.get('finish_reason') or '')
+        stop_reason = {'stop': 'end_turn', 'tool_calls': 'tool_use', 'length': 'max_tokens'}.get(finish_reason, finish_reason)
+
+        blocks: list[dict] = []
+
+        # 文本内容
+        text_content = msg.get('content')
+        if isinstance(text_content, str) and text_content.strip():
+            blocks.append({'type': 'text', 'text': text_content})
+        elif isinstance(text_content, list):
+            for item in text_content:
+                if isinstance(item, dict) and item.get('type') == 'text':
+                    blocks.append({'type': 'text', 'text': str(item.get('text') or '')})
+
+        # 工具调用
+        for tc in msg.get('tool_calls') or []:
+            fn = tc.get('function') or {}
+            arguments = fn.get('arguments') or '{}'
+            try:
+                tool_input = json.loads(arguments) if isinstance(arguments, str) else arguments
+            except (ValueError, TypeError):
+                tool_input = {'raw': arguments}
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+            blocks.append({
+                'type': 'tool_use',
+                'id': str(tc.get('id') or ''),
+                'name': str(fn.get('name') or ''),
+                'input': tool_input,
+            })
+
+        return blocks, stop_reason
