@@ -1,0 +1,44 @@
+{
+  "channels": [
+    {
+      "name": "DeepSeek",
+      "base_url": "https://api.deepseek.com/anthropic",
+      "api_key": "sk-18a0b0ab7b2748499380a623a672ec50",
+      "models": [
+        {
+          "name": "flash",
+          "model_id": "deepseek-v4-flash"
+        },
+        {
+          "name": "pro",
+          "model_id": "deepseek-v4-pro"
+        }
+      ]
+    },
+    {
+      "name": "ForCode",
+      "base_url": "https://forcode.shop/v1",
+      "api_key": "sk-f452a5db49194ef85db2f049951dbec595234f5c67ef4d60dc6ea6dbd0d9e0b4",
+      "models": [
+        {
+          "name": "sonnet",
+          "model_id": "claude-sonnet-5"
+        },
+        {
+          "name": "opus",
+          "model_id": "claude-opus-4-6"
+        }
+      ]
+    }
+  ],
+  "vision": {
+    "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    "api_key": "sk-4ce6b57d200447aabecf2c0582473bda",
+    "model_id": "qwen3.5-flash"
+  },
+  "main": {
+    "default_channel": "DeepSeek",
+    "default_model": "flash"
+  },
+  "tiered": {}
+}
