@@ -1837,71 +1837,15 @@ class AIOrchestrator:
                     model_messages.append({'role': 'user', 'content': '好的，现在可以正常回复了。'})
                     continue
 
-                # ── 兜底逻辑：模型遗漏 send_message 时自动补发 ────────────────────────
-                # 某些模型（如 DeepSeek v4-pro）偶尔会忘记调用 send_message，直接把回复写到 text block。
-                # 检测到这种情况时：
-                # 1. 提取 text 内容作为消息发送（移除 thinking 标签）
-                # 2. 把模型的原始输出改写成正确的工具调用格式（send_message），避免污染后续上下文
-                # 3. 记录 note 标记这是兜底修正
-                if not sent_entries and len(reply.text.strip()) > 4:
-                    warn('[AI][fallback] 模型遗漏 send_message，自动补发并修正上下文')
-                    # 移除 thinking 标签，避免把内部思考发送出去
-                    content = re.sub(r'<thinking>.*?</thinking>', '', reply.text.strip(), flags=re.DOTALL).strip()
-                    if not content:
-                        # 如果移除 thinking 后没有内容，说明模型只输出了思考，不应该发送
-                        model_messages.append({'role': 'assistant', 'content': reply.raw_content})
-                        model_messages.append({'role': 'user', 'content': '请使用 send_message 工具发送你的回复。'})
-                        continue
-                    entries = self._send_scope_message(live_message, content)
-                    sent_entries.extend(entries)
-                    final_reply = content
-                    think_note = self._normalize_think_note(reply.text)
-
-                    # 修正上下文：把原始 text 改写成工具调用格式
-                    corrected_content = []
-                    if reply.raw_content:
-                        for block in reply.raw_content:
-                            if isinstance(block, dict) and block.get('type') == 'text':
-                                # 跳过 text block，替换为工具调用
-                                continue
-                            corrected_content.append(block)
-
-                    # 补上正确的 send_message 工具调用
-                    tool_call_id = f'fallback_{int(time.time() * 1000)}'
-                    corrected_content.append({
-                        'type': 'tool_use',
-                        'id': tool_call_id,
-                        'name': 'send_message',
-                        'input': {'content': content}
-                    })
-                    model_messages.append({'role': 'assistant', 'content': corrected_content})
-
-                    # 补上工具返回结果
-                    message_ids = [e.get('message_id') for e in entries if e.get('message_id')]
-                    result_text = f"已发送 {len(entries)} 条消息" + (f"，message_id: {message_ids}" if message_ids else "")
-                    model_messages.append({
-                        'role': 'user',
-                        'content': [{
-                            'type': 'tool_result',
-                            'tool_use_id': tool_call_id,
-                            'content': result_text,
-                        }]
-                    })
-
-                    self._record_turn_log(
-                        scope_type,
-                        scope_id,
-                        agent_id,
-                        model_messages,
-                        raw_reply=json.dumps(reply.raw_content, ensure_ascii=False),
-                        final_reply=final_reply,
-                        temperature=temperature,
-                        turn_meta=turn_meta,
-                        tool_iterations=tool_iterations,
-                        generation_ms=generation_ms,
-                        note='模型遗漏 send_message，已自动补发并修正上下文为工具调用格式',
-                    )
-                    return {'message': final_reply, 'think_note': think_note}, generation_ms, used_tools
+                # ── 兜底逻辑：模型未调用 send_message，re-prompt 让模型重新决策 ──────────
+                # 模型可能是：①忘记调用工具（某些模型偶发）②主动选择不回复（把理由写进文本）
+                # 直接自动发送文本会把模型的内心独白泄露给用户，因此改为 re-prompt。
+                # 模型重新决策后：如果决定回复 → 调用 send_message；如果决定不回复 → 什么都不做，轮次正常结束。
+                if not sent_entries and reply.text.strip():
+                    warn('[AI][fallback] 模型未调用 send_message，re-prompt 重新决策')
+                    model_messages.append({'role': 'assistant', 'content': reply.raw_content})
+                    model_messages.append({'role': 'user', 'content': '如果你决定回复，请调用 send_message 工具发送；如果决定不回复，请调用 noop 工具结束本轮。'})
+                    continue
 
                 final_reply = '\n'.join(entry['text'] for entry in sent_entries)
                 think_note = self._normalize_think_note(reply.text)
