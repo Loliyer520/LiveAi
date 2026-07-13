@@ -1,6 +1,6 @@
 """
 开发Agent - 负责编写、修改和优化代码
-继承自BaseAgent，专注于软件开发任务
+独立Agent，专注于软件开发任务
 """
 
 import os
@@ -21,13 +21,11 @@ except ImportError:
     PartDict = None
     HAS_GENAI = False
 
-from .base_agent import BaseAgent
-
 MAX_ITERATIONS = 200
 WORKSPACE_DIR = "workspace"
 
 
-class DevAgent(BaseAgent):
+class DevAgent:
     """开发Agent，专注于代码编写、修改和优化"""
     
     def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash", 
@@ -59,7 +57,11 @@ class DevAgent(BaseAgent):
 - 考虑边界情况和错误处理
 - 遵循项目的编码规范"""
         
-        super().__init__(api_key, model_name, api_base, tools, system_prompt)
+        self.api_key = api_key
+        self.model_name = model_name
+        self.api_base = api_base
+        self.tools = tools if tools is not None else []
+        self.system_prompt = system_prompt
     
     def generate_code(self, prompt: str, context: Optional[str] = None) -> str:
         """
@@ -280,7 +282,54 @@ class DevAgent(BaseAgent):
         if workspace_files:
             task += f"\n\n注意：工作目录中有以下文件可用：{', '.join(workspace_files)}"
         
-        return super().run(task, **kwargs)
+        return self._run(task, **kwargs)
+    
+    def _run(self, task: str, **kwargs) -> str:
+        """
+        使用 google.generativeai SDK 调用 Gemini 模型
+        
+        Args:
+            task: 任务描述/用户消息
+            **kwargs: 额外参数，可包含 generation_config
+            
+        Returns:
+            模型的响应文本
+        """
+        if not HAS_GENAI:
+            raise ImportError("google-generativeai 未安装，请运行: pip install google-generativeai")
+        
+        # 配置 API 客户端
+        client_kwargs = {"api_key": self.api_key}
+        if self.api_base:
+            client_kwargs["client_options"] = {"api_endpoint": self.api_base}
+        genai.configure(**client_kwargs)
+        
+        # 提取可选配置
+        generation_config = kwargs.pop("generation_config", None)
+        
+        # 构建带有 system_instruction 的生成模型
+        model = genai.GenerativeModel(
+            model_name=self.model_name,
+            system_instruction=self.system_prompt,
+        )
+        
+        # 调用模型生成内容
+        response = model.generate_content(
+            task,
+            generation_config=generation_config,
+        )
+        
+        # 提取响应文本
+        try:
+            return response.text
+        except ValueError:
+            # 如果响应被安全过滤等原因导致无法获取 text，返回空字符串
+            if response.candidates and response.candidates[0].content.parts:
+                return "".join(
+                    part.text for part in response.candidates[0].content.parts
+                    if hasattr(part, "text")
+                )
+            return ""
     
     def process_task(self, task: str, files: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """
