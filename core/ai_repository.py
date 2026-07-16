@@ -1,25 +1,30 @@
 import time
 import uuid
+from pathlib import Path
 
 from core.ai_types import AgentProfile, PendingTask
+from core.turn_log_slim import slim_turn_log, TURN_LOG_LIMIT
 from pack.json_store import JsonStore
+from pack.scoped_memory_store import ScopedMemoryStore
 
 
 class AIRepository:
-    def __init__(self, store: JsonStore):
+    def __init__(self, store: JsonStore, memory_store: ScopedMemoryStore | None = None):
         self.store = store
+        # memories 已从主文件拆分到独立目录（方案B）。默认放主文件同级的 memories/ 目录。
+        if memory_store is None:
+            base_dir = Path(store.file_path).parent / 'memories'
+            memory_store = ScopedMemoryStore(str(base_dir))
+        self.memory_store = memory_store
         self.store.update(self._ensure_shape)
 
     @staticmethod
     def _ensure_shape(payload: dict):
         payload.setdefault('agents', {})
-        payload.setdefault('memories', {})
         payload.setdefault('tasks', {})
         payload.setdefault('relations', {'users': {}, 'scopes': {}})
         payload.setdefault('settings', {})
         payload.setdefault('knowledge_base', [])
-        for memory in (payload.get('memories') or {}).values():
-            AIRepository._normalize_memory(memory)
 
     def get_setting(self, key: str, default=None):
         payload = self.store.load()
@@ -100,8 +105,7 @@ class AIRepository:
             item.setdefault('turn_id', uuid.uuid4().hex[:12])
             item.setdefault('created_at', time.time())
 
-    def _ensure_memory_entry(self, payload: dict, key: str) -> dict:
-        memory = payload['memories'].setdefault(key, {})
+    def _ensure_memory_entry(self, memory: dict) -> dict:
         self._normalize_memory(memory)
         return memory
 
@@ -324,6 +328,11 @@ class AIRepository:
     def get_or_create_agent(self, scope_type: str, scope_id: str, role: str = 'child') -> AgentProfile:
         key = self._agent_key(scope_type, scope_id)
 
+        # 快路径：agent 已存在时只读返回，不触发全量写盘（避免每条消息都重写整份状态文件）。
+        existing = (self.store.load().get('agents') or {}).get(key)
+        if existing:
+            return AgentProfile(**existing)
+
         def mutator(payload: dict):
             agents = payload['agents']
             data = agents.get(key)
@@ -339,10 +348,15 @@ class AIRepository:
         key = self._memory_key(scope_type, scope_id)
         agent_key = self._agent_key(scope_type, scope_id)
 
-        def mutator(payload: dict):
-            messages = self._ensure_memory_entry(payload, key)['messages']
+        def mem_mutator(memory: dict):
+            self._normalize_memory(memory)
+            messages = memory['messages']
             messages.append(message)
             del messages[:-limit]
+
+        self.memory_store.update(key, mem_mutator)
+
+        def agent_mutator(payload: dict):
             agents = payload['agents']
             data = agents.get(agent_key)
             if not data:
@@ -352,38 +366,39 @@ class AIRepository:
             data['updated_at'] = time.time()
             data['message_count'] = int(data.get('message_count') or 0) + 1
 
-        self.store.update(mutator)
+        self.store.update(agent_mutator)
 
     def list_messages(self, scope_type: str, scope_id: str) -> list[dict]:
-        payload = self.store.load()
         key = self._memory_key(scope_type, scope_id)
-        return list((payload.get('memories', {}).get(key) or {}).get('messages', []))
+        memory = self.memory_store.load(key)
+        return list((memory or {}).get('messages', []))
 
     def clear_messages(self, scope_type: str, scope_id: str):
         key = self._memory_key(scope_type, scope_id)
 
-        def mutator(payload: dict):
-            memory = self._ensure_memory_entry(payload, key)
+        def mutator(memory: dict):
+            self._normalize_memory(memory)
             memory['messages'] = []
 
-        self.store.update(mutator)
+        self.memory_store.update(key, mutator)
 
     def clear_notes(self, scope_type: str, scope_id: str):
         key = self._memory_key(scope_type, scope_id)
 
-        def mutator(payload: dict):
-            memory = self._ensure_memory_entry(payload, key)
+        def mutator(memory: dict):
+            self._normalize_memory(memory)
             memory['notes'] = []
 
-        self.store.update(mutator)
+        self.memory_store.update(key, mutator)
 
     def clear_memory(self, scope_type: str, scope_id: str):
         key = self._memory_key(scope_type, scope_id)
 
-        def mutator(payload: dict):
-            payload['memories'][key] = {'messages': [], 'notes': [], 'tool_logs': [], 'turn_logs': []}
+        def mutator(memory: dict):
+            memory.clear()
+            memory.update({'messages': [], 'notes': [], 'tool_logs': [], 'turn_logs': []})
 
-        self.store.update(mutator)
+        self.memory_store.update(key, mutator)
 
     def add_note(self, scope_type: str, scope_id: str, note: str) -> dict | None:
         key = self._memory_key(scope_type, scope_id)
@@ -391,9 +406,9 @@ class AIRepository:
         if not note:
             return None
 
-        def mutator(payload: dict):
+        def mutator(memory: dict):
+            self._normalize_memory(memory)
             now = time.time()
-            memory = self._ensure_memory_entry(payload, key)
             item = {
                 'note_id': uuid.uuid4().hex[:12],
                 'content': note,
@@ -404,12 +419,11 @@ class AIRepository:
             del memory['notes'][:-200]
             return dict(item)
 
-        return self.store.update(mutator)
+        return self.memory_store.update(key, mutator)
 
     def list_notes(self, scope_type: str, scope_id: str) -> list[dict]:
-        payload = self.store.load()
         key = self._memory_key(scope_type, scope_id)
-        memory = dict((payload.get('memories', {}).get(key) or {}))
+        memory = dict(self.memory_store.load(key) or {})
         self._normalize_memory(memory)
         return list(memory.get('notes', []))
 
@@ -429,8 +443,8 @@ class AIRepository:
         if not note_id or not content:
             return None
 
-        def mutator(payload: dict):
-            memory = self._ensure_memory_entry(payload, key)
+        def mutator(memory: dict):
+            self._normalize_memory(memory)
             for item in memory['notes']:
                 if str(item.get('note_id') or '') != note_id:
                     continue
@@ -439,7 +453,7 @@ class AIRepository:
                 return dict(item)
             return None
 
-        return self.store.update(mutator)
+        return self.memory_store.update(key, mutator)
 
     def add_tool_log(
         self,
@@ -453,8 +467,8 @@ class AIRepository:
     ) -> dict:
         key = self._memory_key(scope_type, scope_id)
 
-        def mutator(payload: dict):
-            memory = self._ensure_memory_entry(payload, key)
+        def mutator(memory: dict):
+            self._normalize_memory(memory)
             item = {
                 'log_id': uuid.uuid4().hex[:12],
                 'agent_id': str(agent_id or ''),
@@ -467,33 +481,31 @@ class AIRepository:
             del memory['tool_logs'][:-max(1, int(limit or 500))]
             return dict(item)
 
-        return self.store.update(mutator)
+        return self.memory_store.update(key, mutator)
 
     def list_tool_logs(self, scope_type: str, scope_id: str) -> list[dict]:
-        payload = self.store.load()
         key = self._memory_key(scope_type, scope_id)
-        memory = dict((payload.get('memories', {}).get(key) or {}))
+        memory = dict(self.memory_store.load(key) or {})
         self._normalize_memory(memory)
         return list(memory.get('tool_logs', []))
 
-    def add_turn_log(self, scope_type: str, scope_id: str, log: dict, limit: int = 500) -> dict:
+    def add_turn_log(self, scope_type: str, scope_id: str, log: dict, limit: int = TURN_LOG_LIMIT) -> dict:
         key = self._memory_key(scope_type, scope_id)
 
-        def mutator(payload: dict):
-            memory = self._ensure_memory_entry(payload, key)
-            item = dict(log or {})
+        def mutator(memory: dict):
+            self._normalize_memory(memory)
+            item = slim_turn_log(dict(log or {}))
             item.setdefault('turn_id', uuid.uuid4().hex[:12])
             item.setdefault('created_at', time.time())
             memory['turn_logs'].append(item)
-            del memory['turn_logs'][:-max(1, int(limit or 500))]
+            del memory['turn_logs'][:-max(1, int(limit or TURN_LOG_LIMIT))]
             return dict(item)
 
-        return self.store.update(mutator)
+        return self.memory_store.update(key, mutator)
 
     def list_turn_logs(self, scope_type: str, scope_id: str) -> list[dict]:
-        payload = self.store.load()
         key = self._memory_key(scope_type, scope_id)
-        memory = dict((payload.get('memories', {}).get(key) or {}))
+        memory = dict(self.memory_store.load(key) or {})
         self._normalize_memory(memory)
         return list(memory.get('turn_logs', []))
 
@@ -584,6 +596,10 @@ class AIRepository:
             self._ensure_shape(payload)
 
         self.store.update(mutator)
+        self.memory_store.reset_all()
+
+    def count_memory_scopes(self) -> int:
+        return len(self.memory_store.list_scopes())
 
     def list_agents(self) -> list[dict]:
         payload = self.store.load()
@@ -596,9 +612,8 @@ class AIRepository:
         return (payload.get('agents') or {}).get(self._agent_key(scope_type, scope_id))
 
     def get_memory(self, scope_type: str, scope_id: str) -> dict:
-        payload = self.store.load()
         key = self._memory_key(scope_type, scope_id)
-        memory = dict((payload.get('memories', {}).get(key) or {}))
+        memory = dict(self.memory_store.load(key) or {})
         self._normalize_memory(memory)
         return memory
 

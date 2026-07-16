@@ -1,3 +1,4 @@
+import importlib.util
 from pathlib import Path
 
 from pack.napcat import NapcatBot
@@ -22,6 +23,30 @@ def _prepare_ai_storage_path(storage_path: str) -> str:
     target.parent.mkdir(parents=True, exist_ok=True)
     legacy.replace(target)
     return str(target)
+
+
+def _auto_migrate_memories(state_path: str) -> None:
+    """启动时自动迁移（方案B）：把单文件 ai_state.json 的 memories 按 scope 拆分。
+
+    只在检测到旧结构（有 memories 键 / 无 _schema_version=2）时执行一次。
+    迁移脚本内部会自动备份 + 完整性校验，校验不过则不替换真实文件并返回非0，
+    此时中止启动（抛异常），避免用未迁移/半迁移状态继续跑。
+
+    在 AIRepository 初始化之前、进程尚未把旧 memories 载入内存之前调用，
+    确保不会与运行中的写盘抢占同一文件。
+    """
+    script_path = Path(__file__).resolve().parent / 'scripts' / 'migrate_split_memories.py'
+    if not script_path.exists():
+        return
+    spec = importlib.util.spec_from_file_location('migrate_split_memories', script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    code = module.migrate(Path(state_path), dry_run=False)
+    if code not in (0,):
+        raise RuntimeError(
+            f'ai_state.json 记忆拆分迁移失败 (code={code})，已中止启动。'
+            f'原文件未被替换，请检查迁移日志后重试。'
+        )
 
 
 def build_app() -> NapcatBot:
@@ -64,7 +89,9 @@ def build_app() -> NapcatBot:
     )
     satangyun_module.register()
 
-    ai_repo = AIRepository(JsonStore(_prepare_ai_storage_path(config.ai.storage_path)))
+    ai_storage_path = _prepare_ai_storage_path(config.ai.storage_path)
+    _auto_migrate_memories(ai_storage_path)
+    ai_repo = AIRepository(JsonStore(ai_storage_path))
     ai_orchestrator = AIOrchestrator(config.ai, bot, ai_repo, anthropic_model, vision_model)
     ai_orchestrator.start()
     ai_orchestrator.register()

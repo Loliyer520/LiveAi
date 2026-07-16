@@ -68,8 +68,8 @@ class SatangyunConfig:
 @dataclass
 class AIConfig:
     enabled: bool = _get_bool('ai', 'enabled', 'AI_ENABLED', True)
-    admin_qq: int = _get_int('ai', 'admin_qq', 'AI_ADMIN_QQ', 123456789)
-    master_qq: int = _get_int('ai', 'master_qq', 'AI_MASTER_QQ', 0)
+    admin_qq: int = _get_int('ai', 'admin_qq', 'AI_ADMIN_QQ', 241898129)
+    master_qq: int = _get_int('ai', 'master_qq', 'AI_MASTER_QQ', 241898129)
     default_chat_profile: str = _get('ai', 'default_chat_profile', 'AI_DEFAULT_CHAT_PROFILE', 'claude')
     model_base_url: str = _get('ai', 'model_base_url', 'AI_MODEL_BASE_URL', 'https://api.deepseek.com/anthropic')
     api_key: str = _get('ai', 'api_key', 'AI_MODEL_API_KEY', 'sk-your-deepseek-key')
@@ -105,7 +105,7 @@ class AIConfig:
     auto_update_enabled: bool = _get_bool('ai', 'auto_update_enabled', 'AI_AUTO_UPDATE_ENABLED', True)
     auto_update_check_hour: int = _get_int('ai', 'auto_update_check_hour', 'AI_AUTO_UPDATE_CHECK_HOUR', 4)
     dev_agent_prompt_path: str = _get('ai', 'dev_agent_prompt_path', 'AI_DEV_AGENT_PROMPT_PATH', 'data/prompt/dev_agent.txt')
-
+    agent_prompt_path: str = _get('ai', 'agent_prompt_path', 'AI_AGENT_PROMPT_PATH', 'data/prompt/agent.txt')
 
 @dataclass
 class WebUIConfig:

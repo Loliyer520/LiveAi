@@ -1,7 +1,7 @@
 import copy
 
 # 循环型工具：执行后把 tool_result 回填给模型继续本回合
-LOOP_TOOL_NAMES = {'memory_list', 'memory_get', 'memory_add', 'memory_update', 'web_search', 'list_tasks', 'get_task', 'download_file', 'check_github_version', 'execute_update'}
+LOOP_TOOL_NAMES = {'memory_list', 'memory_get', 'memory_add', 'memory_update', 'web_search', 'list_tasks', 'get_task', 'download_file', 'check_github_version', 'execute_update', 'create_agent', 'send_to_agent', 'peek_agent', 'list_agents', 'destroy_agent'}
 
 # 指令型工具：终结本回合，由运行时按结构化入参执行
 DIRECTIVE_TOOL_NAMES = {'send_message', 'remember', 'notify_master', 'create_task', 'recall_message'}
@@ -268,6 +268,78 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
             'required': ['task_id'],
         },
     },
+    'create_agent': {
+        'name': 'create_agent',
+        'description': (
+            '创建一个常驻后台 agent 并立即让它开工，返回 agent_id。'
+            '与一次性 dev_agent 任务不同，常驻 agent 会持续存在、可多轮双向沟通：'
+            '它能读写本地项目代码、执行 shell、只读查阅或（token 权限允许时）改动 GitHub 仓库；'
+            '干完一段会挂起待命，可以随时用 send_to_agent 追加指令、用 peek_agent 查进度、'
+            '用 destroy_agent 结束它。适合需要长期跟进、分阶段推进或反复交互的后台工作。'
+            'instruction 用自然语言写清楚要它做什么、期望结果，涉及仓库时带上 owner/repo。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'instruction': {'type': 'string', 'description': '交给该 agent 的任务描述，用自然语言写清楚要做什么、期望结果'},
+            },
+            'required': ['instruction'],
+        },
+    },
+    'send_to_agent': {
+        'name': 'send_to_agent',
+        'description': (
+            '给指定常驻 agent 发送一条消息/追加指令，唤醒它继续工作。'
+            '用于在 agent 挂起待命或运行中补充要求、回答它的提问、调整方向。'
+            'agent_id 来自 create_agent 的返回或 list_agents。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'agent_id': {'type': 'string', 'description': '目标 agent 的 ID'},
+                'message': {'type': 'string', 'description': '要发给该 agent 的消息或指令内容'},
+            },
+            'required': ['agent_id', 'message'],
+        },
+    },
+    'peek_agent': {
+        'name': 'peek_agent',
+        'description': (
+            '获取指定常驻 agent 当前的进度总结（由一个只读、无工具权限的总结 AI 生成），'
+            '不会打断它正在进行的工作。用于了解 agent 干到哪一步、有没有卡住或风险。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'agent_id': {'type': 'string', 'description': '要查看进度的 agent 的 ID'},
+            },
+            'required': ['agent_id'],
+        },
+    },
+    'list_agents': {
+        'name': 'list_agents',
+        'description': (
+            '列出当前所有常驻 agent 及其状态（running/waiting/idle）、任务摘要、消息数与时间。'
+            '用于在创建/查看/销毁 agent 前先掌握全局情况。'
+        ),
+        'input_schema': {'type': 'object', 'properties': {}, 'required': []},
+    },
+    'destroy_agent': {
+        'name': 'destroy_agent',
+        'description': (
+            '销毁指定常驻 agent：强制中断它的常驻循环并移除记录（会自动清理它的后台 shell 任务）。'
+            'summarize=true 时会在销毁前先做一份总结（已完成的操作、可能遗留的隐患），随结果返回。'
+            '确认某个 agent 不再需要时使用。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'agent_id': {'type': 'string', 'description': '要销毁的 agent 的 ID'},
+                'summarize': {'type': 'boolean', 'description': '是否在销毁前先生成一份总结，默认 false'},
+            },
+            'required': ['agent_id', 'summarize'],
+        },
+    },
 }
 
 
@@ -297,6 +369,7 @@ def build_tools(
         names.append('notify_master')
     if allow_tasks:
         names.append('create_task')
+        names.extend(['create_agent', 'send_to_agent', 'peek_agent', 'list_agents', 'destroy_agent'])
     if allow_recurring_tasks:
         names.extend(['create_recurring_task', 'list_recurring_tasks', 'update_recurring_task', 'delete_recurring_task'])
     if allow_update_tools:

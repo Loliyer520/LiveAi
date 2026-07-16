@@ -34,7 +34,7 @@ class JsonStore:
         with self._lock:
             self._cache = payload
             temp_path = self.file_path.with_suffix(self.file_path.suffix + '.tmp')
-            temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+            temp_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
             temp_path.replace(self.file_path)
 
     def update(self, mutator):
