@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import sys
@@ -25,9 +26,15 @@ class NapcatBot:
             'group_increase': [],
             'self_message': [],
         }
-        self._recent_self_sent_ids: dict[int, float] = {}
+        # 精确表：message_id（已归一化） -> 记录时间，用于 HTTP 响应拿到 message_id 后的精确去重
+        self._recent_self_sent_ids: dict[int | str, float] = {}
+        # 占位表：(chat_type, target_id, content_digest) -> 记录时间，
+        # 在 self.post() 发出请求之前先占位，堵住 WS 回显先于 HTTP 响应到达的竞态窗口
+        self._pending_self_sent: dict[tuple, float] = {}
         self._recent_self_sent_lock = threading.Lock()
         self._self_sent_ttl = 120.0
+        # 占位表的兜底过期时间，避免请求异常/无 message_id 时占位残留过久误吞其他设备消息
+        self._pending_self_sent_ttl = 30.0
 
     def on_group_message(self, func: Callable[[ChatMessage], None]):
         self._event_handlers['group_message'].append(func)
@@ -45,21 +52,97 @@ class NapcatBot:
         self._event_handlers['self_message'].append(func)
         return func
 
-    def _remember_self_sent(self, message_id) -> None:
+    @staticmethod
+    def _normalize_message_id(message_id):
+        """把 message_id 归一化成统一类型用于去重比对：优先转 int，失败则兜底存 str。"""
         if message_id is None:
+            return None
+        try:
+            return int(message_id)
+        except (TypeError, ValueError):
+            return str(message_id)
+
+    @staticmethod
+    def _canonical_content_key(message) -> str:
+        """把消息内容（str 或 segment 列表）归一化成占位去重用的稳定摘要输入，
+        只保留内容强相关、发送前后不会变化的字段，忽略回显时可能补充的额外字段
+        （如 image 段的 url/file_size 等）。"""
+        if isinstance(message, str):
+            return message
+        if isinstance(message, list):
+            parts = []
+            for segment in message:
+                if not isinstance(segment, dict):
+                    parts.append(str(segment))
+                    continue
+                seg_type = str(segment.get('type') or '')
+                data = segment.get('data') or {}
+                if seg_type == 'text':
+                    parts.append(f"text:{data.get('text', '')}")
+                elif seg_type == 'image':
+                    parts.append(f"image:{data.get('file', '')}")
+                elif seg_type == 'reply':
+                    parts.append(f"reply:{data.get('id', '')}")
+                elif seg_type == 'at':
+                    parts.append(f"at:{data.get('qq', '')}")
+                else:
+                    parts.append(f'{seg_type}:{json.dumps(data, sort_keys=True, ensure_ascii=False)}')
+            return '|'.join(parts)
+        return str(message) if message is not None else ''
+
+    def _pending_key(self, chat_type: str, target_id, message) -> tuple:
+        digest = hashlib.sha1(self._canonical_content_key(message).encode('utf-8', 'ignore')).hexdigest()
+        return (chat_type, target_id, digest)
+
+    def _mark_pending_self_sent(self, chat_type: str, target_id, message) -> tuple:
+        """在调用 self.post() 之前占位，标记该 scope+内容即将由本进程发出，
+        用于堵住 WS message_sent 回显先于 HTTP 响应到达的竞态窗口。
+        返回占位 key，供发送结束（无论成功/失败）后清理。"""
+        key = self._pending_key(chat_type, target_id, message)
+        with self._recent_self_sent_lock:
+            now = time.time()
+            self._pending_self_sent[key] = now
+            expired = [k for k, ts in self._pending_self_sent.items() if now - ts > self._pending_self_sent_ttl]
+            for k in expired:
+                del self._pending_self_sent[k]
+        return key
+
+    def _clear_pending_self_sent(self, key: tuple) -> None:
+        with self._recent_self_sent_lock:
+            self._pending_self_sent.pop(key, None)
+
+    def _is_pending_self_sent(self, chat_type: str, target_id, message) -> bool:
+        key = self._pending_key(chat_type, target_id, message)
+        with self._recent_self_sent_lock:
+            ts = self._pending_self_sent.get(key)
+            if ts is None:
+                return False
+            return time.time() - ts <= self._pending_self_sent_ttl
+
+    def _remember_self_sent(self, message_id) -> None:
+        normalized = self._normalize_message_id(message_id)
+        if normalized is None:
             return
         with self._recent_self_sent_lock:
             now = time.time()
-            self._recent_self_sent_ids[message_id] = now
+            self._recent_self_sent_ids[normalized] = now
             expired = [mid for mid, ts in self._recent_self_sent_ids.items() if now - ts > self._self_sent_ttl]
             for mid in expired:
                 del self._recent_self_sent_ids[mid]
 
     def _is_recent_self_sent(self, message_id) -> bool:
-        if message_id is None:
+        normalized = self._normalize_message_id(message_id)
+        if normalized is None:
             return False
         with self._recent_self_sent_lock:
-            return message_id in self._recent_self_sent_ids
+            if normalized in self._recent_self_sent_ids:
+                return True
+            if isinstance(normalized, int):
+                return str(normalized) in self._recent_self_sent_ids
+            try:
+                return int(normalized) in self._recent_self_sent_ids
+            except (TypeError, ValueError):
+                return False
 
     def _on_error(self, ws, err):
         log_error(f'Napcat WebSocket 错误: {err}')
@@ -151,9 +234,21 @@ class NapcatBot:
             return
 
         if post_type == 'message_sent':
-            if self._is_recent_self_sent(data.get('message_id')):
-                return
             message_type = data.get('message_type')
+            if message_type == 'group':
+                target_id = data.get('group_id')
+            elif message_type == 'private':
+                target_id = data.get('target_id') or data.get('user_id')
+            else:
+                target_id = None
+            content = data.get('message')
+            if content is None:
+                content = data.get('raw_message', '')
+            if self._is_recent_self_sent(data.get('message_id')) or (
+                message_type in {'group', 'private'} and self._is_pending_self_sent(message_type, target_id, content)
+            ):
+                return
+
             if message_type == 'group':
                 self._dispatch(self._event_handlers['self_message'], self._build_self_message(data, 'group'))
             elif message_type == 'private':
@@ -185,8 +280,14 @@ class NapcatBot:
     def send_text(self, chat_type: str, target_id: int, message: str):
         action = 'send_group_msg' if chat_type == 'group' else 'send_private_msg'
         key = 'group_id' if chat_type == 'group' else 'user_id'
-        response = self.post(action, {key: target_id, 'message': message})
-        self._remember_self_sent((response.get('data') or {}).get('message_id') if isinstance(response, dict) else None)
+        pending_key = self._mark_pending_self_sent(chat_type, target_id, message)
+        try:
+            response = self.post(action, {key: target_id, 'message': message})
+            mid = (response.get('data') or {}).get('message_id') if isinstance(response, dict) else None
+            self._remember_self_sent(mid)
+        finally:
+            # 无论成功/失败都清理占位，避免残留误吞真实他设备消息
+            self._clear_pending_self_sent(pending_key)
         return response
 
     def send_group_text(self, group_id: int, message: str):
@@ -201,8 +302,13 @@ class NapcatBot:
             segments.append({'type': 'text', 'data': {'text': text}})
         action = 'send_group_msg' if chat_type == 'group' else 'send_private_msg'
         key = 'group_id' if chat_type == 'group' else 'user_id'
-        response = self.post(action, {key: target_id, 'message': segments})
-        self._remember_self_sent((response.get('data') or {}).get('message_id') if isinstance(response, dict) else None)
+        pending_key = self._mark_pending_self_sent(chat_type, target_id, segments)
+        try:
+            response = self.post(action, {key: target_id, 'message': segments})
+            mid = (response.get('data') or {}).get('message_id') if isinstance(response, dict) else None
+            self._remember_self_sent(mid)
+        finally:
+            self._clear_pending_self_sent(pending_key)
         return response
 
     def send_reply_text(self, message: ChatMessage, content: str):

@@ -5,10 +5,21 @@ import json
 import os
 import random
 import re
+import shlex
+import sys
 import threading
 import time
 from datetime import datetime
 
+try:
+    import anthropic as _anthropic
+except ImportError:
+    _anthropic = None
+
+try:
+    import httpx as _httpx_mod
+except ImportError:
+    _httpx_mod = None
 from pack.napcat import NapcatBot
 from pack.anthropic_chat_model import AnthropicChatModel, AnthropicReply
 from pack.search_service import DoubaoSearchService
@@ -19,6 +30,7 @@ from core.ai_repository import AIRepository
 from core.ai_tools_schema import LOOP_TOOL_NAMES, build_tools
 from core.config import AIConfig
 from core.dev_agent import run_dev_agent
+from core.agent_manager import AgentManager
 from core.events import ChatMessage
 from core.prompt_store import PromptStore, default_char_prompt
 from core.model_manager import ModelManager
@@ -61,7 +73,13 @@ class AIOrchestrator:
         self._scheduled_alarm_ids = set()
         self._active_scope_turns = set()
         self._pending_scope_turns = {}
+        self._pending_scope_tasks = {}
         self._dev_agent_tasks = set()
+        # 新版常驻 agent 管理器（与旧版一次性 dev_agent task 并行、互不影响）。
+        # report_notifier 指向本类的 _on_agent_report_pending：agent 产生纯文本
+        # 挂起内容时被触发，据 AI 忙/闲决定"立即投递给会话AI"或"延后到下次触发"。
+        # 事件循环引用在 _run_loop 里通过 set_loop 登记（那时 loop 才建好）。
+        self.agent_manager = AgentManager(report_notifier=self._on_agent_report_pending)
         self._resolving_display_names = set()
         self._pending_self_interrupts = {}
         self._message_epoch = 0
@@ -79,8 +97,11 @@ class AIOrchestrator:
             self._update_model_from_config(current_model)
         else:
             warn('[AI] models_config.json 为空，使用传入的默认模型')
-        # 更新 vision 模型
-        vision_config = self.model_manager.get_vision_model()
+        # 更新 vision 模型（优先从 roles.vision 取，回退到 vision 段）
+        vision_config = self.model_manager.get_role_model('vision')
+        roles = self.model_manager.config.get('roles') or {}
+        if 'vision' not in roles:
+            vision_config = self.model_manager.get_vision_model()
         if vision_config:
             self.vision_model = OpenAICompatibleVisionModel(
                 base_url=vision_config['base_url'],
@@ -110,6 +131,8 @@ class AIOrchestrator:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self.queue = asyncio.Queue()
+        # 把事件循环引用交给常驻 agent 管理器，供 send_to_agent 跨线程安全投递。
+        self.agent_manager.set_loop(self.loop)
         for _ in range(max(1, self.config.worker_count)):
             self.loop.create_task(self._worker())
         self.loop.create_task(self._restore_scheduled_tasks())
@@ -189,6 +212,116 @@ class AIOrchestrator:
         )
         self._submit_message(report_message)
 
+    # 新版常驻 agent 上报的【兜底】接收 scope：origin_scope 缺失/为空/格式不合法时，
+    # 回退投递给 master 会话AI。有 origin_scope 时按其解析出的 scope 分组分发（见 _flush_agent_reports）。
+    _AGENT_REPORT_SCOPE_TYPE = 'master'
+    _AGENT_REPORT_SCOPE_ID = '0'
+
+    def _on_agent_report_pending(self) -> None:
+        """AgentManager 的 report_notifier 回调：有新的 agent 挂起内容待上报时被触发。
+
+        触发方是 agent 常驻循环所在事件循环线程（run_agent_loop 里 _emit_agent_message
+        调用 on_agent_message → append 到待上报队列 → 触发本回调）。这里判定会话AI忙/闲：
+        - AI 空闲（目标 scope 不在 _active_scope_turns 里）：立即取走待上报内容，
+          组装成一条 source='agent_message' 的 ChatMessage 触发会话AI。
+        - AI 忙（目标 scope 正在生成）：什么都不做，内容留在待上报队列里，
+          等本轮生成结束、_run_message_turn 释放 scope 后的 flush 再带上，
+          或下次该 scope 被触发时一起带上。
+        """
+        try:
+            self._flush_agent_reports(only_if_idle=True)
+        except Exception as exc:
+            error(f'[AI] _on_agent_report_pending 处理失败: {exc}')
+
+    def _flush_agent_reports(self, only_if_idle: bool = True) -> None:
+        """把 AgentManager 待上报队列里的 agent 挂起内容按 origin_scope 分组投递给对应会话AI。
+
+        每条 pending report 带有 origin_scope（形如 'group:123'），标识真正创建该 agent
+        的会话。这里按 origin_scope 分组，每组分别投递到对应 scope；origin_scope 为空/None
+        的回退到 master:0。
+
+        only_if_idle=True 时，仅把【空闲】scope 的分组投递出去；【忙碌】scope 的分组原样
+        放回待上报队列（requeue_pending_reports），等该 scope 下次空闲时补投，确保不丢失。
+        only_if_idle=False 时对所有目标 scope 无条件投递（用于 scope 刚释放的场景）。
+        同一 scope 下多个 agent 的内容合并成一条消息，每段前缀【agent#id】标清各自来源。
+        """
+        mgr = getattr(self, 'agent_manager', None)
+        if mgr is None or not mgr.has_pending_reports():
+            return
+        reports = mgr.drain_pending_reports()
+        if not reports:
+            return
+
+        # 按 origin_scope 分组。key 用解析出的 (scope_type, scope_id)，None/空回退 master:0。
+        grouped: dict[tuple[str, str], list[dict]] = {}
+        for item in reports:
+            scope_type, scope_id = self._parse_agent_report_scope(item.get('origin_scope'))
+            grouped.setdefault((scope_type, scope_id), []).append(item)
+
+        deferred: list[dict] = []
+        for (scope_type, scope_id), items in grouped.items():
+            scope_key = self._scope_key(scope_type, scope_id)
+            if only_if_idle and scope_key in self._active_scope_turns:
+                # 该 scope 忙：本组内容留到队列，等它空闲再补投。
+                deferred.extend(items)
+                continue
+            self._deliver_agent_reports_to_scope(scope_type, scope_id, items)
+
+        if deferred:
+            # 忙碌 scope 的内容放回队列，不丢失，下次 flush（本轮释放后 or 新触发）补投。
+            mgr.requeue_pending_reports(deferred)
+
+    def _parse_agent_report_scope(self, origin_scope) -> tuple[str, str]:
+        """把 origin_scope 字符串（'scope_type:scope_id'）解析成 (scope_type, scope_id)。
+
+        为空/None 或格式不合法时回退到 master:0，保证兜底通路不被破坏。
+        """
+        raw = str(origin_scope or '').strip()
+        if not raw or ':' not in raw:
+            return self._AGENT_REPORT_SCOPE_TYPE, self._AGENT_REPORT_SCOPE_ID
+        scope_type, _, scope_id = raw.partition(':')
+        scope_type = scope_type.strip()
+        scope_id = scope_id.strip()
+        if not scope_type or scope_id == '':
+            return self._AGENT_REPORT_SCOPE_TYPE, self._AGENT_REPORT_SCOPE_ID
+        return scope_type, scope_id
+
+    def _deliver_agent_reports_to_scope(self, scope_type: str, scope_id: str, items: list[dict]) -> None:
+        """把一个 scope 下的一批 agent 挂起内容合并成一条消息投递给该会话AI。"""
+        if not items:
+            return
+        lines = []
+        for item in items:
+            agent_id = str(item.get('agent_id') or '?')
+            text = str(item.get('text') or '').strip()
+            lines.append(f'【agent#{agent_id}】\n{text}')
+        body = '\n\n'.join(lines)
+        wrapped = (
+            '【内部系统通知：以下是后台常驻 agent 的挂起内容（提问/汇报/进度），不是任何人直接对你说的话，'
+            '仅供你参考决策。每段以【agent#编号】标注来源。请结合语境自主判断是否处理、是否需要通过 '
+            'send_to_agent 给对应 agent 下达进一步指示，或是否需要转达给相关的人。】\n\n'
+            f'{body}'
+        )
+        try:
+            chat_id = 0 if scope_type == 'master' else int(scope_id)
+        except (TypeError, ValueError):
+            # scope_id 不是合法整数：回退 master:0，避免构造 ChatMessage 抛异常丢内容。
+            scope_type = self._AGENT_REPORT_SCOPE_TYPE
+            chat_id = 0
+        report_message = ChatMessage(
+            chat_type=scope_type,
+            chat_id=chat_id,
+            user_id=0,
+            text=wrapped,
+            raw_message=wrapped,
+            sender={'nickname': '常驻agent系统', 'user_id': 0},
+            message_id=None,
+            mentions_self=True,
+            timestamp=time.time(),
+            raw_data={'source': 'agent_message', 'agent_count': len(items)},
+        )
+        self._submit_message(report_message)
+
     def get_runtime_status(self) -> dict:
         current = self.model_manager.get_current_model()
         available = self.model_manager.available_models
@@ -230,6 +363,11 @@ class AIOrchestrator:
             model_name=model_config['model_name'],
             messages_path=model_config['messages_path'],
         )
+        # 让常驻 agent 的无工具总结 AI（summarize_agent）复用同一个模型实例。
+        try:
+            self.agent_manager.set_model(self.model)
+        except Exception:
+            pass
 
     @staticmethod
     def _mask_secret(value: str) -> str:
@@ -276,8 +414,9 @@ class AIOrchestrator:
             {'command': '#clear', 'aliases': ['#clear-chat', '#清空聊天记录'], 'scope': 'all', 'description': '只清空当前会话聊天记录'},
             {'command': '#clear-notes', 'aliases': ['#清空备注'], 'scope': 'all', 'description': '只清空当前会话 AI 工具备忘'},
             {'command': '#clear-memory', 'aliases': ['#clear-all', '#清空记忆'], 'scope': 'all', 'description': '清空当前会话聊天记录、AI 工具备忘和工具记录'},
-            {'command': '/model', 'aliases': ['/model flash', '/model pro', '/model ds', '/model claude', '/model opus'], 'scope': 'admin', 'description': '管理员切换或查看当前模型'},
+            {'command': '/model', 'aliases': ['/model list', '/model switch 0', '/model channel list'], 'scope': 'admin', 'description': '管理员查看/切换模型，并直接管理模型渠道配置'},
             {'command': '/stop', 'aliases': [], 'scope': 'admin', 'description': '管理员立即结束整个 Python 进程'},
+            {'command': '/restart', 'aliases': [], 'scope': 'admin', 'description': '管理员原地重启 bot 自身 Python 进程'},
             {'command': '/on', 'aliases': [], 'scope': 'admin', 'description': '管理员开启 AI 响应'},
             {'command': '/off', 'aliases': [], 'scope': 'admin', 'description': '管理员关闭 AI 响应'},
             {'command': '/clean', 'aliases': [], 'scope': 'admin', 'description': '管理员清空全部对话、印象、任务与记忆，重置 AI'},
@@ -357,6 +496,8 @@ class AIOrchestrator:
             'message_id': message.message_id,
             'timestamp': message.timestamp,
             'source_label': self._message_source_label(message),
+            'source_kind': self._message_source_kind(message),
+            'raw_source': message.raw_data.get('source'),
         }
 
     def _reserve_scope_turn(self, item: dict) -> bool:
@@ -369,23 +510,17 @@ class AIOrchestrator:
         item.setdefault('trigger_messages', [])
         if scope_key in self._active_scope_turns:
             info(f'[AI][reserve] scope busy, deferring: {scope_key}')
-            pending = self._pending_scope_turns.get(scope_key)
-            if pending:
-                pending['message'] = item['message']
-                pending['cleaned'] = item['cleaned']
-                pending['agent_id'] = item['agent_id']
-                pending['deferred_count'] = int(pending.get('deferred_count') or 0) + 1
-                pending.setdefault('trigger_messages', []).extend(item.get('trigger_messages') or [])
-            else:
-                self._pending_scope_turns[scope_key] = {
-                    'kind': 'message',
-                    'message': item['message'],
-                    'cleaned': item['cleaned'],
-                    'agent_id': item['agent_id'],
-                    'scope_key': scope_key,
-                    'deferred_count': 1,
-                    'trigger_messages': list(item.get('trigger_messages') or []),
-                }
+            if scope_key not in self._pending_scope_turns:
+                self._pending_scope_turns[scope_key] = []
+            self._pending_scope_turns[scope_key].append({
+                'kind': 'message',
+                'message': item['message'],
+                'cleaned': item['cleaned'],
+                'agent_id': item['agent_id'],
+                'scope_key': scope_key,
+                'deferred_count': 1,
+                'trigger_messages': list(item.get('trigger_messages') or []),
+            })
             return False
         self._active_scope_turns.add(scope_key)
         return True
@@ -394,12 +529,19 @@ class AIOrchestrator:
         scope_key = str(item.get('scope_key') or '')
         if not scope_key:
             return None
-        pending = self._pending_scope_turns.pop(scope_key, None)
+        pending = None
+        pending_list = self._pending_scope_turns.get(scope_key)
+        if pending_list:
+            pending = pending_list.pop(0)
+            if not pending_list:
+                del self._pending_scope_turns[scope_key]
         if pending:
             history_seed = item.get('followup_history_seed')
             if history_seed:
                 pending['history_seed'] = [dict(entry) for entry in history_seed]
             return pending
+        if self._promote_pending_scope_task(scope_key):
+            return None
         self._active_scope_turns.discard(scope_key)
         return None
 
@@ -407,11 +549,79 @@ class AIOrchestrator:
         scope_key = str(item.get('scope_key') or '')
         if not scope_key:
             return None
-        return self._pending_scope_turns.pop(scope_key, None)
+        pending_list = self._pending_scope_turns.get(scope_key)
+        if pending_list:
+            pending = pending_list.pop(0)
+            if not pending_list:
+                del self._pending_scope_turns[scope_key]
+            return pending
+        return None
+
+    def _scope_key_for_task(self, task: dict) -> str | None:
+        """返回 task turn 会向其生成/发送消息的目标 scope_key；非发送类 task 返回 None。"""
+        kind = task.get('kind')
+        payload = task.get('payload') or {}
+        if kind in ('delegate_to_child', 'followup_to_child'):
+            scope_type = str(payload.get('target_scope_type') or 'private')
+            scope_id = str(payload.get('target_scope_id') or '').strip()
+        elif kind == 'message_scope':
+            scope_type = str(payload.get('target_scope_type') or payload.get('scope_type') or '').strip()
+            scope_id = str(payload.get('target_scope_id') or payload.get('scope_id') or '').strip()
+        else:
+            return None
+        if not scope_type or not scope_id:
+            return None
+        return self._scope_key(scope_type, scope_id)
+
+    def _reserve_task_scope(self, scope_key: str, item: dict) -> bool:
+        """为 task turn 占用目标 scope 会话锁。若忙则按 FIFO 延后，返回 False。"""
+        if scope_key in self._active_scope_turns:
+            info(f'[AI][reserve] scope busy, deferring task: {scope_key}')
+            self._pending_scope_tasks.setdefault(scope_key, []).append({
+                'kind': 'task',
+                'task_id': item['task_id'],
+                'message_epoch': int(item.get('message_epoch', self._message_epoch)),
+            })
+            return False
+        self._active_scope_turns.add(scope_key)
+        return True
+
+    def _promote_pending_scope_task(self, scope_key: str) -> bool:
+        """scope 空闲后，若有延后的 task 则重新入队并保持 scope 占用，返回是否已提升。"""
+        queue = self._pending_scope_tasks.get(scope_key)
+        while queue:
+            pending = queue.pop(0)
+            if not queue:
+                self._pending_scope_tasks.pop(scope_key, None)
+            if self._is_epoch_stale(pending.get('message_epoch')):
+                continue
+            pending['scope_prereserved'] = True
+            self.queue.put_nowait(pending)
+            return True
+        self._pending_scope_tasks.pop(scope_key, None)
+        return False
+
+    def _release_task_scope(self, scope_key: str):
+        """task turn 结束后释放 scope；优先让延后的 message，其次 task 接手。"""
+        if not scope_key:
+            return
+        pending = None
+        pending_list = self._pending_scope_turns.get(scope_key)
+        if pending_list:
+            pending = pending_list.pop(0)
+            if not pending_list:
+                del self._pending_scope_turns[scope_key]
+        if pending:
+            self.queue.put_nowait(pending)
+            return
+        if self._promote_pending_scope_task(scope_key):
+            return
+        self._active_scope_turns.discard(scope_key)
 
     def _cancel_active_requests(self):
         self._message_epoch += 1
         self._pending_scope_turns.clear()
+        self._pending_scope_tasks.clear()
         self._active_scope_turns.clear()
         self._pending_self_interrupts.clear()
         for window in list(self._group_reply_windows.values()):
@@ -426,33 +636,204 @@ class AIOrchestrator:
         return int(epoch) != int(self._message_epoch)
 
     async def _run_message_turn(self, item: dict):
+        _MAX_RETRIES = 2
+        _RETRY_DELAY = 3
         try:
-            await self._process_message(item)
+            for _attempt in range(_MAX_RETRIES + 1):
+                try:
+                    await self._process_message(item)
+                    return
+                except Exception as exc:
+                    _exc_name = type(exc).__name__
+                    _exc_qualname = type(exc).__qualname__
+                    _is_httpx_timeout = (
+                        _httpx_mod is not None and isinstance(exc, _httpx_mod.TimeoutException)
+                    ) or _exc_name == 'TimeoutException'
+                    _is_api_status = (
+                        _anthropic is not None and isinstance(exc, _anthropic.APIStatusError)
+                    ) or _exc_name == 'APIStatusError'
+                    _retryable = _is_httpx_timeout or (
+                        _is_api_status and (
+                            getattr(exc, 'status_code', 0) == 429
+                            or getattr(exc, 'status_code', 0) >= 500
+                        )
+                    )
+                    if not (_is_httpx_timeout or _is_api_status):
+                        raise
+                    if _retryable and _attempt < _MAX_RETRIES:
+                        await asyncio.sleep(_RETRY_DELAY)
+                    else:
+                        raise
         finally:
             followup = self._release_scope_turn(item)
             if followup:
                 await self.queue.put(followup)
+            else:
+                # 本轮结束且该 scope 无后续排队：若期间有 agent 挂起内容因 AI 忙
+                # 被延后，此刻趁 scope 空出把它们一并投递（方向A的"忙碌延后"落地）。
+                try:
+                    self._flush_agent_reports(only_if_idle=True)
+                except Exception as exc:
+                    error(f'[AI] 释放 scope 后 flush agent 上报失败: {exc}')
 
     async def _handle_model_command(self, message: ChatMessage, cleaned: str):
         if not self._is_admin_message(message):
             self.bot.send_text(message.chat_type, message.chat_id, '这个指令你先别动。')
             return
 
-        parts = cleaned.split()
-        if len(parts) == 1:
-            # 列出所有模型
-            list_text = self.model_manager.list_models()
-            self.bot.send_text(message.chat_type, message.chat_id, list_text)
+        try:
+            parts = shlex.split(cleaned)
+        except ValueError as exc:
+            self.bot.send_text(message.chat_type, message.chat_id, f'模型指令解析失败: {exc}')
             return
 
-        target = parts[1]
-        success, msg = self.model_manager.switch_model(target)
+        if len(parts) == 1:
+            self.bot.send_text(
+                message.chat_type,
+                message.chat_id,
+                f"{self.model_manager.get_summary_text()}\n\n{self.model_manager.list_models()}\n\n用法:\n{self._model_command_help_text()}",
+            )
+            return
+
+        sub = str(parts[1] or '').strip().lower()
+
+        if sub in {'help', '?', 'h'}:
+            self.bot.send_text(message.chat_type, message.chat_id, self._model_command_help_text())
+            return
+
+        if sub in {'list', 'ls'}:
+            self.bot.send_text(message.chat_type, message.chat_id, self.model_manager.list_models())
+            return
+
+        if sub in {'current', 'status'}:
+            self.bot.send_text(message.chat_type, message.chat_id, self.model_manager.get_summary_text())
+            return
+
+        if sub == 'reload':
+            result = self.reload_models_config()
+            msg = f"模型配置已重载，当前模型: {result.get('current')}" if result.get('loaded') else str(result.get('message') or '重载失败')
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        if sub in {'switch', 'use'}:
+            if len(parts) < 3:
+                self.bot.send_text(message.chat_type, message.chat_id, '缺少目标模型，例如：/model switch 0')
+                return
+            success, msg = self.model_manager.switch_model(parts[2], persist=True)
+            if success:
+                current = self.model_manager.get_current_model()
+                if current:
+                    self._update_model_from_config(current)
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        if sub in {'channel', 'channels'}:
+            await self._handle_model_channel_command(message, parts[2:])
+            return
+
+        success, msg = self.model_manager.switch_model(parts[1], persist=True)
         if success:
-            # 更新实际的模型实例
             current = self.model_manager.get_current_model()
             if current:
                 self._update_model_from_config(current)
         self.bot.send_text(message.chat_type, message.chat_id, msg)
+
+    def _model_command_help_text(self) -> str:
+        return (
+            '模型管理指令:\n'
+            '/model\n'
+            '/model list\n'
+            '/model current\n'
+            '/model reload\n'
+            '/model switch <序号或名称>\n'
+            '/model channel list\n'
+            '/model channel add name=<名称> base_url=<地址> api_key=<密钥> models=<显示名:模型ID,模型ID2> [messages_path=/v1/messages]\n'
+            '/model channel update <序号或名称> key=value ...\n'
+            '/model channel remove <序号或名称>'
+        )
+
+    @staticmethod
+    def _parse_model_kv_args(items: list[str]) -> tuple[dict, list[str]]:
+        kv: dict[str, str] = {}
+        unknown: list[str] = []
+        for item in items:
+            if '=' not in item:
+                unknown.append(item)
+                continue
+            key, value = item.split('=', 1)
+            key = str(key or '').strip().lower()
+            if not key:
+                unknown.append(item)
+                continue
+            kv[key] = value.strip()
+        return kv, unknown
+
+    async def _handle_model_channel_command(self, message: ChatMessage, args: list[str]):
+        if not args:
+            self.bot.send_text(message.chat_type, message.chat_id, self.model_manager.list_channels())
+            return
+
+        action = str(args[0] or '').strip().lower()
+        if action in {'list', 'ls'}:
+            self.bot.send_text(message.chat_type, message.chat_id, self.model_manager.list_channels())
+            return
+
+        if action == 'add':
+            kv, unknown = self._parse_model_kv_args(args[1:])
+            if unknown:
+                self.bot.send_text(message.chat_type, message.chat_id, f'无法识别的参数: {" ".join(unknown)}')
+                return
+            success, msg = self.model_manager.add_channel(
+                name=kv.get('name', ''),
+                base_url=kv.get('base_url', ''),
+                api_key=kv.get('api_key', ''),
+                messages_path=kv.get('messages_path', '/v1/messages'),
+                models=kv.get('models', ''),
+            )
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        if action in {'update', 'edit'}:
+            if len(args) < 2:
+                self.bot.send_text(message.chat_type, message.chat_id, '缺少目标渠道，例如：/model channel update 0 name=xxx')
+                return
+            target = args[1]
+            kv, unknown = self._parse_model_kv_args(args[2:])
+            if unknown:
+                self.bot.send_text(message.chat_type, message.chat_id, f'无法识别的参数: {" ".join(unknown)}')
+                return
+            success, msg = self.model_manager.update_channel(
+                target,
+                name=kv.get('name'),
+                base_url=kv.get('base_url'),
+                api_key=kv.get('api_key'),
+                messages_path=kv.get('messages_path'),
+                models=kv.get('models') if 'models' in kv else None,
+            )
+            if success:
+                current = self.model_manager.get_current_model()
+                if current:
+                    self._update_model_from_config(current)
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        if action in {'remove', 'rm', 'del', 'delete'}:
+            if len(args) < 2:
+                self.bot.send_text(message.chat_type, message.chat_id, '缺少目标渠道，例如：/model channel remove 0')
+                return
+            success, msg = self.model_manager.remove_channel(args[1])
+            if success:
+                current = self.model_manager.get_current_model()
+                if current:
+                    self._update_model_from_config(current)
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        self.bot.send_text(
+            message.chat_type,
+            message.chat_id,
+            '不支持的渠道操作。\n可用子命令: list / add / update / remove',
+        )
 
     def _is_admin_message(self, message: ChatMessage) -> bool:
         return int(message.user_id or 0) == int(self.config.admin_qq)
@@ -463,6 +844,16 @@ class AIOrchestrator:
         if master_qq == 0:
             return False
         return int(message.user_id or 0) == master_qq
+
+    # 号主 QQ：命令类指令（/、# 开头）只允许该账号触发
+    _COMMAND_MASTER_QQ = 241898129
+
+    def _is_command_master(self, message: ChatMessage) -> bool:
+        """命令权限校验：仅号主本人（QQ 241898129）可触发斜杠/井号命令。"""
+        try:
+            return int(message.user_id or 0) == self._COMMAND_MASTER_QQ
+        except (TypeError, ValueError):
+            return False
 
     def _is_dev_agent_authorized(self, scope_type: str, scope_id: str) -> bool:
         """私聊场景下 dev_agent 任务只能由管理员账号发起，群聊暂不限制。"""
@@ -480,6 +871,19 @@ class AIOrchestrator:
             self._cancel_active_requests()
             warn('[AI] /stop requested, exiting process immediately')
             os._exit(0)
+
+        if command == '/restart':
+            self._cancel_active_requests()
+            self.bot.send_text(message.chat_type, message.chat_id, '正在重启…')
+            warn('[AI] /restart requested, re-executing process in place')
+            # 原地替换当前进程重启，不依赖外部守护进程
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+            return
 
         if command == '/on':
             self.config.enabled = True
@@ -512,8 +916,7 @@ class AIOrchestrator:
         tools: list[dict] | None = None,
         temperature: float = 0.7,
     ) -> AnthropicReply | None:
-        total_models = len(self.model_manager.available_models)
-        for attempt in range(max(1, total_models)):
+        for attempt in range(1):
             current = self.model_manager.get_current_model()
             try:
                 return await asyncio.to_thread(
@@ -531,25 +934,27 @@ class AIOrchestrator:
                     f"base_url={self.model.base_url} "
                     f'error={exc}'
                 )
-                if attempt < total_models - 1:
-                    next_model = self.model_manager.switch_next_model()
-                    if next_model:
-                        self._update_model_from_config(next_model)
-                        warn(f'[AI][failover] 切换到 {next_model["display_name"]} 重试')
-                    else:
-                        raise
-                else:
-                    raise
+                raise
 
     async def _enqueue_message(self, message: ChatMessage):
         scope_type = message.chat_type
         scope_id = str(message.chat_id)
-        agent = self.repo.get_or_create_agent(scope_type, scope_id)
+        agent = await asyncio.to_thread(self.repo.get_or_create_agent, scope_type, scope_id)
         cleaned = self._clean_text(message)
         source_kind = self._message_source_kind(message)
         source_label = self._message_source_label(message)
 
-        if cleaned in {'/on', '/off', '/clean', '/stop'}:
+        # 命令权限统一收口：以 / 或 # 开头的命令类消息只允许号主(241898129)触发。
+        # 其他任何人（私聊/群）发命令一律静默 return，不回应。仅拦截真实用户来源，
+        # 内部来源（后台任务回执、admin_webui）不受影响，避免误伤自然聊天照常处理。
+        if (
+            str(cleaned or '').startswith(('/', '#'))
+            and source_kind not in ('internal_task', 'admin_webui')
+            and not self._is_command_master(message)
+        ):
+            return
+
+        if cleaned in {'/on', '/off', '/clean', '/stop', '/restart'}:
             await self._handle_power_command(message, cleaned)
             return
 
@@ -612,7 +1017,8 @@ class AIOrchestrator:
         if not self.config.enabled:
             return
 
-        self.repo.append_message(
+        await asyncio.to_thread(
+            self.repo.append_message,
             scope_type,
             scope_id,
             {
@@ -627,9 +1033,10 @@ class AIOrchestrator:
             },
             self.config.history_limit,
         )
-        self.repo.touch_user_identity(message.user_id, message.nickname, scope_type, scope_id)
-        agent = self.repo.get_or_create_agent(scope_type, scope_id)
-
+        await asyncio.to_thread(
+            self.repo.touch_user_identity, message.user_id, message.nickname, scope_type, scope_id
+        )
+        agent = await asyncio.to_thread(self.repo.get_or_create_agent, scope_type, scope_id)
         if self._should_ignore_message(message):
             self.repo.add_note(scope_type, scope_id, f'识别到非普通聊天来源消息: {source_label}')
             return
@@ -688,7 +1095,7 @@ class AIOrchestrator:
                     message.chat_id,
                     '好，我知道是这个号了，你要我怎么喊他？',
                 )
-                self._record_outbound_message(message.chat_type, str(message.chat_id), '好，我知道是这个号了，你要我怎么喊他？')
+                await self._record_outbound_message(message.chat_type, str(message.chat_id), '好，我知道是这个号了，你要我怎么喊他？')
                 return
 
             preference_request = self._detect_global_preference_request(message, cleaned)
@@ -774,7 +1181,12 @@ class AIOrchestrator:
 
     def _send_chat_reply(self, message: ChatMessage, text: str):
         self.bot.send_text(message.chat_type, message.chat_id, text)
-        self._record_outbound_message(message.chat_type, str(message.chat_id), text)
+        # _record_outbound_message 现为 async（append_message 已移出事件循环）。
+        # 本方法是同步的指令快通道，用 fire-and-forget 调度落库，不阻塞指令响应。
+        if self.loop is not None:
+            self.loop.create_task(
+                self._record_outbound_message(message.chat_type, str(message.chat_id), text)
+            )
 
     def _build_help_text(self) -> str:
         lines = ['可用指令：']
@@ -939,6 +1351,12 @@ class AIOrchestrator:
         # 检查是否是系统管理员消息
         if message.user_id == 0 and message.raw_data.get('source') == 'admin_webui':
             return 'admin_webui'
+        # 内部来源：dev_agent 任务汇报，需正常唤醒 AI，不能被系统昵称判断误伤
+        if message.user_id == 0 and message.raw_data.get('source') == 'dev_agent_task_report':
+            return 'internal_task'
+        # 内部来源：新版常驻 agent 挂起内容上报，同样按内部任务处理正常唤醒 AI
+        if message.user_id == 0 and message.raw_data.get('source') == 'agent_message':
+            return 'internal_task'
         if message.chat_type == 'group':
             return 'group'
         sub_type = str(message.raw_data.get('sub_type') or '').strip().lower()
@@ -955,6 +1373,7 @@ class AIOrchestrator:
         kind = self._message_source_kind(message)
         mapping = {
             'admin_webui': '系统管理员（后台控制台）',
+            'internal_task': '后台任务',
             'group': 'QQ群消息',
             'friend_private': 'QQ好友私聊',
             'group_temp_private': '群临时会话',
@@ -1016,7 +1435,7 @@ class AIOrchestrator:
         scope_type = message.chat_type
         scope_id = str(message.chat_id)
         source_label = self._message_source_label(message)
-        agent = self.repo.get_or_create_agent(scope_type, scope_id)
+        agent = await asyncio.to_thread(self.repo.get_or_create_agent, scope_type, scope_id)
         self._maybe_resolve_display_name(scope_type, scope_id, agent)
         trigger_messages = list(item.get('trigger_messages') or [self._build_trigger_message_entry(message, cleaned)])
         history = self.repo.list_messages(scope_type, scope_id)
@@ -1137,12 +1556,13 @@ class AIOrchestrator:
             return
         if self._is_epoch_stale(run_epoch):
             return
-        outbound_entry = self._record_outbound_message(
+        outbound_entry = await self._record_outbound_message(
             message.chat_type,
             str(message.chat_id),
             reply,
             generation_ms=generation_ms,
             think_note=think_note,
+            tool_context_messages=(reply_bundle or {}).get('tool_context_messages'),
         )
         item['followup_history_seed'] = [
             *[dict(entry) for entry in history_before_trigger],
@@ -1209,6 +1629,30 @@ class AIOrchestrator:
             }
         ]
 
+    @staticmethod
+    def _stamp_cache_control_on_message(message: dict) -> None:
+        """Attach a prompt-cache breakpoint (cache_control: ephemeral) to a
+        message's content.  Anthropic requires the marker to sit on a content
+        block, so a plain string content is converted into a single text block.
+        If the content is already a block list, the marker is added to its last
+        block.  Empty/unknown shapes are left untouched."""
+        if not isinstance(message, dict):
+            return
+        content = message.get('content')
+        if isinstance(content, str):
+            message['content'] = [
+                {
+                    'type': 'text',
+                    'text': content,
+                    'cache_control': {'type': 'ephemeral'},
+                }
+            ]
+            return
+        if isinstance(content, list) and content:
+            last_block = content[-1]
+            if isinstance(last_block, dict):
+                last_block['cache_control'] = {'type': 'ephemeral'}
+
     def _build_child_messages(
         self,
         message: ChatMessage,
@@ -1240,7 +1684,24 @@ class AIOrchestrator:
         )
         messages = self._build_char_prefill_messages(persona)
         messages += self._build_tool_prefill_messages()
-        messages += self._build_role_based_history_messages(history)
+
+        # --- Prompt cache breakpoint 3/4: end of static prefill ---
+        # Mark the last prefill message so char_prefill + tool_prefill form a
+        # cacheable prefix.  If prefill is empty (no persona), skip gracefully.
+        if messages:
+            self._stamp_cache_control_on_message(messages[-1])
+
+        history_messages = self._build_role_based_history_messages(history)
+
+        # --- Prompt cache breakpoint 4/4: rolling history prefix ---
+        # Place a breakpoint a few messages before the end of history so that
+        # appending new messages doesn't immediately invalidate the cache.
+        _HISTORY_CACHE_TAIL_BUFFER = 4  # keep last N messages uncached
+        if len(history_messages) > _HISTORY_CACHE_TAIL_BUFFER:
+            bp_idx = len(history_messages) - 1 - _HISTORY_CACHE_TAIL_BUFFER
+            self._stamp_cache_control_on_message(history_messages[bp_idx])
+
+        messages += history_messages
         messages.append(
             {
                 'role': 'user',
@@ -1363,32 +1824,142 @@ class AIOrchestrator:
             parts.extend(['', '消息中包含以下文件（如需下载请调用 download_file 工具）：', '\n'.join(file_lines)])
         return '\n'.join(parts)
 
+    def _is_internal_tool_report_item(self, item: dict) -> bool:
+        """判断一条历史/触发条目是否为内部工具回执（dev_agent 任务结果 / 常驻 agent 汇报 /
+        notify_master 回传等）。与 _message_source_kind 的判定保持一致：
+        source_kind=='internal_task'，或原始来源属于内部来源，或 user_id==0。"""
+        source_kind = str(item.get('source_kind') or '').strip()
+        if source_kind == 'internal_task':
+            return True
+        raw_source = item.get('raw_source')
+        if raw_source is None:
+            raw = item.get('raw_data')
+            if isinstance(raw, dict):
+                raw_source = raw.get('source')
+        if str(raw_source or '').strip() in ('dev_agent_task_report', 'agent_message'):
+            return True
+        try:
+            if int(item.get('user_id')) == 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        return False
+
+    def _xml_attr_escape(self, value) -> str:
+        return (
+            str(value if value is not None else '')
+            .replace('&', '&amp;')
+            .replace('"', '&quot;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+        )
+
+    def _sanitize_block_body(self, text) -> str:
+        """轻量兜底：只对正文中可能与 <user_msg>/<tool_report> 包裹标签混淆的
+        特定标签串做替换，把其起始的 `<` 换成全角 `＜`，避免正文里恰好出现这些
+        标签导致模型解析块边界错乱。不做全量 XML 转义，保留其余代码/符号可读性。"""
+        s = str(text if text is not None else '')
+        for token in ('</user_msg>', '</tool_report>', '<user_msg', '<tool_report'):
+            s = s.replace(token, '＜' + token[1:])
+        return s
+
+    def _wrap_user_msg_block(self, items: list[dict]) -> str:
+        """把一段连续的真实用户消息合并成一个 <user_msg> 块。逐条保留原有
+        `HH:MM 昵称(uid): 内容` 行，块属性 from/time 取第一条。"""
+        if not items:
+            return ''
+        first = items[0]
+        nickname = first.get('nickname', first.get('user_id'))
+        first_ts = self._coerce_timestamp(first.get('timestamp'))
+        time_str = self._format_message_clock(first_ts)
+        inner = '\n'.join(self._sanitize_block_body(self._format_history_item_for_user_message(it)) for it in items)
+        return (
+            f'<user_msg from="{self._xml_attr_escape(nickname)}" '
+            f'time="{self._xml_attr_escape(time_str)}">{inner}</user_msg>'
+        )
+
+    def _wrap_tool_report_block(self, item: dict, note: str = '') -> str:
+        """把一条内部工具回执包成独立的 <tool_report> 块。source 取该条 nickname，
+        time 取该条 timestamp。note 非空时作为额外属性附加（用于触发轮定性提示）。"""
+        source = item.get('nickname', item.get('user_id'))
+        current_ts = self._coerce_timestamp(item.get('timestamp'))
+        time_str = self._format_message_clock(current_ts)
+        text = self._sanitize_block_body(item.get('text') or '')
+        note_attr = f' note="{self._xml_attr_escape(note)}"' if note else ''
+        return (
+            f'<tool_report source="{self._xml_attr_escape(source)}" '
+            f'time="{self._xml_attr_escape(time_str)}"{note_attr}>{text}</tool_report>'
+        )
+
+    def _render_pending_user_segment(self, pending_items: list[dict]) -> str:
+        """把一段（跨到下一个 assistant 之前）累积的条目按时间顺序渲染成一个
+        role='user' 的字符串：真实用户消息合并进 <user_msg>，内部回执各自独立成
+        <tool_report>，两类块按原始时序穿插排列。"""
+        blocks: list[str] = []
+        user_run: list[dict] = []
+        for it in pending_items:
+            if self._is_internal_tool_report_item(it):
+                if user_run:
+                    blocks.append(self._wrap_user_msg_block(user_run))
+                    user_run = []
+                blocks.append(self._wrap_tool_report_block(it))
+            else:
+                user_run.append(it)
+        if user_run:
+            blocks.append(self._wrap_user_msg_block(user_run))
+        return '\n'.join(blocks)
+
     def _build_role_based_history_messages(self, history: list[dict]) -> list[dict]:
         messages: list[dict] = []
-        pending_user_lines: list[str] = []
+        pending_items: list[dict] = []
+
+        def flush_pending():
+            nonlocal pending_items
+            if pending_items:
+                messages.append({'role': 'user', 'content': self._render_pending_user_segment(pending_items)})
+                pending_items = []
+
         for item in history:
             user_id = str(item.get('user_id') or '').strip()
+            tool_context_messages = self._normalize_tool_context_messages(item.get('tool_context_messages'))
             text = str(item.get('text') or '').strip()
-            if not text:
-                continue
             if user_id and user_id == str(self.bot.self_id):
-                if pending_user_lines:
-                    messages.append({'role': 'user', 'content': '\n'.join(pending_user_lines)})
-                    pending_user_lines = []
+                # 遇到 assistant 条目：先把累积的 user 段（内部回执+用户消息按时序）落盘
+                flush_pending()
+                if tool_context_messages:
+                    messages.extend(tool_context_messages)
+                    continue
+                if not text:
+                    continue
                 messages.append({'role': 'assistant', 'content': text})
                 continue
-            pending_user_lines.append(self._format_history_item_for_user_message(item))
-        if pending_user_lines:
-            messages.append({'role': 'user', 'content': '\n'.join(pending_user_lines)})
+            if not text:
+                continue
+            pending_items.append(item)
+        flush_pending()
         return messages
 
     def _build_trigger_user_message(self, trigger_messages: list[dict]) -> str:
-        lines = [
-            self._format_history_item_for_user_message(item)
-            for item in trigger_messages
-            if str(item.get('text') or '').strip()
-        ]
-        return '\n'.join(lines) if lines else '暂无新消息'
+        items = [item for item in trigger_messages if str(item.get('text') or '').strip()]
+        if not items:
+            return '暂无新消息'
+        blocks: list[str] = []
+        user_run: list[dict] = []
+        for it in items:
+            if self._is_internal_tool_report_item(it):
+                if user_run:
+                    blocks.append(self._wrap_user_msg_block(user_run))
+                    user_run = []
+                # 触发轮的内部回执额外附上定性提示，避免模型把系统内部异步结果当成用户发言外发
+                blocks.append(self._wrap_tool_report_block(
+                    it,
+                    note='这是系统内部异步结果，默认只更新记忆、消化即可，非必要不要调用 send_message 对外发送',
+                ))
+            else:
+                user_run.append(it)
+        if user_run:
+            blocks.append(self._wrap_user_msg_block(user_run))
+        return '\n'.join(blocks) if blocks else '暂无新消息'
 
     def _format_history_item_for_user_message(self, item: dict) -> str:
         current_ts = self._coerce_timestamp(item.get('timestamp'))
@@ -1656,6 +2227,84 @@ class AIOrchestrator:
                 del self._recurring_tasks[task_id]
                 self._save_recurring_tasks()
                 result = f'任务 {task_id[:8]} 已删除'
+        elif name == 'create_agent':
+            instruction = str(tool_input.get('instruction') or '').strip()
+            if not instruction:
+                result = 'error: instruction 为空，未创建 agent。'
+            else:
+                # 记录创建该 agent 的会话 scope，供后续按 scope 投递上报（投递逻辑下个任务接）。
+                origin_scope = f'{scope_type}:{scope_id}' if scope_type and str(scope_id) != '' else None
+                try:
+                    new_agent_id = self.agent_manager.create_agent(instruction, origin_scope=origin_scope)
+                    # 启动常驻循环：使用 roles.agent 独立模型配置
+                    role_model_config = self.model_manager.get_role_model('agent')
+                    if role_model_config:
+                        agent_model = AnthropicChatModel(
+                            base_url=role_model_config['base_url'],
+                            api_key=role_model_config['api_key'],
+                            model_name=role_model_config['model_name'],
+                            messages_path=role_model_config['messages_path'],
+                        )
+                    else:
+                        agent_model = self.model
+                    agent_task = self.loop.create_task(
+                        self.agent_manager.run_agent_loop(
+                            new_agent_id,
+                            agent_model,
+                            self._get_github_api_token(),
+                            prompt_path=self.config.agent_prompt_path,
+                            on_agent_message=self.agent_manager.on_agent_message,
+                        )
+                    )
+                    self.agent_manager.register_agent_task(new_agent_id, agent_task)
+                    result = f'已创建常驻 agent，agent_id: {new_agent_id}，已开始执行任务。'
+                except Exception as exc:
+                    result = f'创建 agent 失败: {exc}'
+        elif name == 'send_to_agent':
+            target_agent_id = str(tool_input.get('agent_id') or '').strip()
+            message = str(tool_input.get('message') or '').strip()
+            if not target_agent_id:
+                result = 'error: agent_id 为空，未发送。'
+            elif not message:
+                result = 'error: message 为空，未发送。'
+            else:
+                ok = self.agent_manager.send_to_agent(target_agent_id, {'role': 'user', 'content': message})
+                result = f'已向 agent {target_agent_id} 发送消息。' if ok else f'向 agent {target_agent_id} 发送失败（可能不存在或队列异常）。'
+        elif name == 'peek_agent':
+            target_agent_id = str(tool_input.get('agent_id') or '').strip()
+            if not target_agent_id:
+                result = 'error: agent_id 为空，无法查看进度。'
+            else:
+                result = await self.agent_manager.summarize_agent(target_agent_id, 'progress')
+        elif name == 'list_agents':
+            agents = self.agent_manager.list_agents()
+            if not agents:
+                result = '当前没有常驻 agent。'
+            else:
+                lines = [f'共 {len(agents)} 个常驻 agent：']
+                for item in agents:
+                    lines.append(
+                        f"- {item.get('agent_id')} | {item.get('status')} | "
+                        f"消息数:{item.get('message_count')} | "
+                        f"来源:{item.get('origin_scope') or '未知'} | "
+                        f"{item.get('instruction_summary') or ''}"
+                    )
+                result = '\n'.join(lines)
+        elif name == 'destroy_agent':
+            target_agent_id = str(tool_input.get('agent_id') or '').strip()
+            summarize = bool(tool_input.get('summarize', False))
+            if not target_agent_id:
+                result = 'error: agent_id 为空，未销毁。'
+            else:
+                destroy_result = await self.agent_manager.destroy_agent(target_agent_id, summarize)
+                removed = destroy_result.get('removed')
+                summary = destroy_result.get('summary')
+                if removed:
+                    result = f'agent {target_agent_id} 已销毁。'
+                    if summary:
+                        result += f'\n销毁前总结：\n{summary}'
+                else:
+                    result = f'agent {target_agent_id} 不存在或已被移除。'
         else:
             result = f'未知 AI 工具: {name}'
         self.tools.record_tool_use(
@@ -1717,7 +2366,7 @@ class AIOrchestrator:
         summary = (reply.text if reply else '').strip()
         return summary or '摘要为空。'
 
-    def _record_turn_log(
+    async def _record_turn_log(
         self,
         scope_type: str,
         scope_id: str,
@@ -1731,7 +2380,8 @@ class AIOrchestrator:
         generation_ms: int | None = None,
         note: str | None = None,
     ):
-        self.repo.add_turn_log(
+        await asyncio.to_thread(
+            self.repo.add_turn_log,
             scope_type,
             scope_id,
             {
@@ -1745,7 +2395,6 @@ class AIOrchestrator:
                 'generation_ms': generation_ms,
                 'note': note,
             },
-            limit=self.config.history_limit,
         )
 
     async def _complete_child_turn(
@@ -1778,11 +2427,12 @@ class AIOrchestrator:
         started_at = time.perf_counter()
         used_tools = False
         sent_entries: list[dict] = []
+        tool_context_messages: list[dict] = []
         fallback_prompted = False
         max_iterations = 8 if live_message is not None else 6
         for _ in range(max_iterations):
             if self._is_epoch_stale(run_epoch):
-                return {'message': '', 'think_note': ''}, int((time.perf_counter() - started_at) * 1000), used_tools
+                return {'message': '', 'think_note': '', 'tool_context_messages': tool_context_messages}, int((time.perf_counter() - started_at) * 1000), used_tools
             round_tools = tools
             forced_digest_round = False
             if scope_key is not None:
@@ -1799,9 +2449,9 @@ class AIOrchestrator:
             reply = await self._complete_chat(system_blocks, model_messages, round_tools, temperature)
             generation_ms = int((time.perf_counter() - started_at) * 1000)
             if self._is_epoch_stale(run_epoch):
-                return {'message': '', 'think_note': ''}, generation_ms, used_tools
+                return {'message': '', 'think_note': '', 'tool_context_messages': tool_context_messages}, generation_ms, used_tools
             if not reply or (not reply.text and not reply.tool_calls):
-                self._record_turn_log(
+                await self._record_turn_log(
                     scope_type,
                     scope_id,
                     agent_id,
@@ -1813,8 +2463,7 @@ class AIOrchestrator:
                     tool_iterations=tool_iterations,
                     generation_ms=generation_ms,
                 )
-                return {'message': '', 'think_note': ''}, generation_ms, used_tools
-
+                return {'message': '', 'think_note': '', 'tool_context_messages': tool_context_messages}, generation_ms, used_tools
             if live_message is None:
                 loop_calls = [call for call in reply.tool_calls if call.name in LOOP_TOOL_NAMES]
                 if not loop_calls:
@@ -1828,7 +2477,7 @@ class AIOrchestrator:
                         allow_tasks=allow_tasks,
                     )
                     think_note = self._normalize_think_note(reply.text)
-                    self._record_turn_log(
+                    await self._record_turn_log(
                         scope_type,
                         scope_id,
                         agent_id,
@@ -1840,7 +2489,7 @@ class AIOrchestrator:
                         tool_iterations=tool_iterations,
                         generation_ms=generation_ms,
                     )
-                    return {'message': final_reply, 'think_note': think_note}, generation_ms, used_tools
+                    return {'message': final_reply, 'think_note': think_note, 'tool_context_messages': tool_context_messages}, generation_ms, used_tools
                 used_tools = True
                 result_blocks: list[dict] = []
                 iteration_calls: list[dict] = []
@@ -1863,7 +2512,8 @@ class AIOrchestrator:
                         'tool_calls': iteration_calls,
                     }
                 )
-                model_messages.append({'role': 'assistant', 'content': self._filter_thinking_blocks(reply.raw_content)})
+                assistant_content = self._filter_thinking_blocks(reply.raw_content)
+                model_messages.append({'role': 'assistant', 'content': assistant_content})
                 model_messages.append({'role': 'user', 'content': result_blocks})
                 continue
 
@@ -1892,7 +2542,7 @@ class AIOrchestrator:
 
                 final_reply = '\n'.join(entry['text'] for entry in sent_entries)
                 think_note = self._normalize_think_note(reply.text)
-                self._record_turn_log(
+                await self._record_turn_log(
                     scope_type,
                     scope_id,
                     agent_id,
@@ -1904,7 +2554,7 @@ class AIOrchestrator:
                     tool_iterations=tool_iterations,
                     generation_ms=generation_ms,
                 )
-                return {'message': final_reply, 'think_note': think_note}, generation_ms, used_tools
+                return {'message': final_reply, 'think_note': think_note, 'tool_context_messages': tool_context_messages}, generation_ms, used_tools
 
             used_tools = True
             result_blocks = []
@@ -1938,11 +2588,19 @@ class AIOrchestrator:
                     'tool_calls': iteration_calls,
                 }
             )
-            model_messages.append({'role': 'assistant', 'content': self._filter_thinking_blocks(reply.raw_content)})
+            assistant_content = self._filter_thinking_blocks(reply.raw_content)
+            model_messages.append({'role': 'assistant', 'content': assistant_content})
             model_messages.append({'role': 'user', 'content': result_blocks})
+            tool_context_messages.append({'role': 'assistant', 'content': copy.deepcopy(assistant_content)})
+            tool_context_messages.append({'role': 'user', 'content': copy.deepcopy(result_blocks)})
 
             scope_key = self._scope_key(scope_type, scope_id)
-            pending = self._pending_scope_turns.pop(scope_key, None)
+            pending = None
+            pending_list = self._pending_scope_turns.get(scope_key)
+            if pending_list:
+                pending = pending_list.pop(0)
+                if not pending_list:
+                    del self._pending_scope_turns[scope_key]
             if pending:
                 model_messages.append({'role': 'user', 'content': self._build_pending_fold_reminder(pending)})
 
@@ -1956,7 +2614,7 @@ class AIOrchestrator:
             limit=self.config.history_limit,
         )
         final_reply = '\n'.join(entry['text'] for entry in sent_entries) if live_message is not None else ''
-        self._record_turn_log(
+        await self._record_turn_log(
             scope_type,
             scope_id,
             agent_id,
@@ -1968,7 +2626,7 @@ class AIOrchestrator:
             tool_iterations=tool_iterations,
             generation_ms=int((time.perf_counter() - started_at) * 1000),
         )
-        return {'message': final_reply, 'think_note': ''}, int((time.perf_counter() - started_at) * 1000), used_tools
+        return {'message': final_reply, 'think_note': '', 'tool_context_messages': tool_context_messages}, int((time.perf_counter() - started_at) * 1000), used_tools
 
     def _apply_directive_tools(
         self,
@@ -2063,6 +2721,22 @@ class AIOrchestrator:
                 return filtered[0].get('text', '')
             return filtered if filtered else ''
         return raw_content
+
+    def _normalize_tool_context_messages(self, messages) -> list[dict]:
+        normalized: list[dict] = []
+        for item in messages or []:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get('role') or '').strip()
+            if role not in {'user', 'assistant'}:
+                continue
+            normalized.append(
+                {
+                    'role': role,
+                    'content': copy.deepcopy(item.get('content')),
+                }
+            )
+        return normalized
 
     def _send_scope_message(self, message: ChatMessage, content: str) -> list[dict]:
         content = self._strip_send_message_thinking(content)
@@ -2222,6 +2896,22 @@ class AIOrchestrator:
             return
         if task.get('status') == 'done':
             return
+
+        # 发送类 task 需占用目标 scope 会话锁，避免与 message turn 并发写同一会话。
+        scope_key = self._scope_key_for_task(task)
+        prereserved = bool(item.get('scope_prereserved'))
+        if scope_key and not prereserved:
+            if not self._reserve_task_scope(scope_key, item):
+                # scope 忙：已按 FIFO 压入 pending，等空闲后 _promote 重新入队，本次不执行。
+                return
+        try:
+            await self._dispatch_task(task, task_id, run_epoch=run_epoch)
+        finally:
+            # 覆盖正常返回/异常/prereserved 等所有退出路径，确保占用的锁被释放。
+            if scope_key:
+                self._release_task_scope(scope_key)
+
+    async def _dispatch_task(self, task: dict, task_id, run_epoch: int):
         kind = task.get('kind')
 
         if kind == 'set_alarm':
@@ -3257,7 +3947,7 @@ class AIOrchestrator:
             self.repo.get_or_create_agent('private', target_qq)
             self.repo.add_note('private', target_qq, relay_context)
             self.repo.add_note('private', target_qq, '如果对方问为什么突然发这条消息，你必须如实说明这是代发，不要编造原因。')
-            self._record_outbound_message('private', target_qq, content)
+            await self._record_outbound_message('private', target_qq, content)
 
             scope_type = payload.get('scope_type')
             scope_id = payload.get('scope_id')
@@ -3276,7 +3966,7 @@ class AIOrchestrator:
                 if requester_qq and scope_type == 'group':
                     fail_text = f'{self.bot.at(int(requester_qq))} {fail_text}'
                 await asyncio.to_thread(self.tools.send_chat_message, scope_type, int(scope_id), fail_text)
-                self._record_outbound_message(scope_type, str(scope_id), fail_text)
+                await self._record_outbound_message(scope_type, str(scope_id), fail_text)
             return f'代发失败: {exc}'
 
     async def _handle_delegate_to_child(self, task: dict, run_epoch: int | None = None) -> str:
@@ -3357,7 +4047,7 @@ class AIOrchestrator:
         if self._is_epoch_stale(run_epoch):
             return f'目标子AI {agent.agent_id} 的请求已被中止。'
         await asyncio.to_thread(self.tools.send_chat_message, target_scope_type, int(target_scope_id), reply)
-        self._record_outbound_message(
+        await self._record_outbound_message(
             target_scope_type,
             target_scope_id,
             reply,
@@ -3450,15 +4140,54 @@ class AIOrchestrator:
         if self._is_epoch_stale(run_epoch):
             return f'给 {target_scope_type}:{target_scope_id} 的发消息请求已被中止。'
         await asyncio.to_thread(self.tools.send_chat_message, target_scope_type, int(target_scope_id), content)
-        self._record_outbound_message(target_scope_type, target_scope_id, content)
+        await self._record_outbound_message(target_scope_type, target_scope_id, content)
         return f'已向 {target_scope_type}:{target_scope_id} 发送消息。'
 
     async def _run_dev_agent_task(self, task: dict):
         task_id = task['task_id']
         payload = task.get('payload') or {}
-        task_desc = str(payload.get('task') or '').strip()
+        # 兼容回退：依次尝试 task / content / description
+        raw_task = payload.get('task') or payload.get('content') or payload.get('description') or ''
+        raw_task = str(raw_task).strip()
+        # 若取到的值形似 JSON dict，尝试解析并从中提取 task
+        if raw_task.startswith('{'):
+            try:
+                parsed = json.loads(raw_task)
+                if isinstance(parsed, dict):
+                    raw_task = str(parsed.get('task') or raw_task).strip()
+                    if not payload.get('github_repo') and parsed.get('github_repo'):
+                        payload['github_repo'] = parsed['github_repo']
+            except (json.JSONDecodeError, TypeError):
+                pass
+        task_desc = raw_task
         github_repo = str(payload.get('github_repo') or '').strip()
         source_agent = str(task.get('source_agent') or '')
+        delivery_done = False
+
+        scope_type, _, scope_id = source_agent.partition(':')
+        # If the task was created by master itself, try to find the originating user
+        # session from the payload so the result can be forwarded there.
+        if scope_type == 'master':
+            origin_scope_type = str(payload.get('origin_scope_type') or '').strip()
+            origin_scope_id = str(payload.get('origin_scope_id') or '').strip()
+            if origin_scope_type and origin_scope_id:
+                scope_type, scope_id = origin_scope_type, origin_scope_id
+
+        async def finish_trigger(summary: dict):
+            nonlocal delivery_done
+            if delivery_done:
+                return
+            delivery_done = True
+            status = str(summary.get('status') or 'done').strip() or 'done'
+            result = str(summary.get('result') or '').strip() or 'Dev agent 已结束，但没有返回结果。'
+            self.repo.update_task(task_id, status, result)
+            self.repo.add_note(
+                'master',
+                'global',
+                f'Dev agent 任务完成 [{task_id}] ({status}): {task_desc}\n结果: {result}',
+            )
+            if scope_type and scope_id and scope_type != 'master':
+                self._deliver_task_report_message(scope_type, scope_id, task_id, result)
 
         requester_qq = str(payload.get('requester_qq') or '').strip()
         if task_desc and requester_qq:
@@ -3472,36 +4201,36 @@ class AIOrchestrator:
                 )
 
         if not task_desc:
-            result = '缺少任务描述 (task)，未执行。'
+            result = f'缺少任务描述 (task)，未执行。实际收到的 payload 键: {list(payload.keys())}'
         else:
             try:
+                role_model_config = self.model_manager.get_role_model('dev_agent')
+                if role_model_config:
+                    dev_model = AnthropicChatModel(
+                        base_url=role_model_config['base_url'],
+                        api_key=role_model_config['api_key'],
+                        model_name=role_model_config['model_name'],
+                        messages_path=role_model_config['messages_path'],
+                    )
+                else:
+                    dev_model = self.model
                 result = await run_dev_agent(
-                    self.model,
+                    dev_model,
                     self._get_github_api_token(),
                     task_desc,
                     github_repo=github_repo,
                     prompt_path=self.config.dev_agent_prompt_path,
+                    on_finished=finish_trigger,
                 )
             except Exception as exc:
                 result = f'Dev agent 执行异常: {exc}'
-
-        self.repo.update_task(task_id, 'done', result)
-        self.repo.add_note(
-            'master',
-            'global',
-            f'Dev agent 任务完成 [{task_id}]: {task_desc}\n结果: {result}',
-        )
-
-        scope_type, _, scope_id = source_agent.partition(':')
-        # If the task was created by master itself, try to find the originating user
-        # session from the payload so the result can be forwarded there.
-        if scope_type == 'master':
-            origin_scope_type = str(payload.get('origin_scope_type') or '').strip()
-            origin_scope_id = str(payload.get('origin_scope_id') or '').strip()
-            if origin_scope_type and origin_scope_id:
-                scope_type, scope_id = origin_scope_type, origin_scope_id
-        if scope_type and scope_id and scope_type != 'master':
-            self._deliver_task_report_message(scope_type, scope_id, task_id, result)
+        if not delivery_done:
+            await finish_trigger(
+                {
+                    'status': 'failed' if result.startswith('Dev agent 执行异常') else 'done',
+                    'result': result,
+                }
+            )
 
     async def _report_child_result(self, source_agent: str, payload: dict):
         report_task = self.tools.create_task(source_agent, 'child_report', payload)
@@ -3907,7 +4636,7 @@ class AIOrchestrator:
         if not scope_type or not scope_id:
             return
         await asyncio.to_thread(self.tools.send_chat_message, scope_type, int(scope_id), text)
-        self._record_outbound_message(scope_type, str(scope_id), text)
+        await self._record_outbound_message(scope_type, str(scope_id), text)
 
     def _notify_prefix(self, payload: dict) -> str:
         requester_qq = str(payload.get('requester_qq') or '').strip()
@@ -3916,9 +4645,25 @@ class AIOrchestrator:
             return self.bot.at(int(requester_qq))
         return ''
 
+    @staticmethod
+    def _coerce_timestamp(value) -> float:
+        """将 Unix 时间戳(float/int/数字字符串)或 ISO 8601 字符串统一转换为 Unix 时间戳(float)。"""
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            text = value.strip()
+            try:
+                return float(text)
+            except ValueError:
+                pass
+            iso = text.replace('Z', '+00:00') if text.endswith('Z') else text
+            dt = datetime.fromisoformat(iso)
+            return dt.timestamp()
+        raise TypeError(f'无法解析时间戳: {value!r}')
+
     def _resolve_alarm_due_at(self, payload: dict) -> float | None:
         if payload.get('due_at') is not None:
-            return float(payload['due_at'])
+            return self._coerce_timestamp(payload['due_at'])
         if payload.get('delay_seconds') is not None:
             return time.time() + float(payload['delay_seconds'])
         time_expression = payload.get('time_expression')
@@ -3967,8 +4712,9 @@ class AIOrchestrator:
         generation_ms: int | None = None,
         think_note: str = '',
         timestamp: float | None = None,
+        tool_context_messages: list[dict] | None = None,
     ) -> dict:
-        return {
+        item = {
             'user_id': self.bot.self_id,
             'nickname': '冰糖',
             'text': text,
@@ -3978,21 +4724,28 @@ class AIOrchestrator:
             'generation_ms': generation_ms,
             'think_note': self._normalize_think_note(think_note),
         }
+        normalized_tool_context = self._normalize_tool_context_messages(tool_context_messages)
+        if normalized_tool_context:
+            item['tool_context_messages'] = normalized_tool_context
+        return item
 
-    def _record_outbound_message(
+    async def _record_outbound_message(
         self,
         scope_type: str,
         scope_id: str,
         text: str,
         generation_ms: int | None = None,
         think_note: str = '',
+        tool_context_messages: list[dict] | None = None,
     ) -> dict:
         item = self._build_outbound_message_entry(
             text,
             generation_ms=generation_ms,
             think_note=think_note,
+            tool_context_messages=tool_context_messages,
         )
-        self.repo.append_message(
+        await asyncio.to_thread(
+            self.repo.append_message,
             scope_type,
             scope_id,
             item,

@@ -169,7 +169,7 @@ class WebUIService:
         state = self.repo.load_state()
         agents = list((state.get('agents') or {}).values())
         tasks = list((state.get('tasks') or {}).values())
-        memories = state.get('memories') or {}
+        memory_scope_count = self.repo.count_memory_scopes()
         runtime = self.orchestrator.get_runtime_status()
         top_agents = []
         for item in self.list_agents()[:8]:
@@ -193,7 +193,7 @@ class WebUIService:
                 'masters': sum(1 for item in agents if item.get('scope_type') == 'master'),
                 'tasks': len(tasks),
                 'queued_tasks': sum(1 for item in tasks if item.get('status') in {'queued', 'running', 'scheduled'}),
-                'memories': len(memories),
+                'memories': memory_scope_count,
             },
             'task_status_counts': self._count_values(tasks, 'status'),
             'task_kind_counts': self._count_values(tasks, 'kind'),
@@ -213,7 +213,6 @@ class WebUIService:
         result = []
         state = self.repo.load_state()
         agents = state.get('agents') or {}
-        memories = state.get('memories') or {}
 
         # Sort agents by updated_at descending
         sorted_agents = sorted(agents.values(), key=lambda item: item.get('updated_at', 0), reverse=True)
@@ -224,7 +223,7 @@ class WebUIService:
             
             s_type = agent.get('scope_type', '')
             s_id = str(agent.get('scope_id', ''))
-            memory = memories.get(f'{s_type}:{s_id}') or {}
+            memory = self.repo.get_memory(s_type, s_id)
             
             item = {
                 'agent_id': agent.get('agent_id'),
