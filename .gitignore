@@ -33,3 +33,13 @@ data/github_update_workflow.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Model config with API keys
+data/models_config.json
+
+# Backup files
+*.bak
+*.bak.*
+*.bak_*
+*.backup
+*.orig
