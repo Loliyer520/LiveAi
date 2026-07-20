@@ -94,6 +94,10 @@ class AIRepository:
         memory.setdefault('notes', [])
         memory.setdefault('tool_logs', [])
         memory.setdefault('turn_logs', [])
+        memory.setdefault('diary_window', [])
+        memory.setdefault('diary_summaries', [])
+        memory.setdefault('diary_pending', [])
+        memory.setdefault('diary_next_index', 0)
         for item in memory['notes']:
             item.setdefault('note_id', uuid.uuid4().hex[:12])
             item.setdefault('created_at', time.time())
@@ -344,15 +348,24 @@ class AIRepository:
 
         return self.store.update(mutator)
 
-    def append_message(self, scope_type: str, scope_id: str, message: dict, limit: int):
+    def append_message(self, scope_type: str, scope_id: str, message: dict, limit: int, diary_size: int = 0) -> bool:
         key = self._memory_key(scope_type, scope_id)
         agent_key = self._agent_key(scope_type, scope_id)
+        has_pending = False
 
         def mem_mutator(memory: dict):
+            nonlocal has_pending
             self._normalize_memory(memory)
+            if diary_size > 0:
+                self._maybe_migrate_to_diary(memory, diary_size)
             messages = memory['messages']
             messages.append(message)
-            del messages[:-limit]
+            if diary_size > 0:
+                if len(messages) >= diary_size:
+                    self._seal_diary(memory)
+                has_pending = bool(memory.get('diary_pending'))
+            else:
+                del messages[:-limit]
 
         self.memory_store.update(key, mem_mutator)
 
@@ -367,6 +380,120 @@ class AIRepository:
             data['message_count'] = int(data.get('message_count') or 0) + 1
 
         self.store.update(agent_mutator)
+        return has_pending
+
+    @staticmethod
+    def _seal_diary(memory: dict):
+        messages = memory.get('messages', [])
+        if not messages:
+            return
+        next_idx = int(memory.get('diary_next_index') or 0)
+        diary_window = memory.setdefault('diary_window', [])
+        diary_pending = memory.setdefault('diary_pending', [])
+        diary_window.append({'index': next_idx, 'messages': list(messages), 'sealed_at': int(time.time())})
+        memory['diary_next_index'] = next_idx + 1
+        memory['messages'] = []
+        while len(diary_window) > 2:
+            diary_pending.append(diary_window.pop(0))
+
+    @staticmethod
+    def _maybe_migrate_to_diary(memory: dict, diary_size: int):
+        if memory.get('diary_next_index') or memory.get('diary_window'):
+            return
+        messages = memory.get('messages', [])
+        if len(messages) <= diary_size:
+            return
+        chunks, i = [], 0
+        while i + diary_size <= len(messages):
+            chunks.append(messages[i:i + diary_size])
+            i += diary_size
+        remainder = messages[i:]
+        diary_window, diary_pending, next_idx = [], [], 0
+        for chunk in chunks:
+            diary_window.append({'index': next_idx, 'messages': chunk, 'sealed_at': int(time.time())})
+            next_idx += 1
+        while len(diary_window) > 2:
+            diary_pending.append(diary_window.pop(0))
+        memory['diary_window'] = diary_window
+        memory['diary_pending'] = diary_pending
+        memory['diary_next_index'] = next_idx
+        memory['messages'] = remainder
+
+    def get_diary_context(self, scope_type: str, scope_id: str) -> dict:
+        key = self._memory_key(scope_type, scope_id)
+        memory = self.memory_store.load(key) or {}
+        self._normalize_memory(memory)
+        return {
+            'summaries': list(memory.get('diary_summaries') or []),
+            'window': [dict(d) for d in (memory.get('diary_window') or [])],
+            'current': list(memory.get('messages') or []),
+            'has_pending': bool(memory.get('diary_pending')),
+        }
+
+    def get_pending_diary(self, scope_type: str, scope_id: str) -> dict | None:
+        key = self._memory_key(scope_type, scope_id)
+        memory = self.memory_store.load(key) or {}
+        self._normalize_memory(memory)
+        pending = memory.get('diary_pending') or []
+        if not pending:
+            return None
+        return dict(min(pending, key=lambda d: int(d.get('index') or 0)))
+
+    # 日记摘要上限：超过此数量时触发元总结（将最旧 50 条摘要合并为一条）
+    MAX_DIARY_ENTRIES = 100
+    DIARY_META_BATCH = 50
+
+    def store_diary_summary(self, scope_type: str, scope_id: str, diary_index: int, text: str) -> bool:
+        """存储一条日记摘要。返回 True 表示需要进行元总结（摘要总数超过上限）。"""
+        key = self._memory_key(scope_type, scope_id)
+        needs_meta = False
+
+        def mutator(memory: dict):
+            nonlocal needs_meta
+            self._normalize_memory(memory)
+            memory['diary_pending'] = [
+                d for d in (memory.get('diary_pending') or [])
+                if int(d.get('index') or 0) != diary_index
+            ]
+            summaries = memory.setdefault('diary_summaries', [])
+            summaries.append({'index': diary_index, 'text': text, 'summarized_at': int(time.time())})
+            summaries.sort(key=lambda x: int(x.get('index') or 0))
+            # 检查是否需要进行元总结
+            if len(summaries) > self.MAX_DIARY_ENTRIES and not memory.get('meta_summary_pending'):
+                needs_meta = True
+                memory['meta_summary_pending'] = True
+
+        self.memory_store.update(key, mutator)
+        return needs_meta
+
+    def get_meta_summary_candidates(self, scope_type: str, scope_id: str) -> list[dict] | None:
+        """取最旧的 DIARY_META_BATCH 条日记摘要用于元总结。不足则返回 None。"""
+        key = self._memory_key(scope_type, scope_id)
+        memory = self.memory_store.load(key) or {}
+        self._normalize_memory(memory)
+        summaries = list(memory.get('diary_summaries') or [])
+        if len(summaries) <= self.MAX_DIARY_ENTRIES:
+            return None
+        return summaries[:self.DIARY_META_BATCH]
+
+    def store_meta_summary(self, scope_type: str, scope_id: str, text: str):
+        """用一条元总结替换最旧的 DIARY_META_BATCH 条日记摘要。"""
+        key = self._memory_key(scope_type, scope_id)
+
+        def mutator(memory: dict):
+            self._normalize_memory(memory)
+            summaries = memory.setdefault('diary_summaries', [])
+            # 用一条元总结替换前 DIARY_META_BATCH 条
+            meta_entry = {
+                'index': summaries[0]['index'] if summaries else 0,
+                'text': text,
+                'summarized_at': int(time.time()),
+                'is_meta': True,
+            }
+            memory['diary_summaries'] = [meta_entry] + summaries[self.DIARY_META_BATCH:]
+            memory['meta_summary_pending'] = False
+
+        self.memory_store.update(key, mutator)
 
     def list_messages(self, scope_type: str, scope_id: str) -> list[dict]:
         key = self._memory_key(scope_type, scope_id)

@@ -1,10 +1,10 @@
 import copy
 
 # 循环型工具：执行后把 tool_result 回填给模型继续本回合
-LOOP_TOOL_NAMES = {'memory_list', 'memory_get', 'memory_add', 'memory_update', 'web_search', 'list_tasks', 'get_task', 'download_file', 'check_github_version', 'execute_update', 'create_agent', 'send_to_agent', 'peek_agent', 'list_agents', 'destroy_agent'}
+LOOP_TOOL_NAMES = {'memory_list', 'memory_get', 'memory_add', 'memory_update', 'web_search', 'list_tasks', 'get_task', 'download_file', 'check_github_version', 'execute_update', 'create_agent', 'send_to_agent', 'peek_agent', 'list_agents', 'destroy_agent', 'create_recurring_task', 'list_recurring_tasks', 'update_recurring_task', 'delete_recurring_task', 'view_image', 'list_stickers', 'annotate_sticker', 'send_sticker', 'send_local_image', 'send_file', 'manage_upstream', 'manage_channel', 'manage_role', 'query_logs', 'manage_mute'}
 
 # 指令型工具：终结本回合，由运行时按结构化入参执行
-DIRECTIVE_TOOL_NAMES = {'send_message', 'remember', 'notify_master', 'create_task', 'recall_message'}
+DIRECTIVE_TOOL_NAMES = {'send_message', 'remember', 'notify_master', 'create_task', 'recall_message', 'stay_silent'}
 
 _TOOL_DEFINITIONS: dict[str, dict] = {
     'memory_list': {
@@ -60,6 +60,110 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
             'required': ['query'],
         },
     },
+    'view_image': {
+        'name': 'view_image',
+        'description': (
+            '查看/解析本次触发消息里的某张图片，返回该图片的文字描述。'
+            '只有当你确实需要看懂图片内容才有意义时才调用（比如别人发图问你、图里有你需要理解的文字/梗/信息）；'
+            '纯表情、刷屏、跟你无关的图不用看。'
+            'index 从 1 开始，对应背景信息里"本次消息包含的图片"列出的序号；'
+            '不传 index 时默认解析第 1 张。'
+            '可选 question 用来指定你想重点看什么（比如"图里的文字是什么""这个人在做什么"），不传则做通用描述。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'index': {'type': 'integer', 'description': '要查看的图片序号，从 1 开始，默认 1'},
+                'question': {'type': 'string', 'description': '可选，你想重点了解图片的什么内容'},
+            },
+            'required': [],
+        },
+    },
+    'list_stickers': {
+        'name': 'list_stickers',
+        'description': (
+            '列出你自己账号收藏的表情包（QQ 收藏表情），返回带序号的列表，每条包含你之前给它打的备注（如果有）。'
+            '想发表情包前先用它看看有哪些、序号是多少。'
+            '如果某个表情还没备注，建议先用 annotate_sticker 给它打个备注（描述这个表情是什么、适合什么场景），方便以后凭记忆挑选。'
+            '这份列表是账号级共享缓存（几分钟内有效），不同会话看到的序号一致，一般不需要强制刷新；'
+            '只有怀疑收藏内容变了（比如刚在别处收藏/删除了表情）才传 refresh=true 强制重新拉取。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'refresh': {'type': 'boolean', 'description': '是否强制重新拉取，忽略缓存，默认 false'},
+            },
+            'required': [],
+        },
+    },
+    'annotate_sticker': {
+        'name': 'annotate_sticker',
+        'description': (
+            '给你收藏的某个表情包打备注或改备注，方便以后按备注挑选要发哪个。'
+            'index 从 1 开始，对应 list_stickers 列出的序号。'
+            'note 写清楚这个表情是什么样子、表达什么情绪、适合什么场景。'
+            '调用前请先用 list_stickers 确认序号。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'index': {'type': 'integer', 'description': '要打备注的表情序号，从 1 开始（来自 list_stickers）'},
+                'note': {'type': 'string', 'description': '备注内容，描述这个表情的样子/情绪/适用场景'},
+            },
+            'required': ['index', 'note'],
+        },
+    },
+    'send_sticker': {
+        'name': 'send_sticker',
+        'description': (
+            '把你收藏的某个表情包发到当前会话。index 从 1 开始，对应 list_stickers 列出的序号。'
+            '在合适的聊天氛围里用表情包活跃气氛或表达情绪，但别刷屏。'
+            '调用前请先用 list_stickers 确认序号（尤其是你还没查过收藏列表时）。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'index': {'type': 'integer', 'description': '要发送的表情序号，从 1 开始（来自 list_stickers）'},
+            },
+            'required': ['index'],
+        },
+    },
+    'send_local_image': {
+        'name': 'send_local_image',
+        'description': (
+            '把一张本地图片文件发送到当前会话（例如把代码渲染成的图片发出去）。'
+            '出于安全限制，只能发送项目 data/images/ 目录下的图片文件，'
+            'path 传相对该目录的文件名（如 "code_abc.png"）或该目录下的绝对路径；'
+            '目录以外的路径会被拒绝。支持 .png/.jpg/.jpeg/.gif/.webp，单张不超过 10MB。'
+            '可选 caption 会作为图片附带的文字一起发送。'
+            '发送成功后会返回 message_id。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'path': {'type': 'string', 'description': '要发送的本地图片路径，限定在项目 data/images/ 目录内'},
+                'caption': {'type': 'string', 'description': '可选，随图片一起发送的文字说明'},
+            },
+            'required': ['path'],
+        },
+    },
+    'send_file': {
+        'name': 'send_file',
+        'description': (
+            '把服务器本地的一个文件通过 QQ 发送给当前会话（私聊或群聊）。'
+            'path 必须是服务器上的绝对路径（如 /my/pro/bot/LiveAi/data/files/report.pdf）；'
+            '可选 name 指定对方看到的显示文件名（含后缀），不传则取路径末尾的文件名。'
+            '发送成功后返回确认信息。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'path': {'type': 'string', 'description': '服务器上文件的绝对路径'},
+                'name': {'type': 'string', 'description': '可选，对方看到的显示文件名（含后缀）'},
+            },
+            'required': ['path'],
+        },
+    },
     'send_message': {
         'name': 'send_message',
         'description': (
@@ -80,6 +184,17 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
             },
             'required': ['content'],
         },
+    },
+    'stay_silent': {
+        'name': 'stay_silent',
+        'description': (
+            '本回合保持沉默、不发任何消息，直接结束这一轮。'
+            '当你判断现在不该说话（没被点名、插不上话、没有明确要回应的内容、'
+            '或说了反而尴尬）时调用它。'
+            '注意：不要用它来“假装沉默却把想说的话写在别处”——真要说话就调用 send_message，'
+            '真不想说才调用 stay_silent。二者只能选其一。'
+        ),
+        'input_schema': {'type': 'object', 'properties': {}, 'required': []},
     },
     'recall_message': {
         'name': 'recall_message',
@@ -110,12 +225,22 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
         'name': 'notify_master',
         'description': (
             '向主AI上报或请求协调。当用户要你联系别人、转达消息、查其他会话情况，'
-            '或有需要跨会话协作的事项时调用。'
+            '或有需要跨会话协作的事项时调用。\n'
+            'content 可以是一句自然语言（主AI会自行理解并协调），'
+            '也可以是一段 JSON 字符串来精确表达意图，支持以下 request_type：\n'
+            '1) 联系/转达他人：{"request_type":"coordinate_contact","target_scope_type":"private",'
+            '"target_scope_id":"对方QQ号","content":"要转达的话","instruction":"如果合适，请主动联系并自然转达"}\n'
+            '2) 设定某人的全局人物设定/关系（如“X是我女朋友”“对X语气好一点”）：'
+            '{"request_type":"set_user_preference","target_query":"对方昵称或QQ",'
+            '"preference_text":"要长期记住的设定，写清关系或对待方式"}\n'
+            '3) 查询之前托付联系的进度（如“我让你发的消息对方回了吗”）：'
+            '{"request_type":"query_contact_status"}（主AI会自动定位最近一次联系任务并回传进度）\n'
+            '不确定用哪种时，直接用自然语言描述即可，主AI会判断。'
         ),
         'input_schema': {
             'type': 'object',
             'properties': {
-                'content': {'type': 'string', 'description': '要上报给主AI的内容，或 JSON 格式的协调请求'},
+                'content': {'type': 'string', 'description': '要上报给主AI的内容，或上述 JSON 格式的协调请求'},
             },
             'required': ['content'],
         },
@@ -340,6 +465,101 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
             'required': ['agent_id', 'summarize'],
         },
     },
+    'manage_upstream': {
+        'name': 'manage_upstream',
+        'description': '管理 API 上游配置（三级架构第一级）。支持查看/新增/修改/删除上游，以及查询上游余额。',
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'action': {'type': 'string', 'description': 'list | add | update | remove | balance', 'enum': ['list', 'add', 'update', 'remove', 'balance']},
+                'name': {'type': 'string', 'description': '上游名称（add/update/remove/balance 时使用）'},
+                'base_url': {'type': 'string', 'description': 'API 地址，如 https://api.example.com'},
+                'api_key': {'type': 'string', 'description': 'API 密钥'},
+                'messages_path': {'type': 'string', 'description': 'Anthropic 接口填 /v1/messages，OpenAI 留空'},
+            },
+            'required': ['action'],
+        },
+    },
+    'manage_channel': {
+        'name': 'manage_channel',
+        'description': '管理渠道配置（三级架构第二级）。渠道是模型池，包含多个上游+模型的组合及轮询策略。',
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'action': {'type': 'string', 'description': 'list | add | update | remove | addmodel | removemodel', 'enum': ['list', 'add', 'update', 'remove', 'addmodel', 'removemodel']},
+                'name': {'type': 'string', 'description': '渠道名称'},
+                'strategy': {'type': 'string', 'description': '轮询策略: fallback（失败切换）| random（每次随机）| roundrobin（每次轮询）', 'enum': ['fallback', 'random', 'roundrobin']},
+                'upstream': {'type': 'string', 'description': 'addmodel 时：上游名称'},
+                'model_id': {'type': 'string', 'description': 'addmodel 时：模型 ID'},
+                'model_index': {'type': 'integer', 'description': 'removemodel 时：要删除的模型序号（从0开始）'},
+            },
+            'required': ['action'],
+        },
+    },
+    'manage_role': {
+        'name': 'manage_role',
+        'description': '管理角色-渠道绑定（三级架构第三级）。为 main/tiered/agent/dev_agent/vision 各角色指定使用哪个渠道。',
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'action': {'type': 'string', 'description': 'list | set', 'enum': ['list', 'set']},
+                'role': {'type': 'string', 'description': 'set 时：角色名，可选 main / tiered / agent / dev_agent / vision'},
+                'channel': {'type': 'string', 'description': 'set 时：要绑定的渠道名称'},
+            },
+            'required': ['action'],
+        },
+    },
+    'query_logs': {
+        'name': 'query_logs',
+        'description': (
+            '查询系统运行时日志。用于排查问题、了解后台 agent/task 状态、检查 API 调用情况、'
+            '确认聊天 AI 触发原因等。\n'
+            '参数：count（返回条数，1-200，默认20）、priority（过滤级别，0-5）、'
+            'scope_key（会话标识，格式 "group:群号" 或 "private:QQ号"，默认当前会话）。\n'
+            '优先级说明：0=全部 / 1=忽略API的info / 2=只看异常 / 3=agent日志 / 4/5=聊天AI日志。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'count': {'type': 'integer', 'description': '返回日志条数，1-200，默认20'},
+                'priority': {'type': 'integer', 'description': '日志过滤级别 0-5，默认0（全部）'},
+                'scope_key': {'type': 'string', 'description': '会话标识 "group:群号" 或 "private:QQ号"，默认当前会话'},
+            },
+            'required': [],
+        },
+    },
+    'manage_mute': {
+        'name': 'manage_mute',
+        'description': (
+            '群聊禁言管理工具。'
+            '支持禁言（ban）、解除禁言（unban）、查看禁言状态（status）三种操作。'
+            '仅在当前会话是群聊时可用，需要 bot 自身是该群的管理员或群主才能执行 ban/unban。'
+            '\n'
+            '参数说明：\n'
+            '- action: ban（禁言）/ unban（解除禁言）/ status（查询成员角色和 bot 自身权限）\n'
+            '- target_user_id: 要操作的群成员 QQ 号，ban/unban 时必填\n'
+            '- duration: 禁言时长（秒），仅在 ban 时有效；默认 60 秒，最大 30 天（2592000 秒）\n'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'action': {
+                    'type': 'string',
+                    'description': '操作类型：ban=禁言, unban=解除禁言, status=查看状态',
+                    'enum': ['ban', 'unban', 'status'],
+                },
+                'target_user_id': {
+                    'type': 'integer',
+                    'description': '要操作的群成员 QQ 号，ban/unban 时必填',
+                },
+                'duration': {
+                    'type': 'integer',
+                    'description': '禁言时长（秒），ban 时使用，默认 60，最大 2592000（30天）',
+                },
+            },
+            'required': ['action'],
+        },
+    },
 }
 
 
@@ -353,6 +573,8 @@ def build_tools(
     include_download_file: bool = True,
     allow_recurring_tasks: bool = True,
     allow_update_tools: bool = False,
+    allow_config_tools: bool = False,
+    include_group_management: bool = False,
     cache_last: bool = True,
     immediate_mode: bool = False,
 ) -> list[dict]:
@@ -361,6 +583,7 @@ def build_tools(
         names.extend(['memory_list', 'memory_get', 'memory_add', 'memory_update'])
     if allow_search:
         names.append('web_search')
+    names.append('query_logs')
     if include_download_file:
         names.append('download_file')
     if include_remember:
@@ -374,10 +597,16 @@ def build_tools(
         names.extend(['create_recurring_task', 'list_recurring_tasks', 'update_recurring_task', 'delete_recurring_task'])
     if allow_update_tools:
         names.extend(['check_github_version', 'execute_update'])
+    if allow_config_tools:
+        names.extend(['manage_upstream', 'manage_channel', 'manage_role'])
+    if include_group_management:
+        names.append('manage_mute')
     if include_message:
         names.append('send_message')
     if include_message and immediate_mode:
         names.append('recall_message')
+        names.append('stay_silent')
+        names.extend(['view_image', 'list_stickers', 'annotate_sticker', 'send_sticker', 'send_local_image', 'send_file'])
     tools = [copy.deepcopy(_TOOL_DEFINITIONS[name]) for name in names]
     if tools and cache_last:
         tools[-1]['cache_control'] = {'type': 'ephemeral'}

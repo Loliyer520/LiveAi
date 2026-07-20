@@ -16,6 +16,7 @@ from typing import Awaitable, Callable
 from pack.anthropic_chat_model import AnthropicChatModel
 from pack.github_service import GitHubService
 from pack.console_logger import error, warn
+from core.logger import get_bot_logger, CAT_API
 
 MAX_ITERATIONS = 100
 MAX_FILE_BYTES = 300_000
@@ -69,6 +70,10 @@ def _call_with_retry(label: str, fn, max_retries: int = API_MAX_RETRIES):
             if attempt >= max_retries or not _is_retryable_api_error(exc):
                 raise
             delay = _retry_sleep_seconds(attempt)
+            try:
+                get_bot_logger().warn(CAT_API, '', f'API 重试 {label} attempt={attempt}/{max_retries} delay={delay:.1f}s error={exc}')
+            except Exception:
+                pass
             warn(f'[DevAgent] {label} 失败，第 {attempt}/{max_retries} 次重试前等待 {delay:.1f}s: {exc}')
             time.sleep(delay)
     if last_exc is not None:
@@ -864,7 +869,7 @@ def _replace_local_file_lines(
     replacement = str(content or '')
     replacement_lines = replacement.splitlines(keepends=True)
     if replacement and not replacement.endswith('\n'):
-        replacement_lines = replacement_lines[:-1] + [replacement_lines[-1]]
+        replacement_lines[-1] = replacement_lines[-1] + '\n'
     updated_lines = lines[: start_line - 1] + replacement_lines + lines[end_line:]
     updated = ''.join(updated_lines)
     return _finalize_file_update(
@@ -905,7 +910,7 @@ def _insert_local_file_lines(
         insert_index = line - 1 if position == 'before' else line
     insert_lines = str(content or '').splitlines(keepends=True)
     if content and '\n' in content and not content.endswith('\n'):
-        insert_lines[-1] = insert_lines[-1]
+        insert_lines[-1] = insert_lines[-1] + '\n'
     updated_lines = lines[:insert_index] + insert_lines + lines[insert_index:]
     updated = ''.join(updated_lines)
     return _finalize_file_update(

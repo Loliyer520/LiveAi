@@ -20,36 +20,9 @@ ai:
   enabled: true
   admin_qq: 123456789
   master_qq: 123456789  # 主人QQ号，AI会识别为"主人"并给予最高信任
-  default_chat_profile: "claude"
 
-  # Flash model (default)
-  model_base_url: "https://api.deepseek.com/anthropic"
-  api_key: "sk-your-deepseek-key"
-  model_name: "deepseek-v4-flash"
-  model_messages_path: "/v1/messages"
-
-  # Pro model
-  pro_model_base_url: "https://api.deepseek.com/anthropic"
-  pro_api_key: "sk-your-deepseek-key"
-  pro_model_name: "deepseek-v4-pro"
-  pro_model_messages_path: "/v1/messages"
-
-  # Claude model
-  claude_model_base_url: "https://api.anthropic.com/v1"
-  claude_api_key: "sk-your-claude-key"
-  claude_model_name: "claude-sonnet-4"
-  claude_model_messages_path: "/messages"
-
-  # Claude Opus model
-  claude_opus_model_base_url: "https://api.anthropic.com/v1"
-  claude_opus_api_key: "sk-your-claude-key"
-  claude_opus_model_name: "claude-opus-4"
-  claude_opus_model_messages_path: "/messages"
-
-  # Vision model
-  vision_base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-  vision_api_key: "sk-your-vision-key"
-  vision_model_name: "qwen3.5-flash"
+  # 模型/渠道配置统一在 data/models_config.json 中管理
+  models_config_path: "data/models_config.json"
 
   # Storage and prompts
   storage_path: "data/msgs/ai_state.json"

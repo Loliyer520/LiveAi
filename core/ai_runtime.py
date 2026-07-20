@@ -20,12 +20,18 @@ try:
     import httpx as _httpx_mod
 except ImportError:
     _httpx_mod = None
+
+try:
+    import requests as _requests_mod
+except ImportError:
+    _requests_mod = None
 from pack.napcat import NapcatBot
 from pack.anthropic_chat_model import AnthropicChatModel, AnthropicReply
 from pack.search_service import DoubaoSearchService
 from pack.vision_model import OpenAICompatibleVisionModel
 from pack.update_service import UpdateService
 from pack.console_logger import info, warn, error, debug
+from core.logger import get_bot_logger, INFO, WARN, ERROR, CAT_API, CAT_CHAT, CAT_TASK, CAT_AGENT
 from core.ai_repository import AIRepository
 from core.ai_tools_schema import LOOP_TOOL_NAMES, build_tools
 from core.config import AIConfig
@@ -33,8 +39,72 @@ from core.dev_agent import run_dev_agent
 from core.agent_manager import AgentManager
 from core.events import ChatMessage
 from core.prompt_store import PromptStore, default_char_prompt
+from core.test_command import handle_test_command
 from core.model_manager import ModelManager
 from tool.ai_toolbox import AIToolbox
+
+
+# ── 代码块转图：检测/分段纯函数（步骤2，暂不接线到发送主链路）──────────────
+# 匹配 Markdown 围栏代码块：```lang\n...代码...\n```
+# - 开围栏后 info string 第一个 token 作为语言，空则为 None（交给 Pygments 猜）
+# - re.DOTALL 让 . 跨行匹配，(.*?) 非贪婪，避免把多个代码块吞成一个
+_CODE_FENCE_RE = re.compile(r'```[ \t]*([^\n`]*)\n(.*?)```', re.DOTALL)
+
+
+def _extract_code_language(info_string: str | None) -> str | None:
+    """从围栏 info string 里取语言标识：第一个 token，空则 None。"""
+    info = (info_string or '').strip()
+    if not info:
+        return None
+    token = info.split()[0].strip()
+    return token or None
+
+
+def has_code_block(content: str | None) -> bool:
+    """内容里是否存在至少一个围栏代码块。"""
+    if not content:
+        return False
+    return _CODE_FENCE_RE.search(content) is not None
+
+
+def split_code_block_segments(content: str | None) -> list[dict]:
+    """把一段文本按代码块切成有序段列表，保持原文顺序。
+
+    返回元素形如：
+      {'kind': 'text', 'text': 原始文本片段}
+      {'kind': 'code', 'language': str|None, 'code': 代码正文, 'raw': 含围栏的原文}
+
+    规则：
+      - 代码块之间/前后的纯文本各自成为一个 text 段（去空后为空的片段丢弃）
+      - 多个代码块 → 多个 code 段，顺序穿插，位置与原文一致
+      - 'raw' 保留含围栏的原始文本，供降级时原样发送
+      - 无代码块时返回单个 text 段（或空列表）
+    """
+    text = content or ''
+    segments: list[dict] = []
+    last = 0
+    for m in _CODE_FENCE_RE.finditer(text):
+        start, end = m.span()
+        if start > last:
+            pre = text[last:start]
+            if pre.strip():
+                segments.append({'kind': 'text', 'text': pre})
+        code = m.group(2)
+        # 去掉代码正文末尾恰好一个换行（闭合围栏前的换行），保留内部结构
+        if code.endswith('\n'):
+            code = code[:-1]
+        segments.append({
+            'kind': 'code',
+            'language': _extract_code_language(m.group(1)),
+            'code': code,
+            'raw': m.group(0),
+        })
+        last = end
+    if last < len(text):
+        tail = text[last:]
+        if tail.strip():
+            segments.append({'kind': 'text', 'text': tail})
+    return segments
 
 
 class AIOrchestrator:
@@ -52,7 +122,7 @@ class AIOrchestrator:
         self.model = model
         self.vision_model = vision_model
         self.tools = AIToolbox(bot, repo)
-        self.model_manager = ModelManager('data/models_config.json')
+        self.model_manager = ModelManager(self.config.models_config_path)
         self.update_service = UpdateService(
             github_token=self._get_github_api_token(),
             repo_owner=self.config.update_repo_owner,
@@ -83,13 +153,36 @@ class AIOrchestrator:
         self._resolving_display_names = set()
         self._pending_self_interrupts = {}
         self._message_epoch = 0
+        self._stale_message_max_age: float = 120.0  # 超过此秒数的旧消息不再触发回复
         self._group_reply_windows: dict[str, dict] = {}
+        # 本次触发消息里的图片引用，按 scope_key 暂存，供 view_image 工具按需解析。
+        # 每个 scope 同一时刻只有一个 turn 在跑（scope 锁保证），故直接覆盖即可。
+        self._turn_image_refs: dict[str, list[str]] = {}
+        # 收藏表情缓存：list_stickers 拉取后按序缓存 URL，供 send_sticker/annotate_sticker 按序号定位。
+        self._sticker_cache: list[str] = []
+        self._sticker_cache_at: float = 0.0
+        self._sticker_cache_ttl = 300.0  # 5分钟内多个会话共用同一份缓存，避免重复请求 NapCat
         self._recurring_tasks: dict[str, dict] = {}
         self._recurring_tasks_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             'data', 'recurring_tasks.json',
         )
         self._load_recurring_tasks()
+        # ── 定期情报轮状态机 ──────────────────────────────────────────
+        # 主AI 每 4 小时主动发起一轮情报收集。每个进行中的情报轮在此登记：
+        #   round_id -> {
+        #       'status': 'collecting' | 'finalizing' | 'done',
+        #       'started_at': float, 'deadline': float,
+        #       'waiting': set(scope_key),   # 尚未回报的会话
+        #       'received': {scope_key: report_text},  # 已回报的会话
+        #       'scopes': [(scope_type, scope_id), ...],  # 本轮全部目标会话
+        #   }
+        self._intelligence_rounds: dict[str, dict] = {}
+        # 情报轮参数：活跃判定窗口、回报超时、cron 触发表
+        self._intel_active_window = 4 * 3600      # 最近 4 小时有活动视为活跃
+        self._intel_report_timeout = 5 * 60       # 单轮回报 5 分钟超时兜底
+        self._intel_schedule = '0 */4 * * *'      # 每 4 小时整点触发
+        self._intel_next_run: float = 0.0
         # 初始化模型配置（用新的 ModelManager 替换旧的 profile 系统）
         current_model = self.model_manager.get_current_model()
         if current_model:
@@ -138,6 +231,7 @@ class AIOrchestrator:
         self.loop.create_task(self._restore_scheduled_tasks())
         self.loop.create_task(self._recurring_scheduler_loop())
         self.loop.create_task(self._auto_update_check_loop())
+        self.loop.create_task(self._intelligence_scheduler_loop())
         self.ready.set()
         self.loop.run_forever()
 
@@ -324,7 +418,21 @@ class AIOrchestrator:
 
     def get_runtime_status(self) -> dict:
         current = self.model_manager.get_current_model()
-        available = self.model_manager.available_models
+        mm_config = self.model_manager.config or {}
+        channels = mm_config.get('channels') or []
+        main_channel = str((mm_config.get('roles') or {}).get('main') or '').strip()
+        available = [
+            {
+                'index': idx,
+                'display_name': str(ch.get('name') or ''),
+                'model_id': ', '.join(
+                    f'{m.get("upstream")}/{m.get("model_id")}' for m in (ch.get('models') or [])
+                ),
+                'base_url': str(ch.get('strategy') or 'fallback'),
+                'active': str(ch.get('name') or '').strip() == main_channel,
+            }
+            for idx, ch in enumerate(channels)
+        ]
         return {
             'enabled': self.config.enabled,
             'ready': bool(self.loop and self.queue),
@@ -334,16 +442,7 @@ class AIOrchestrator:
             'queue_size': self.queue.qsize() if self.queue else 0,
             'worker_count': max(1, self.config.worker_count),
             'scheduled_alarm_count': len(self._scheduled_alarm_ids),
-            'available_models': [
-                {
-                    'index': idx,
-                    'display_name': m['display_name'],
-                    'model_id': m['model_id'],
-                    'base_url': m['base_url'],
-                    'active': idx == self.model_manager.current_model_index,
-                }
-                for idx, m in enumerate(available)
-            ],
+            'available_models': available,
         }
 
     def switch_model_profile(self, requested: str) -> tuple[bool, str]:
@@ -379,24 +478,28 @@ class AIOrchestrator:
         return f'{value[:4]}{"*" * (len(value) - 8)}{value[-4:]}'
 
     def get_model_profiles_info(self) -> list[dict]:
-        """兼容旧 API，从 ModelManager 构造返回值"""
+        """从 ModelManager 新结构构造返回值"""
         result = []
-        channels = self.model_manager.config.get('channels', [])
+        channels = self.model_manager.config.get('channels') or []
+        upstreams_map = {u['name']: u for u in (self.model_manager.config.get('upstreams') or [])}
         current = self.model_manager.get_current_model()
         current_display = current['display_name'] if current else ''
 
         for ch in channels:
-            for m in ch.get('models', []):
-                display = f"{ch['name']}/{m['name']}"
+            for m in (ch.get('models') or []):
+                upstream_name = str(m.get('upstream') or '')
+                model_id = str(m.get('model_id') or '')
+                upstream = upstreams_map.get(upstream_name) or {}
+                display = f'{upstream_name}/{model_id}'
                 result.append({
                     'name': display,
-                    'label': m['name'],
+                    'label': model_id,
                     'active': display == current_display,
-                    'base_url': ch['base_url'],
-                    'model_name': m['model_id'],
-                    'messages_path': '/v1/messages',
-                    'api_key_set': bool(ch.get('api_key')),
-                    'api_key_masked': self._mask_secret(ch.get('api_key', '')),
+                    'base_url': str(upstream.get('base_url') or ''),
+                    'model_name': model_id,
+                    'messages_path': str(upstream.get('messages_path') or '') or '/v1/messages',
+                    'api_key_set': bool(upstream.get('api_key')),
+                    'api_key_masked': self._mask_secret(upstream.get('api_key', '')),
                     'overridden_fields': [],
                 })
         return result
@@ -414,7 +517,11 @@ class AIOrchestrator:
             {'command': '#clear', 'aliases': ['#clear-chat', '#清空聊天记录'], 'scope': 'all', 'description': '只清空当前会话聊天记录'},
             {'command': '#clear-notes', 'aliases': ['#清空备注'], 'scope': 'all', 'description': '只清空当前会话 AI 工具备忘'},
             {'command': '#clear-memory', 'aliases': ['#clear-all', '#清空记忆'], 'scope': 'all', 'description': '清空当前会话聊天记录、AI 工具备忘和工具记录'},
-            {'command': '/model', 'aliases': ['/model list', '/model switch 0', '/model channel list'], 'scope': 'admin', 'description': '管理员查看/切换模型，并直接管理模型渠道配置'},
+            {'command': '/model', 'aliases': ['/model list', '/model reload'], 'scope': 'admin', 'description': '管理员查看/重载模型配置'},
+            {'command': '/upstream', 'aliases': ['/upstream list', '/upstream add', '/upstream remove'], 'scope': 'admin', 'description': '管理 API 上游（base_url/api_key）'},
+            {'command': '/channel', 'aliases': ['/channel list', '/channel add', '/channel remove'], 'scope': 'admin', 'description': '管理渠道（模型池 + 轮询策略）'},
+            {'command': '/role', 'aliases': ['/role list', '/role set main <渠道名>'], 'scope': 'admin', 'description': '为 AI 角色绑定渠道'},
+            {'command': '/test', 'aliases': ['/test all', '/test alls'], 'scope': 'admin', 'description': '测试渠道/模型可用性，无参数列出列表'},
             {'command': '/stop', 'aliases': [], 'scope': 'admin', 'description': '管理员立即结束整个 Python 进程'},
             {'command': '/restart', 'aliases': [], 'scope': 'admin', 'description': '管理员原地重启 bot 自身 Python 进程'},
             {'command': '/on', 'aliases': [], 'scope': 'admin', 'description': '管理员开启 AI 响应'},
@@ -444,7 +551,7 @@ class AIOrchestrator:
         return True, task.task_id
 
     def _submit_message(self, message: ChatMessage):
-        if message.user_id == self.bot.self_id:
+        if str(message.user_id) == str(self.bot.self_id):
             return
         if not self.loop or not self.queue:
             self.start()
@@ -487,6 +594,16 @@ class AIOrchestrator:
     def _scope_key(self, scope_type: str, scope_id: str) -> str:
         return f'{scope_type}:{scope_id}'
 
+    async def _get_stickers(self, force: bool = False) -> list[str]:
+        """账号级共享的收藏表情缓存，避免不同会话短时间内重复拉取同一份列表。"""
+        now = time.time()
+        if not force and self._sticker_cache and (now - self._sticker_cache_at) < self._sticker_cache_ttl:
+            return self._sticker_cache
+        stickers = list(await asyncio.to_thread(self.bot.fetch_custom_face))
+        self._sticker_cache = stickers
+        self._sticker_cache_at = now
+        return self._sticker_cache
+
     def _build_trigger_message_entry(self, message: ChatMessage, cleaned: str) -> dict:
         return {
             'user_id': message.user_id,
@@ -512,6 +629,7 @@ class AIOrchestrator:
             info(f'[AI][reserve] scope busy, deferring: {scope_key}')
             if scope_key not in self._pending_scope_turns:
                 self._pending_scope_turns[scope_key] = []
+            _pending_len = len(self._pending_scope_turns[scope_key])
             self._pending_scope_turns[scope_key].append({
                 'kind': 'message',
                 'message': item['message'],
@@ -521,6 +639,7 @@ class AIOrchestrator:
                 'deferred_count': 1,
                 'trigger_messages': list(item.get('trigger_messages') or []),
             })
+            get_bot_logger().info(CAT_CHAT, scope_key, f'消息排队合并: 会话正忙, 当前排队数={_pending_len + 1}')
             return False
         self._active_scope_turns.add(scope_key)
         return True
@@ -530,11 +649,19 @@ class AIOrchestrator:
         if not scope_key:
             return None
         pending = None
-        pending_list = self._pending_scope_turns.get(scope_key)
-        if pending_list:
+        while True:
+            pending_list = self._pending_scope_turns.get(scope_key)
+            if not pending_list:
+                break
             pending = pending_list.pop(0)
             if not pending_list:
                 del self._pending_scope_turns[scope_key]
+            # 跳过已过期的延迟消息，避免突然回复旧内容
+            if self._is_message_stale(pending.get('message')):
+                info(f'[AI][release] dropping stale pending message scope={scope_key}')
+                pending = None
+                continue
+            break
         if pending:
             history_seed = item.get('followup_history_seed')
             if history_seed:
@@ -549,13 +676,18 @@ class AIOrchestrator:
         scope_key = str(item.get('scope_key') or '')
         if not scope_key:
             return None
-        pending_list = self._pending_scope_turns.get(scope_key)
-        if pending_list:
+        while True:
+            pending_list = self._pending_scope_turns.get(scope_key)
+            if not pending_list:
+                return None
             pending = pending_list.pop(0)
             if not pending_list:
                 del self._pending_scope_turns[scope_key]
+            # 跳过已过期的延迟消息
+            if self._is_message_stale(pending.get('message')):
+                info(f'[AI][take_pending] dropping stale pending message scope={scope_key}')
+                continue
             return pending
-        return None
 
     def _scope_key_for_task(self, task: dict) -> str | None:
         """返回 task turn 会向其生成/发送消息的目标 scope_key；非发送类 task 返回 None。"""
@@ -635,35 +767,16 @@ class AIOrchestrator:
             return False
         return int(epoch) != int(self._message_epoch)
 
+    def _is_message_stale(self, message) -> bool:
+        """检查消息时间戳是否超过最大允许时效。"""
+        ts = getattr(message, 'timestamp', None)
+        if ts is None:
+            return False
+        return (time.time() - float(ts)) > self._stale_message_max_age
+
     async def _run_message_turn(self, item: dict):
-        _MAX_RETRIES = 2
-        _RETRY_DELAY = 3
         try:
-            for _attempt in range(_MAX_RETRIES + 1):
-                try:
-                    await self._process_message(item)
-                    return
-                except Exception as exc:
-                    _exc_name = type(exc).__name__
-                    _exc_qualname = type(exc).__qualname__
-                    _is_httpx_timeout = (
-                        _httpx_mod is not None and isinstance(exc, _httpx_mod.TimeoutException)
-                    ) or _exc_name == 'TimeoutException'
-                    _is_api_status = (
-                        _anthropic is not None and isinstance(exc, _anthropic.APIStatusError)
-                    ) or _exc_name == 'APIStatusError'
-                    _retryable = _is_httpx_timeout or (
-                        _is_api_status and (
-                            getattr(exc, 'status_code', 0) == 429
-                            or getattr(exc, 'status_code', 0) >= 500
-                        )
-                    )
-                    if not (_is_httpx_timeout or _is_api_status):
-                        raise
-                    if _retryable and _attempt < _MAX_RETRIES:
-                        await asyncio.sleep(_RETRY_DELAY)
-                    else:
-                        raise
+            await self._process_message(item)
         finally:
             followup = self._release_scope_turn(item)
             if followup:
@@ -838,6 +951,162 @@ class AIOrchestrator:
     def _is_admin_message(self, message: ChatMessage) -> bool:
         return int(message.user_id or 0) == int(self.config.admin_qq)
 
+    # ─── 上游命令 /upstream ───
+
+    async def _handle_upstream_command(self, message: ChatMessage, cleaned: str):
+        import shlex
+        try:
+            parts = shlex.split(cleaned)
+        except ValueError as exc:
+            self.bot.send_text(message.chat_type, message.chat_id, f'指令解析失败: {exc}')
+            return
+
+        sub = str(parts[1] if len(parts) > 1 else '').strip().lower()
+
+        if not sub or sub in {'list', 'ls'}:
+            self.bot.send_text(message.chat_type, message.chat_id, self.model_manager.list_upstreams_text())
+            return
+
+        if sub == 'add':
+            kv, _ = self._parse_model_kv_args(parts[2:])
+            ok, msg = self.model_manager.add_upstream(
+                name=kv.get('name', ''), base_url=kv.get('base_url', ''),
+                api_key=kv.get('api_key', ''), messages_path=kv.get('messages_path', ''),
+            )
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        if sub in {'update', 'edit'}:
+            if len(parts) < 3:
+                self.bot.send_text(message.chat_type, message.chat_id, '缺少目标，例: /upstream update deepseek api_key=sk-new')
+                return
+            kv, _ = self._parse_model_kv_args(parts[3:])
+            ok, msg = self.model_manager.update_upstream(parts[2], **kv)
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        if sub in {'remove', 'rm', 'del'}:
+            if len(parts) < 3:
+                self.bot.send_text(message.chat_type, message.chat_id, '缺少目标，例: /upstream remove deepseek')
+                return
+            ok, msg = self.model_manager.remove_upstream(parts[2])
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        help_text = (
+            '上游管理指令:\n'
+            '/upstream list\n'
+            '/upstream add name=<名称> base_url=<地址> api_key=<密钥> [messages_path=]\n'
+            '/upstream update <名称> key=value ...\n'
+            '/upstream remove <名称>'
+        )
+        self.bot.send_text(message.chat_type, message.chat_id, help_text)
+
+    # ─── 渠道命令 /channel ───
+
+    async def _handle_channel_command(self, message: ChatMessage, cleaned: str):
+        import shlex
+        try:
+            parts = shlex.split(cleaned)
+        except ValueError as exc:
+            self.bot.send_text(message.chat_type, message.chat_id, f'指令解析失败: {exc}')
+            return
+
+        sub = str(parts[1] if len(parts) > 1 else '').strip().lower()
+
+        if not sub or sub in {'list', 'ls'}:
+            self.bot.send_text(message.chat_type, message.chat_id, self.model_manager.list_channels_text())
+            return
+
+        if sub == 'add':
+            kv, _ = self._parse_model_kv_args(parts[2:])
+            ok, msg = self.model_manager.add_channel(
+                name=kv.get('name', ''), strategy=kv.get('strategy', 'fallback'),
+                models=kv.get('models', ''),
+            )
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        if sub in {'update', 'edit'}:
+            if len(parts) < 3:
+                self.bot.send_text(message.chat_type, message.chat_id, '缺少目标，例: /channel update 主力渠道 strategy=random')
+                return
+            kv, _ = self._parse_model_kv_args(parts[3:])
+            ok, msg = self.model_manager.update_channel(parts[2], **kv)
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        if sub in {'remove', 'rm', 'del'}:
+            if len(parts) < 3:
+                self.bot.send_text(message.chat_type, message.chat_id, '缺少目标，例: /channel remove 主力渠道')
+                return
+            ok, msg = self.model_manager.remove_channel(parts[2])
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        if sub in {'addmodel', 'addm'}:
+            if len(parts) < 5:
+                self.bot.send_text(message.chat_type, message.chat_id, '用法: /channel addmodel <渠道> <上游> <模型ID>')
+                return
+            ok, msg = self.model_manager.add_model_to_channel(parts[2], parts[3], parts[4])
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        help_text = (
+            '渠道管理指令:\n'
+            '/channel list\n'
+            '/channel add name=<名称> [strategy=fallback|random|roundrobin] [models=上游:模型ID,...]\n'
+            '/channel update <名称> key=value ...\n'
+            '/channel remove <名称>\n'
+            '/channel addmodel <渠道名> <上游名> <模型ID>'
+        )
+        self.bot.send_text(message.chat_type, message.chat_id, help_text)
+
+    # ─── 角色命令 /role ───
+
+    async def _handle_role_command(self, message: ChatMessage, cleaned: str):
+        import shlex
+        try:
+            parts = shlex.split(cleaned)
+        except ValueError as exc:
+            self.bot.send_text(message.chat_type, message.chat_id, f'指令解析失败: {exc}')
+            return
+
+        sub = str(parts[1] if len(parts) > 1 else '').strip().lower()
+
+        if not sub or sub in {'list', 'ls'}:
+            self.bot.send_text(message.chat_type, message.chat_id, self.model_manager.list_roles_text())
+            return
+
+        if sub == 'set':
+            if len(parts) < 4:
+                self.bot.send_text(message.chat_type, message.chat_id, '用法: /role set <角色> <渠道名>\n角色可用: main tiered agent dev_agent vision')
+                return
+            ok, msg = self.model_manager.set_role(parts[2], parts[3])
+            if ok:
+                self.reload_models_config()
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
+
+        help_text = (
+            '角色管理指令:\n'
+            '/role list\n'
+            '/role set <角色> <渠道名>\n'
+            '角色: main / tiered / agent / dev_agent / vision'
+        )
+        self.bot.send_text(message.chat_type, message.chat_id, help_text)
+
+    # ─── 测试命令 /test ───
+
+    async def _handle_test_command(self, message: ChatMessage, cleaned: str):
+        if not self._is_admin_message(message):
+            self.bot.send_text(message.chat_type, message.chat_id, '这个指令你先别动。')
+            return
+
+        await handle_test_command(message, cleaned, self.model_manager, self.bot)
+
+
+
     def _is_master_message(self, message: ChatMessage) -> bool:
         """检查消息是否来自主人"""
         master_qq = int(getattr(self.config, 'master_qq', 0))
@@ -882,7 +1151,14 @@ class AIOrchestrator:
                 sys.stderr.flush()
             except Exception:
                 pass
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            # 使用绝对路径的 main.py，避免相对路径因工作目录变化而失败
+            _repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            _main_script = os.path.join(_repo_dir, 'main.py')
+            try:
+                os.execv(sys.executable, [sys.executable, _main_script])
+            except Exception as _e:
+                error(f'[AI] /restart execv failed: {_e}')
+                self.bot.send_text(message.chat_type, message.chat_id, f'重启失败: {_e}')
             return
 
         if command == '/on':
@@ -916,10 +1192,22 @@ class AIOrchestrator:
         tools: list[dict] | None = None,
         temperature: float = 0.7,
     ) -> AnthropicReply | None:
-        for attempt in range(1):
+        _MAX_FALLBACK_ATTEMPTS = 3
+        _tool_count = len(tools) if tools else 0
+        _msg_count = len(messages) if messages else 0
+        for attempt in range(_MAX_FALLBACK_ATTEMPTS):
             current = self.model_manager.get_current_model()
+            _model_name = current['display_name'] if current else 'unknown'
+            _api_url = f'{self.model.base_url}{self.model.messages_path}'
+            info(
+                f'[AI][api] request model={_model_name} '
+                f'url={_api_url} '
+                f'messages={_msg_count} tools={_tool_count} '
+                f'temp={temperature} attempt={attempt + 1}/{_MAX_FALLBACK_ATTEMPTS}'
+            )
+            _api_start = time.perf_counter()
             try:
-                return await asyncio.to_thread(
+                _reply = await asyncio.to_thread(
                     self.model.complete,
                     system_blocks,
                     messages,
@@ -927,18 +1215,76 @@ class AIOrchestrator:
                     self.model.model_name,
                     temperature,
                 )
+                _api_ms = int((time.perf_counter() - _api_start) * 1000)
+                _text_len = len(_reply.text) if _reply and _reply.text else 0
+                _tool_calls = len(_reply.tool_calls) if _reply and _reply.tool_calls else 0
+                info(
+                    f'[AI][api] response model={_model_name} '
+                    f'ms={_api_ms} '
+                    f'text_len={_text_len} tool_calls={_tool_calls} '
+                    f'stop={_reply.stop_reason if _reply else "none"}'
+                )
+                get_bot_logger().info(CAT_API, '', f'API 调用成功 model={_model_name} ms={_api_ms}ms text_len={_text_len} tool_calls={_tool_calls} stop={_reply.stop_reason if _reply else "none"}')
+                return _reply
             except Exception as exc:
+                _api_ms = int((time.perf_counter() - _api_start) * 1000)
+                _exc_name = type(exc).__name__
+                # 判定是否为可 fallback 的上游异常：httpx 超时 / requests 超时 / anthropic 5xx
+                _is_httpx_timeout = (
+                    _httpx_mod is not None and isinstance(exc, _httpx_mod.TimeoutException)
+                ) or _exc_name == 'TimeoutException'
+                _is_requests_timeout = (
+                    _requests_mod is not None and isinstance(exc, _requests_mod.exceptions.Timeout)
+                ) or _exc_name == 'Timeout'
+                _is_api_5xx = False
+                if (
+                    _anthropic is not None and isinstance(exc, _anthropic.APIStatusError)
+                ) or _exc_name == 'APIStatusError':
+                    _status = getattr(exc, 'status_code', 0) or 0
+                    if 500 <= _status < 600:
+                        _is_api_5xx = True
+                # RuntimeError 里也可能包装了上游 5xx（如 502 Bad Gateway），按消息内容判定
+                _is_runtime_5xx = (
+                    _exc_name == 'RuntimeError'
+                    and 'status=5' in str(exc)
+                )
+                _is_fallbackable = _is_httpx_timeout or _is_requests_timeout or _is_api_5xx or _is_runtime_5xx
+
                 error(
                     '[AI][model] request failed '
                     f"model={current['display_name'] if current else 'unknown'} "
                     f"base_url={self.model.base_url} "
+                    f'fallbackable={_is_fallbackable} '
+                    f'attempt={attempt + 1}/{_MAX_FALLBACK_ATTEMPTS} '
                     f'error={exc}'
                 )
-                raise
+                get_bot_logger().error(CAT_API, '', f'API 调用异常 model={_model_name} ms={_api_ms}ms fallbackable={_is_fallbackable} attempt={attempt+1}/{_MAX_FALLBACK_ATTEMPTS} error={_exc_name}: {exc}')
 
+                if not _is_fallbackable or attempt >= _MAX_FALLBACK_ATTEMPTS - 1:
+                    raise
+
+                # 通知 ModelManager 推进 fallback 索引，再用新配置重建 self.model
+                self.model_manager.notify_failure('main')
+                next_model = self.model_manager.get_current_model()
+                if next_model:
+                    info(
+                        f'[AI][model] fallback switching to {next_model["display_name"]}'
+                    )
+                    self._update_model_from_config(next_model)
+                else:
+                    warn('[AI][model] fallback: no next model available')
+        return None
     async def _enqueue_message(self, message: ChatMessage):
         scope_type = message.chat_type
         scope_id = str(message.chat_id)
+        info(
+            f'[AI][recv] scope={scope_type}:{scope_id} '
+            f'user={message.nickname}({message.user_id}) '
+            f'mid={message.message_id} '
+            f'text_len={len(message.text or "")} '
+            f'source={self._message_source_label(message)} '
+            f'mentions_self={message.mentions_self}'
+        )
         agent = await asyncio.to_thread(self.repo.get_or_create_agent, scope_type, scope_id)
         cleaned = self._clean_text(message)
         source_kind = self._message_source_kind(message)
@@ -960,6 +1306,22 @@ class AIOrchestrator:
 
         if cleaned.startswith('/model'):
             await self._handle_model_command(message, cleaned)
+            return
+
+        if cleaned.startswith('/upstream'):
+            await self._handle_upstream_command(message, cleaned)
+            return
+
+        if cleaned.startswith('/channel'):
+            await self._handle_channel_command(message, cleaned)
+            return
+
+        if cleaned.startswith('/role'):
+            await self._handle_role_command(message, cleaned)
+            return
+
+        if cleaned.startswith('/test'):
+            await self._handle_test_command(message, cleaned)
             return
 
         if cleaned in {'#help', '#指令', '#菜单', '#命令'}:
@@ -1017,7 +1379,7 @@ class AIOrchestrator:
         if not self.config.enabled:
             return
 
-        await asyncio.to_thread(
+        _has_pending = await asyncio.to_thread(
             self.repo.append_message,
             scope_type,
             scope_id,
@@ -1032,7 +1394,10 @@ class AIOrchestrator:
                 'source_label': source_label,
             },
             self.config.history_limit,
+            self.config.diary_size,
         )
+        if _has_pending:
+            await self._maybe_schedule_diary_summarization(scope_type, scope_id)
         await asyncio.to_thread(
             self.repo.touch_user_identity, message.user_id, message.nickname, scope_type, scope_id
         )
@@ -1053,67 +1418,17 @@ class AIOrchestrator:
                 self._send_chat_reply(message, f"任务 {task_id}: {task.get('status')}\n{result}")
             return
 
-        # Intent detectors bypass the AI entirely — only safe for group chats where
-        # the AI might not trigger anyway. For private chats the AI always responds,
-        # so we let the child AI handle alarms / notify_master / create_task through
-        # its own tools, avoiding silent drops that make private chat feel probabilistic.
-        if message.chat_type != 'private':
-            alarm_request = self._detect_alarm_request(message, cleaned)
-            if alarm_request:
-                task = self.tools.create_task(agent.agent_id, 'set_alarm', alarm_request)
-                await self.queue.put({'kind': 'task', 'task_id': task.task_id, 'message_epoch': self._message_epoch})
-                self.repo.add_note(
-                    scope_type,
-                    scope_id,
-                    f"闹钟任务已创建: {task.task_id} -> {alarm_request.get('note', '')}",
-                )
-                self._send_chat_reply(
-                    message,
-                    f"{self._at_if_needed(message)} 闹钟记下啦，{self._humanize_due_at(alarm_request.get('due_at'))}提醒你：{alarm_request.get('note', '到点了')}",
-                )
-                return
-            master_request = self._detect_master_request(message, cleaned)
-            if master_request:
-                task = self.tools.create_task(agent.agent_id, 'notify_master', master_request)
-                await self.queue.put({'kind': 'task', 'task_id': task.task_id, 'message_epoch': self._message_epoch})
-                self.repo.add_note(
-                    scope_type,
-                    scope_id,
-                    f"跨会话协作已创建: {task.task_id} -> {master_request.get('instruction') or master_request.get('content')}",
-                )
-                return
+        # 意图检测器已移除：闹钟/联系/全局设定/状态查询等一律交给 AI 自主判断，
+        # 通过它自己的工具（create_task、notify_master 等）执行，符合"AI 完全自主运行"的初衷。
 
-            target_only = self._detect_contact_target_only(message, cleaned)
-            if target_only:
-                self.repo.add_note(
-                    scope_type,
-                    scope_id,
-                    f"最近一次联系目标QQ: {target_only}",
-                )
-                self.bot.send_text(
-                    message.chat_type,
-                    message.chat_id,
-                    '好，我知道是这个号了，你要我怎么喊他？',
-                )
-                await self._record_outbound_message(message.chat_type, str(message.chat_id), '好，我知道是这个号了，你要我怎么喊他？')
-                return
-
-            preference_request = self._detect_global_preference_request(message, cleaned)
-            if preference_request:
-                task = self.tools.create_task(agent.agent_id, 'notify_master', preference_request)
-                await self.queue.put({'kind': 'task', 'task_id': task.task_id, 'message_epoch': self._message_epoch})
-                self.repo.add_note(
-                    scope_type,
-                    scope_id,
-                    f"全局人物设定已提交: {preference_request.get('target_query')} -> {preference_request.get('preference_text')}",
-                )
-                return
-
-            status_request = self._detect_status_request(message, cleaned)
-            if status_request:
-                task = self.tools.create_task(agent.agent_id, 'notify_master', status_request)
-                await self.queue.put({'kind': 'task', 'task_id': task.task_id, 'message_epoch': self._message_epoch})
-                return
+        # 过滤已过期的旧消息：如果消息时间戳距离当前太久，直接丢弃不触发回复
+        if self._is_message_stale(message):
+            info(
+                f'[AI][recv] stale message dropped '
+                f'age={time.time() - float(message.timestamp):.0f}s '
+                f'scope={scope_type}:{scope_id}'
+            )
+            return
 
         if not self._should_trigger(message, cleaned, agent):
             # 即使不触发 AI，也要更新 debounce 窗口计时
@@ -1155,7 +1470,7 @@ class AIOrchestrator:
             'timestamp': message.timestamp,
             'source_label': '本人-其他设备',
         }
-        self.repo.append_message(scope_type, scope_id, entry, self.config.history_limit)
+        self.repo.append_message(scope_type, scope_id, entry, self.config.history_limit, self.config.diary_size)
         scope_key = self._scope_key(scope_type, scope_id)
         if scope_key in self._active_scope_turns:
             self._pending_self_interrupts.setdefault(scope_key, []).append(entry)
@@ -1169,7 +1484,12 @@ class AIOrchestrator:
             try:
                 kind = item['kind']
                 if int(item.get('message_epoch', self._message_epoch)) != int(self._message_epoch):
+                    debug(f'[AI][worker] stale epoch, skipping kind={kind}')
                     continue
+                debug(
+                    f'[AI][worker] dequeue kind={kind} '
+                    f'queue_size={self.queue.qsize()}'
+                )
                 if kind == 'message':
                     await self._run_message_turn(item)
                 elif kind == 'task':
@@ -1414,16 +1734,21 @@ class AIOrchestrator:
         if message.chat_type == 'private':
             if self._should_ignore_message(message):
                 return False
+            get_bot_logger().info(CAT_CHAT, f'{message.chat_type}:{message.chat_id}', f'AI 触发: private 私聊, user={message.nickname}({message.user_id})')
             return True
         if message.mentions_self:
             info(f'[AI][trigger] mentions_self=True scope={message.chat_type}:{message.chat_id} user={message.user_id}')
+            get_bot_logger().info(CAT_CHAT, f'{message.chat_type}:{message.chat_id}', f'AI 触发: @提及, user={message.nickname}({message.user_id})')
             return True
         lowered = cleaned.lower()
         if any(word.lower() in lowered for word in agent.trigger_words):
+            get_bot_logger().info(CAT_CHAT, f'{message.chat_type}:{message.chat_id}', f'AI 触发: 触发词, user={message.nickname}({message.user_id}) word={next(w for w in agent.trigger_words if w.lower() in lowered)}')
             return True
         result = random.random() < agent.trigger_rate
         if not result and message.chat_type == 'group':
             debug(f'[AI][trigger] skipped by trigger_rate={agent.trigger_rate} scope={message.chat_type}:{message.chat_id}')
+        elif result:
+            get_bot_logger().info(CAT_CHAT, f'{message.chat_type}:{message.chat_id}', f'AI 触发: 随机概率 rate={agent.trigger_rate:.2f}, user={message.nickname}({message.user_id})')
         return result
 
     async def _process_message(self, item: dict):
@@ -1435,10 +1760,24 @@ class AIOrchestrator:
         scope_type = message.chat_type
         scope_id = str(message.chat_id)
         source_label = self._message_source_label(message)
+        _proc_start = time.perf_counter()
+        _deferred = int(item.get('deferred_count') or 0)
+        _trig_count = len(item.get('trigger_messages') or [])
+        info(
+            f'[AI][process] start scope={scope_type}:{scope_id} '
+            f'user={message.nickname}({message.user_id}) '
+            f'mid={message.message_id} '
+            f'text_len={len(cleaned)} '
+            f'deferred={_deferred} '
+            f'trigger_msgs={_trig_count}'
+        )
+        get_bot_logger().info(CAT_CHAT, f'{scope_type}:{scope_id}', f'AI 对话开始: 触发消息数={_trig_count}, 排队合并数={_deferred}, user={message.nickname}({message.user_id})')
         agent = await asyncio.to_thread(self.repo.get_or_create_agent, scope_type, scope_id)
         self._maybe_resolve_display_name(scope_type, scope_id, agent)
         trigger_messages = list(item.get('trigger_messages') or [self._build_trigger_message_entry(message, cleaned)])
-        history = self.repo.list_messages(scope_type, scope_id)
+        _diary_ctx = await asyncio.to_thread(self.repo.get_diary_context, scope_type, scope_id)
+        _diary_summaries = _diary_ctx['summaries']
+        history = self._flatten_diary_context(_diary_ctx)
         history_seed = item.get('history_seed')
         if history_seed:
             history_before_trigger = [dict(entry) for entry in history_seed]
@@ -1458,33 +1797,24 @@ class AIOrchestrator:
                     continue
                 seen_image_refs.add(ref)
                 image_refs.append(ref)
-        image_context = None
         global_identity_context = self._build_global_identity_context_for_message(message, combined_trigger_text or cleaned)
+        # 图片不再自动解析：把本次触发的图片引用按 scope 暂存，交给 AI 用 view_image 工具按需查看。
+        scope_key = self._scope_key(scope_type, scope_id)
         if image_refs:
+            self._turn_image_refs[scope_key] = list(image_refs)
             info(
                 '[AI][image] detected '
                 f'count={len(image_refs)} scope={scope_type}:{scope_id} '
                 f'source={self._message_source_label(message)} '
                 f'refs={self._summarize_image_refs(image_refs)}'
             )
-        if image_refs:
-            try:
-                info(f'[AI][image] describing scope={scope_type}:{scope_id}')
-                image_context = await asyncio.to_thread(
-                    self.vision_model.describe_images,
-                    image_refs,
-                    '请详细描述图片，尤其关注人物、文字、场景、动作、情绪和梗。',
-                )
-                if image_context:
-                    info(
-                        '[AI][image] describe success '
-                        f'scope={scope_type}:{scope_id} chars={len(image_context)}'
-                    )
-                else:
-                    warn(f'[AI][image] describe empty scope={scope_type}:{scope_id}')
-            except Exception as exc:
-                error(f'[AI][image] describe failed scope={scope_type}:{scope_id} error={exc}')
-                image_context = f'图片解析失败: {exc}'
+        else:
+            self._turn_image_refs.pop(scope_key, None)
+        # image_context 现在只是"有几张图可看"的提示，具体内容由 view_image 拉取。
+        image_context = f'本次消息包含 {len(image_refs)} 张图片' if image_refs else None
+
+        # 群上下文：群人数、群主、管理员、成员列表
+        group_context = await self._build_group_context(scope_type, scope_id)
 
         generation_ms = None
         while True:
@@ -1497,8 +1827,10 @@ class AIOrchestrator:
                 trigger_messages,
                 image_context,
                 global_identity_context,
+                group_context,
                 int(item.get('deferred_count') or 0),
                 agent.display_name,
+                _diary_summaries,
             )
             reply_bundle, generation_ms, used_tools = await self._complete_child_turn(
                 scope_type,
@@ -1532,7 +1864,7 @@ class AIOrchestrator:
                 1,
                 int(pending.get('deferred_count') or 0),
             )
-            history = self.repo.list_messages(scope_type, scope_id)
+            history = self._flatten_diary_context(await asyncio.to_thread(self.repo.get_diary_context, scope_type, scope_id))
             history_before_trigger = history[:-len(trigger_messages)] if trigger_messages and len(history) >= len(trigger_messages) else history
             tool_logs = self.tools.list_tool_uses(scope_type, scope_id)
             combined_trigger_text = '\n'.join(
@@ -1564,6 +1896,15 @@ class AIOrchestrator:
             think_note=think_note,
             tool_context_messages=(reply_bundle or {}).get('tool_context_messages'),
         )
+        _proc_ms = int((time.perf_counter() - _proc_start) * 1000)
+        info(
+            f'[AI][process] done scope={scope_type}:{scope_id} '
+            f'ms={_proc_ms} '
+            f'reply_len={len(reply)} '
+            f'gen_ms={generation_ms} '
+            f'think_len={len(think_note)}'
+        )
+        get_bot_logger().info(CAT_CHAT, f'{scope_type}:{scope_id}', f'AI 对话完成: ms={_proc_ms}ms reply_len={len(reply)} gen_ms={generation_ms}')
         item['followup_history_seed'] = [
             *[dict(entry) for entry in history_before_trigger],
             *[dict(entry) for entry in trigger_messages],
@@ -1615,43 +1956,26 @@ class AIOrchestrator:
                     '',
                     self.CHILD_RULES_PROMPT,
                     '',
-                    '发言方式：【关键】要发消息给用户，必须调用 send_message 工具。'
+                    '发言方式：【关键】要发消息给用户，必须调用 send_message 工具，'
+                    '你直接输出的普通文字不会被发送。'
                     '如果需要思考分析，用 <thinking>...</thinking> 包裹写在 send_message 的 content 里，'
                     '这部分会自动过滤掉不会发给用户，用户只看到思考标签外的正常内容。'
-                    '如果觉得现在不该说话，就不要调用 send_message。',
+                    '如果觉得现在不该说话，调用 stay_silent 工具结束本回合——'
+                    '不要把想说的话写成普通文字或塞进思考区来“假装沉默”，'
+                    '真要说就 send_message，真不想说就 stay_silent，二者选其一。',
                 ]
             )
         return [
             {
                 'type': 'text',
                 'text': '\n'.join(parts),
-                'cache_control': {'type': 'ephemeral'},
             }
         ]
 
     @staticmethod
     def _stamp_cache_control_on_message(message: dict) -> None:
-        """Attach a prompt-cache breakpoint (cache_control: ephemeral) to a
-        message's content.  Anthropic requires the marker to sit on a content
-        block, so a plain string content is converted into a single text block.
-        If the content is already a block list, the marker is added to its last
-        block.  Empty/unknown shapes are left untouched."""
-        if not isinstance(message, dict):
-            return
-        content = message.get('content')
-        if isinstance(content, str):
-            message['content'] = [
-                {
-                    'type': 'text',
-                    'text': content,
-                    'cache_control': {'type': 'ephemeral'},
-                }
-            ]
-            return
-        if isinstance(content, list) and content:
-            last_block = content[-1]
-            if isinstance(last_block, dict):
-                last_block['cache_control'] = {'type': 'ephemeral'}
+        """No-op: cache_control removed for CCM compatibility."""
+        return
 
     def _build_child_messages(
         self,
@@ -1663,8 +1987,10 @@ class AIOrchestrator:
         trigger_messages: list[dict],
         image_context: str | None,
         global_identity_context: str,
+        group_context: str = '',
         deferred_count: int = 0,
         display_name: str = '',
+        diary_summaries: list[dict] | None = None,
     ) -> dict:
         system_blocks = self._static_system_blocks(self._system_prompt(), persona)
         system_blocks.append(
@@ -1677,8 +2003,10 @@ class AIOrchestrator:
                     tool_logs,
                     image_context,
                     global_identity_context,
+                    group_context,
                     deferred_count,
                     display_name,
+                    diary_summaries,
                 ),
             }
         )
@@ -1763,8 +2091,10 @@ class AIOrchestrator:
         tool_logs: list[dict],
         image_context: str | None,
         global_identity_context: str,
+        group_context: str = '',
         deferred_count: int = 0,
         display_name: str = '',
+        diary_summaries: list[dict] | None = None,
     ) -> str:
         tool_log_lines = self._format_tool_logs_for_prompt(tool_logs)
         recent_think_lines = self._collect_recent_think_notes(history)
@@ -1788,6 +2118,18 @@ class AIOrchestrator:
             '',
             '当前会话印象:',
             impression or '暂无，先谨慎观察这个会话的用途、常聊话题、关键人物和氛围。',
+        ]
+        if group_context:
+            parts += [
+                '',
+                '群信息:',
+                group_context,
+            ]
+        if diary_summaries:
+            parts += ['', '历史记忆摘要（从旧到新，每段约50条消息的浓缩）:']
+            for s in diary_summaries:
+                parts.append(f'【第{int(s.get("index", 0)) + 1}段】{str(s.get("text") or "")[:600]}')
+        parts += [
             '',
             '已知事实（关于号主本人，仅这些内容可以确认/复述，没写到的不要编）:',
             '\n'.join(knowledge_lines) if knowledge_lines else '暂无已录入的事实，涉及号主具体信息一律不要编造，含糊带过或反问。',
@@ -1814,7 +2156,12 @@ class AIOrchestrator:
             global_identity_context or '暂无',
         ])
         if image_context:
-            parts.extend(['', '这次触发相关图片解析:', image_context])
+            parts.extend([
+                '',
+                f'本次消息包含图片（{image_context}）：如果需要看懂图片内容才能好好回应，'
+                '调用 view_image 工具查看（index 从 1 开始，按消息里图片出现顺序）；'
+                '纯表情、跟你无关的图不用看。',
+            ])
         file_refs = self._extract_file_refs(message.raw_message or '')
         if file_refs:
             file_lines = []
@@ -1997,6 +2344,12 @@ class AIOrchestrator:
 
     async def _run_ai_tool_call(self, scope_type: str, scope_id: str, agent_id: str, name: str, tool_input: dict) -> str:
         tool_input = dict(tool_input or {})
+        _tool_start = time.perf_counter()
+        info(
+            f'[AI][tool] exec scope={scope_type}:{scope_id} '
+            f'agent={agent_id} tool={name} '
+            f'input_keys={list(tool_input.keys())}'
+        )
         if name == 'memory_list':
             notes = self.tools.recall(scope_type, scope_id)
             if not notes:
@@ -2048,8 +2401,8 @@ class AIOrchestrator:
             if scope_type != 'master':
                 result = 'error: 这个工具只能由主AI使用。'
             else:
-                info = await self.update_service.get_version_info()
-                result = json.dumps(info, ensure_ascii=False, indent=2)
+                version_info = await self.update_service.get_version_info()
+                result = json.dumps(version_info, ensure_ascii=False, indent=2)
         elif name == 'execute_update':
             if scope_type != 'master':
                 result = 'error: 这个工具只能由主AI使用。'
@@ -2095,22 +2448,6 @@ class AIOrchestrator:
                     f"payload: {task.get('payload') or '无'}",
                     f"result: {task.get('result') or '暂无结果'}",
                 ])
-        elif name == 'get_task':
-            task_id = str(tool_input.get('task_id') or '').strip()
-            task = self.repo.get_task(task_id)
-            if not task:
-                result = f'没有找到 task_id={task_id} 的后台任务。'
-            else:
-                result = '\n'.join([
-                    f"task_id: {task.get('task_id')}",
-                    f"kind: {task.get('kind')}",
-                    f"status: {task.get('status')}",
-                    f"source_agent: {task.get('source_agent')}",
-                    f"created_at: {self._format_ts_text(task.get('created_at', 0))}",
-                    f"updated_at: {self._format_ts_text(task.get('updated_at', 0))}",
-                    f"payload: {task.get('payload') or '无'}",
-                    f"result: {task.get('result') or '暂无结果'}",
-                ])
         elif name == 'download_file':
             file_id = str(tool_input.get('file_id') or '').strip()
             file_name = str(tool_input.get('file_name') or 'file').strip()
@@ -2118,12 +2455,12 @@ class AIOrchestrator:
                 result = 'error: file_id 为空，无法下载文件。'
             else:
                 try:
-                    info = self.bot.get_file(file_id)
+                    file_info = self.bot.get_file(file_id)
                 except Exception as e:
-                    info = None
+                    file_info = None
                     result = f'获取文件信息失败: {e}'
-                if info is not None:
-                    size = info.get('size') or 0
+                if file_info is not None:
+                    size = file_info.get('size') or 0
                     MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
                     if size > MAX_FILE_SIZE:
                         result = f'文件过大（{size // 1024 // 1024}MB），超过 20MB 限制，已跳过下载。'
@@ -2136,12 +2473,12 @@ class AIOrchestrator:
                         dest_dir.mkdir(parents=True, exist_ok=True)
                         safe_name = re.sub(r'[\\/:*?"<>|]', '_', file_name) or 'file'
                         dest_path = dest_dir / safe_name
-                        src_path = info.get('file') or ''
+                        src_path = file_info.get('file') or ''
                         try:
                             if src_path and pathlib.Path(src_path).exists():
                                 shutil.copy2(src_path, dest_path)
-                            elif info.get('url'):
-                                await asyncio.to_thread(_urllib_req.urlretrieve, info['url'], str(dest_path))
+                            elif file_info.get('url'):
+                                await asyncio.to_thread(_urllib_req.urlretrieve, file_info['url'], str(dest_path))
                             else:
                                 result = '无法获取文件内容：既无本地路径也无下载 URL。'
                                 dest_path = None
@@ -2305,8 +2642,354 @@ class AIOrchestrator:
                         result += f'\n销毁前总结：\n{summary}'
                 else:
                     result = f'agent {target_agent_id} 不存在或已被移除。'
+        elif name == 'view_image':
+            scope_key = self._scope_key(scope_type, scope_id)
+            refs = self._turn_image_refs.get(scope_key) or []
+            if not refs:
+                result = '本次消息里没有可查看的图片。'
+            else:
+                try:
+                    index = int(tool_input.get('index') or 1)
+                except (TypeError, ValueError):
+                    index = 1
+                if index < 1 or index > len(refs):
+                    result = f'图片序号超出范围（共 {len(refs)} 张，index 从 1 开始）。'
+                else:
+                    question = str(tool_input.get('question') or '').strip()
+                    prompt = question or '请详细描述图片，尤其关注人物、文字、场景、动作、情绪和梗。'
+                    try:
+                        desc = await asyncio.to_thread(
+                            self.vision_model.describe_images,
+                            [refs[index - 1]],
+                            prompt,
+                        )
+                        result = desc.strip() if desc else '图片解析结果为空。'
+                    except Exception as exc:
+                        result = f'图片解析失败: {exc}'
+        elif name == 'list_stickers':
+            try:
+                stickers = await self._get_stickers(force=bool(tool_input.get('refresh')))
+            except Exception as exc:
+                stickers = None
+                result = f'获取收藏表情失败: {exc}'
+            if stickers is not None:
+                if not stickers:
+                    result = '你的账号还没有收藏任何表情。'
+                else:
+                    notes = self.repo.get_setting('sticker_notes', {}) or {}
+                    lines = [f'共 {len(stickers)} 个收藏表情：']
+                    for i, url in enumerate(stickers, start=1):
+                        note = str(notes.get(url) or '').strip()
+                        note_str = note if note else '（无备注，建议用 annotate_sticker 打备注）'
+                        lines.append(f'{i}. {note_str}')
+                    result = '\n'.join(lines)
+        elif name == 'annotate_sticker':
+            try:
+                stickers = await self._get_stickers()
+            except Exception:
+                stickers = []
+            try:
+                index = int(tool_input.get('index') or 0)
+            except (TypeError, ValueError):
+                index = 0
+            note = str(tool_input.get('note') or '').strip()
+            if not stickers:
+                result = '拿不到收藏表情列表，无法打备注，请先调用 list_stickers。'
+            elif index < 1 or index > len(stickers):
+                result = f'表情序号超出范围（共 {len(stickers)} 个，index 从 1 开始）。'
+            elif not note:
+                result = 'note 为空，未保存备注。'
+            else:
+                url = stickers[index - 1]
+                notes = dict(self.repo.get_setting('sticker_notes', {}) or {})
+                notes[url] = note
+                self.repo.set_setting('sticker_notes', notes)
+                result = f'已给第 {index} 个表情打备注：{note}'
+        elif name == 'send_sticker':
+            try:
+                stickers = await self._get_stickers()
+            except Exception:
+                stickers = []
+            try:
+                index = int(tool_input.get('index') or 0)
+            except (TypeError, ValueError):
+                index = 0
+            if not stickers:
+                result = '拿不到收藏表情列表，无法发送，请先调用 list_stickers。'
+            elif index < 1 or index > len(stickers):
+                result = f'表情序号超出范围（共 {len(stickers)} 个，index 从 1 开始）。'
+            else:
+                url = stickers[index - 1]
+                try:
+                    target_id = int(scope_id)
+                except (TypeError, ValueError):
+                    target_id = scope_id
+                try:
+                    await asyncio.to_thread(self.bot.send_image, scope_type, target_id, url)
+                    result = f'已发送第 {index} 个表情。'
+                except Exception as exc:
+                    result = f'发送表情失败: {exc}'
+        elif name == 'send_local_image':
+            import base64 as _base64
+            import pathlib as _pathlib
+            raw_path = str(tool_input.get('path') or '').strip()
+            caption = str(tool_input.get('caption') or '').strip() or None
+            ALLOWED_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+            MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB
+            if not raw_path:
+                result = 'error: path 为空，未发送。'
+            else:
+                proj_root = _pathlib.Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                allowed_dir = (proj_root / 'data' / 'images').resolve()
+                candidate = _pathlib.Path(raw_path)
+                if not candidate.is_absolute():
+                    candidate = allowed_dir / candidate
+                try:
+                    resolved = candidate.resolve()
+                except Exception as exc:
+                    resolved = None
+                    result = f'error: 路径解析失败: {exc}'
+                if resolved is not None:
+                    # 白名单前缀校验：resolve() 后必须仍落在 data/images 内，防 .. 与软链接逃逸
+                    if not (resolved == allowed_dir or allowed_dir in resolved.parents):
+                        result = 'error: 只允许发送项目 data/images/ 目录内的图片，路径被拒绝。'
+                    elif not resolved.exists() or not resolved.is_file():
+                        result = 'error: 文件不存在或不是普通文件。'
+                    elif resolved.suffix.lower() not in ALLOWED_EXTS:
+                        result = f'error: 不支持的图片格式（仅支持 {", ".join(sorted(ALLOWED_EXTS))}）。'
+                    else:
+                        try:
+                            file_size = resolved.stat().st_size
+                        except Exception:
+                            file_size = 0
+                        if file_size > MAX_IMAGE_SIZE:
+                            result = f'error: 图片过大（{file_size // 1024 // 1024}MB），超过 10MB 限制。'
+                        else:
+                            try:
+                                data_bytes = resolved.read_bytes()
+                                b64 = _base64.b64encode(data_bytes).decode('ascii')
+                                file_arg = f'base64://{b64}'
+                                try:
+                                    target_id = int(scope_id)
+                                except (TypeError, ValueError):
+                                    target_id = scope_id
+                                response = await asyncio.to_thread(
+                                    self.tools.send_chat_image, scope_type, target_id, file_arg, caption
+                                )
+                                mid = None
+                                if isinstance(response, dict):
+                                    mid = (response.get('data') or {}).get('message_id')
+                                if mid is not None:
+                                    result = f'已发送图片 {resolved.name}，message_id: {mid}'
+                                else:
+                                    result = f'已发送图片 {resolved.name}。'
+                            except Exception as exc:
+                                result = f'发送图片失败: {exc}'
+        elif name == 'manage_upstream':
+            action = str(tool_input.get('action') or '').strip()
+            if action == 'list':
+                result = self.model_manager.list_upstreams_text()
+            elif action == 'add':
+                _ok, result = self.model_manager.add_upstream(
+                    name=str(tool_input.get('name') or '').strip(),
+                    base_url=str(tool_input.get('base_url') or '').strip(),
+                    api_key=str(tool_input.get('api_key') or '').strip(),
+                    messages_path=str(tool_input.get('messages_path') or '').strip(),
+                )
+            elif action == 'update':
+                _fields = {k: v for k, v in tool_input.items() if k not in ('action', 'name') and v is not None}
+                _ok, result = self.model_manager.update_upstream(str(tool_input.get('name') or '').strip(), **_fields)
+            elif action == 'remove':
+                _ok, result = self.model_manager.remove_upstream(str(tool_input.get('name') or '').strip())
+            elif action == 'balance':
+                import requests as _requests
+                _base_url = str(tool_input.get('base_url') or '').strip().rstrip('/')
+                _api_key = str(tool_input.get('api_key') or '').strip()
+                if not _base_url:
+                    _uname = str(tool_input.get('name') or '').strip()
+                    for _u in (self.model_manager.config.get('upstreams') or []):
+                        if _u.get('name') == _uname:
+                            _base_url = str(_u.get('base_url') or '').strip().rstrip('/')
+                            _api_key = str(_u.get('api_key') or _api_key).strip()
+                            break
+                if not _base_url:
+                    result = '缺少 base_url，无法查询余额。'
+                else:
+                    _headers = {'Authorization': f'Bearer {_api_key}', 'x-api-key': _api_key, 'Accept': 'application/json'}
+                    _candidates = [_base_url]
+                    for _sfx in ('/anthropic', '/v1', '/compatible-mode/v1'):
+                        if _base_url.endswith(_sfx):
+                            _candidates.append(_base_url[:-len(_sfx)])
+                    _bal_paths = ['/dashboard/billing/credit_grants', '/v1/dashboard/billing/credit_grants', '/dashboard/billing/subscription']
+                    _found = False
+                    for _cb in _candidates:
+                        for _path in _bal_paths:
+                            _url = _cb.rstrip('/') + _path
+                            try:
+                                _resp = await asyncio.to_thread(_requests.get, _url, headers=_headers, timeout=10)
+                                if _resp.status_code == 200:
+                                    try:
+                                        _data = _resp.json()
+                                    except ValueError:
+                                        continue
+                                    _total = _data.get('total_granted') or _data.get('hard_limit_usd')
+                                    _used = _data.get('total_used')
+                                    _rem = _data.get('total_available') or _data.get('soft_limit_usd')
+                                    if _total is not None or _rem is not None:
+                                        _parts = []
+                                        if _rem is not None:
+                                            _parts.append(f'剩余 ${float(_rem):.2f}')
+                                        if _used is not None:
+                                            _parts.append(f'已用 ${float(_used):.2f}')
+                                        if _total is not None:
+                                            _parts.append(f'总额 ${float(_total):.2f}')
+                                        result = ' | '.join(_parts) if _parts else str(_data)
+                                        _found = True
+                                        break
+                            except Exception:
+                                continue
+                        if _found:
+                            break
+                    if not _found:
+                        result = '该上游不支持余额查询（未找到标准接口）。'
+            else:
+                result = f'manage_upstream: 未知 action={action!r}，可用: list add update remove balance'
+        elif name == 'manage_channel':
+            action = str(tool_input.get('action') or '').strip()
+            if action == 'list':
+                result = self.model_manager.list_channels_text()
+            elif action == 'add':
+                _ok, result = self.model_manager.add_channel(
+                    name=str(tool_input.get('name') or '').strip(),
+                    strategy=str(tool_input.get('strategy') or 'fallback').strip(),
+                )
+            elif action == 'update':
+                _fields = {k: v for k, v in tool_input.items() if k not in ('action', 'name') and v is not None}
+                _ok, result = self.model_manager.update_channel(str(tool_input.get('name') or '').strip(), **_fields)
+            elif action == 'remove':
+                _ok, result = self.model_manager.remove_channel(str(tool_input.get('name') or '').strip())
+                if _ok:
+                    _cur = self.model_manager.get_current_model()
+                    if _cur:
+                        self._update_model_from_config(_cur)
+            elif action == 'addmodel':
+                _ok, result = self.model_manager.add_model_to_channel(
+                    str(tool_input.get('name') or '').strip(),
+                    str(tool_input.get('upstream') or '').strip(),
+                    str(tool_input.get('model_id') or '').strip(),
+                )
+            elif action == 'removemodel':
+                try:
+                    _midx = int(tool_input.get('model_index') or 0)
+                except (TypeError, ValueError):
+                    _midx = 0
+                _ok, result = self.model_manager.remove_model_from_channel(
+                    str(tool_input.get('name') or '').strip(), _midx
+                )
+            else:
+                result = f'manage_channel: 未知 action={action!r}，可用: list add update remove addmodel removemodel'
+        elif name == 'manage_role':
+            action = str(tool_input.get('action') or '').strip()
+            if action == 'list':
+                result = self.model_manager.list_roles_text()
+            elif action == 'set':
+                _ok, result = self.model_manager.set_role(
+                    str(tool_input.get('role') or '').strip(),
+                    str(tool_input.get('channel') or '').strip(),
+                )
+                if _ok:
+                    self.reload_models_config()
+            else:
+                result = f'manage_role: 未知 action={action!r}，可用: list set'
+        elif name == 'query_logs':
+            from core.logger import query_logs_text
+            count = int(tool_input.get('count') or 20)
+            priority = int(tool_input.get('priority') or 0)
+            scope_key = str(tool_input.get('scope_key') or '').strip()
+            if not scope_key:
+                scope_key = f'{scope_type}:{scope_id}'
+            result = query_logs_text(count=count, priority=priority, scope_key=scope_key)
+        elif name == 'manage_mute':
+            if scope_type != 'group':
+                result = 'manage_mute: 禁言工具仅限群聊场景使用。'
+            else:
+                action = str(tool_input.get('action') or 'status').strip()
+                group_id = int(scope_id)
+                bot_qq = self.bot.self_id
+                # 获取 bot 自身在群里的角色
+                try:
+                    bot_info = self.bot.get_group_member_info(group_id, bot_qq)
+                    bot_role = bot_info.get('role', 'member')
+                except Exception as e:
+                    bot_role = 'unknown'
+                    result = f'manage_mute: 无法获取 bot 自身角色信息: {e}'
+                if bot_role == 'unknown' and action != 'status':
+                    pass  # result already set above
+                elif action == 'status':
+                    lines = [f'bot 自身角色: {bot_role}（QQ: {bot_qq}）']
+                    target_id = tool_input.get('target_user_id')
+                    if target_id:
+                        try:
+                            target_info = self.bot.get_group_member_info(group_id, int(target_id))
+                            lines.append(f'目标用户 {target_id} 角色: {target_info.get("role", "unknown")}')
+                        except Exception as e:
+                            lines.append(f'查询目标用户 {target_id} 失败: {e}')
+                    result = '\n'.join(lines)
+                elif bot_role not in ('owner', 'admin'):
+                    result = f'manage_mute: 权限不足。bot 当前在该群的角色为 {bot_role}，需要管理员或群主权限才能执行禁言操作。'
+                elif action not in ('ban', 'unban'):
+                    result = f'manage_mute: 未知 action={action!r}，可用: ban unban status'
+                else:
+                    target_id = tool_input.get('target_user_id')
+                    if not target_id:
+                        result = 'manage_mute: ban/unban 操作必须提供 target_user_id（要禁言的群成员 QQ 号）'
+                    else:
+                        target_id = int(target_id)
+                        # 查询目标用户角色，做权限层级检查
+                        try:
+                            target_info = self.bot.get_group_member_info(group_id, target_id)
+                            target_role = target_info.get('role', 'member')
+                        except Exception as e:
+                            result = f'manage_mute: 查询目标用户 {target_id} 失败: {e}'
+                            target_role = None
+                        if target_role is not None:
+                            if target_role == 'owner':
+                                result = f'manage_mute: 无法 {action} 群主（owner）。'
+                            elif bot_role == 'admin' and target_role == 'admin' and action == 'ban':
+                                result = 'manage_mute: 管理员无法禁言其他管理员，仅群主有此权限。'
+                            else:
+                                if action == 'ban':
+                                    duration = int(tool_input.get('duration') or 60)
+                                    # 限制最大 30 天
+                                    max_duration = 2592000
+                                    if duration > max_duration:
+                                        duration = max_duration
+                                    if duration < 0:
+                                        duration = 0
+                                else:  # unban
+                                    duration = 0
+                                try:
+                                    self.bot.set_group_ban(group_id, target_id, duration)
+                                    if action == 'ban' and duration > 0:
+                                        mins = duration // 60
+                                        secs = duration % 60
+                                        time_str = f'{mins}分{secs}秒' if mins > 0 else f'{secs}秒'
+                                        result = f'已禁言用户 {target_id}（角色: {target_role}），时长 {time_str}（{duration}秒）。'
+                                    elif action == 'ban' and duration == 0:
+                                        result = f'已解除用户 {target_id} 的禁言（角色: {target_role}）。'
+                                    else:
+                                        result = f'已解除用户 {target_id} 的禁言（角色: {target_role}）。'
+                                except Exception as e:
+                                    result = f'manage_mute: 禁言操作失败: {e}'
         else:
             result = f'未知 AI 工具: {name}'
+        _tool_ms = int((time.perf_counter() - _tool_start) * 1000)
+        _result_preview = self._short_text(result, 80)
+        info(
+            f'[AI][tool] done scope={scope_type}:{scope_id} '
+            f'tool={name} ms={_tool_ms} '
+            f'result_len={len(result)} preview={_result_preview}'
+        )
         self.tools.record_tool_use(
             scope_type,
             scope_id,
@@ -2417,10 +3100,13 @@ class AIOrchestrator:
         else:
             system_blocks = list(messages.get('system') or [])
             model_messages = [dict(item) for item in (messages.get('messages') or [])]
+        _allow_cfg = scope_type == 'master' or (scope_type == 'private' and str(scope_id) == str(self.config.admin_qq))
         tools = build_tools(
             allow_notify_master=allow_notify_master,
             allow_tasks=allow_tasks,
             immediate_mode=live_message is not None,
+            allow_config_tools=_allow_cfg,
+            include_group_management=(scope_type == 'group'),
         )
         scope_key = self._scope_key(scope_type, scope_id) if live_message is not None else None
         tool_iterations: list[dict] = []
@@ -2429,7 +3115,16 @@ class AIOrchestrator:
         sent_entries: list[dict] = []
         tool_context_messages: list[dict] = []
         fallback_prompted = False
+        openai_tool_guidance = False
         max_iterations = 8 if live_message is not None else 6
+        _turn_kind = (turn_meta or {}).get('turn_kind', 'unknown')
+        _tool_count = len(tools) if tools else 0
+        info(
+            f'[AI][turn] start scope={scope_type}:{scope_id} '
+            f'agent={agent_id} kind={_turn_kind} '
+            f'messages={len(model_messages)} tools={_tool_count} '
+            f'live={live_message is not None} max_iter={max_iterations}'
+        )
         for _ in range(max_iterations):
             if self._is_epoch_stale(run_epoch):
                 return {'message': '', 'think_note': '', 'tool_context_messages': tool_context_messages}, int((time.perf_counter() - started_at) * 1000), used_tools
@@ -2444,6 +3139,8 @@ class AIOrchestrator:
                         allow_tasks=allow_tasks,
                         immediate_mode=True,
                         include_message=False,
+                        allow_config_tools=_allow_cfg,
+                        include_group_management=(scope_type == 'group'),
                     )
                     forced_digest_round = True
             reply = await self._complete_chat(system_blocks, model_messages, round_tools, temperature)
@@ -2489,20 +3186,32 @@ class AIOrchestrator:
                         tool_iterations=tool_iterations,
                         generation_ms=generation_ms,
                     )
+                    info(
+                        f'[AI][turn] done scope={scope_type}:{scope_id} '
+                        f'kind={_turn_kind} ms={generation_ms} '
+                        f'reply_len={len(final_reply)} iterations={len(tool_iterations)}'
+                    )
                     return {'message': final_reply, 'think_note': think_note, 'tool_context_messages': tool_context_messages}, generation_ms, used_tools
                 used_tools = True
                 result_blocks: list[dict] = []
                 iteration_calls: list[dict] = []
                 for call in reply.tool_calls:
-                    if call.name in LOOP_TOOL_NAMES:
-                        result = await self._run_ai_tool_call(scope_type, scope_id, agent_id, call.name, call.input)
-                    else:
-                        result = '本轮先处理查询类工具，这个操作未执行；如仍需要，请在拿到查询结果后的最终回复里再调用。'
+                    try:
+                        if call.name in LOOP_TOOL_NAMES:
+                            result = await self._run_ai_tool_call(scope_type, scope_id, agent_id, call.name, call.input)
+                        else:
+                            result = '本轮先处理查询类工具，这个操作未执行；如仍需要，请在拿到查询结果后的最终回复里再调用。'
+                    except Exception as exc:
+                        warn(
+                            f'[AI][tool] 工具调用异常 scope={scope_type}:{scope_id} '
+                            f'tool={call.name} error={type(exc).__name__}: {exc}'
+                        )
+                        result = f'工具 {call.name} 执行异常: {type(exc).__name__}: {exc}'
                     result_blocks.append(
                         {
                             'type': 'tool_result',
                             'tool_use_id': call.call_id,
-                            'content': result,
+                            'content': result if result is not None else '（工具无返回）',
                         }
                     )
                     iteration_calls.append({'name': call.name, 'input': call.input, 'result': result})
@@ -2537,7 +3246,7 @@ class AIOrchestrator:
                     warn('[AI][fallback] 模型未调用 send_message，re-prompt 重新决策')
                     fallback_prompted = True
                     model_messages.append({'role': 'assistant', 'content': self._filter_thinking_blocks(reply.raw_content)})
-                    model_messages.append({'role': 'user', 'content': '如果你决定回复，请调用 send_message 工具发送；如果决定不回复，什么都不输出即可。'})
+                    model_messages.append({'role': 'user', 'content': '你刚才输出了普通文字，但普通文字不会发送给用户。如果你想说这些话，请调用 send_message 工具发送；如果决定不回复，请调用 stay_silent 工具结束本回合。'})
                     continue
 
                 final_reply = '\n'.join(entry['text'] for entry in sent_entries)
@@ -2554,31 +3263,51 @@ class AIOrchestrator:
                     tool_iterations=tool_iterations,
                     generation_ms=generation_ms,
                 )
+                info(
+                    f'[AI][turn] done scope={scope_type}:{scope_id} '
+                    f'kind={_turn_kind} ms={generation_ms} '
+                    f'reply_len={len(final_reply)} iterations={len(tool_iterations)}'
+                )
                 return {'message': final_reply, 'think_note': think_note, 'tool_context_messages': tool_context_messages}, generation_ms, used_tools
 
-            used_tools = True
             result_blocks = []
             iteration_calls = []
+            end_turn_requested = False
             for call in reply.tool_calls:
-                if call.name in LOOP_TOOL_NAMES:
-                    result = await self._run_ai_tool_call(scope_type, scope_id, agent_id, call.name, call.input)
-                else:
-                    result = self._execute_live_action_tool_call(
-                        scope_type,
-                        scope_id,
-                        agent_id,
-                        live_message,
-                        call,
-                        context,
-                        allow_notify_master,
-                        allow_tasks,
-                        sent_entries,
+                try:
+                    if call.name == 'stay_silent':
+                        # 保持沉默：这一轮到此结束，不做实际工作。给一个占位 tool_result
+                        # 保证 tool_use/tool_result 配对，随后终结本回合。
+                        result = '好的，本回合保持沉默，不发消息。'
+                        end_turn_requested = True
+                    elif call.name in LOOP_TOOL_NAMES:
+                        result = await self._run_ai_tool_call(scope_type, scope_id, agent_id, call.name, call.input)
+                        used_tools = True
+                    else:
+                        result = self._execute_live_action_tool_call(
+                            scope_type,
+                            scope_id,
+                            agent_id,
+                            live_message,
+                            call,
+                            context,
+                            allow_notify_master,
+                            allow_tasks,
+                            sent_entries,
+                        )
+                        used_tools = True
+                except Exception as exc:
+                    warn(
+                        f'[AI][tool] 工具调用异常 scope={scope_type}:{scope_id} '
+                        f'tool={call.name} error={type(exc).__name__}: {exc}'
                     )
+                    result = f'工具 {call.name} 执行异常: {type(exc).__name__}: {exc}'
+                    used_tools = True
                 result_blocks.append(
                     {
                         'type': 'tool_result',
                         'tool_use_id': call.call_id,
-                        'content': result,
+                        'content': result if result is not None else '（工具无返回）',
                     }
                 )
                 iteration_calls.append({'name': call.name, 'input': call.input, 'result': result})
@@ -2594,6 +3323,35 @@ class AIOrchestrator:
             tool_context_messages.append({'role': 'assistant', 'content': copy.deepcopy(assistant_content)})
             tool_context_messages.append({'role': 'user', 'content': copy.deepcopy(result_blocks)})
 
+            # OpenAI 协议模型引导：工具结果返回后追加提醒，防止模型陷入查询→查询循环
+            if getattr(self.model, 'is_openai_protocol', False) and not sent_entries and not end_turn_requested:
+                if not openai_tool_guidance:
+                    openai_tool_guidance = True
+                    model_messages.append({'role': 'user', 'content': '以上是工具执行结果。请基于这些信息，调用 send_message 工具向用户发送最终回复；如果判断不需要回复，请调用 stay_silent 工具结束本回合。'})
+
+            if end_turn_requested:
+                final_reply = '\n'.join(entry['text'] for entry in sent_entries)
+                think_note = self._normalize_think_note(reply.text)
+                await self._record_turn_log(
+                    scope_type,
+                    scope_id,
+                    agent_id,
+                    model_messages,
+                    raw_reply=json.dumps(reply.raw_content, ensure_ascii=False),
+                    final_reply=final_reply,
+                    temperature=temperature,
+                    turn_meta=turn_meta,
+                    tool_iterations=tool_iterations,
+                    generation_ms=generation_ms,
+                )
+                info(
+                    f'[AI][turn] done scope={scope_type}:{scope_id} '
+                    f'kind={_turn_kind} ms={generation_ms} '
+                    f'reply_len={len(final_reply)} iterations={len(tool_iterations)} '
+                    f'stay_silent=True'
+                )
+                return {'message': final_reply, 'think_note': think_note, 'tool_context_messages': tool_context_messages}, generation_ms, used_tools
+
             scope_key = self._scope_key(scope_type, scope_id)
             pending = None
             pending_list = self._pending_scope_turns.get(scope_key)
@@ -2603,6 +3361,53 @@ class AIOrchestrator:
                     del self._pending_scope_turns[scope_key]
             if pending:
                 model_messages.append({'role': 'user', 'content': self._build_pending_fold_reminder(pending)})
+
+        # OpenAI 协议模型兜底：loop_guard 触发前做最后一次 re-prompt，给模型一次强制决定的机会
+        if live_message is not None and getattr(self.model, 'is_openai_protocol', False):
+            model_messages.append({'role': 'user', 'content': '你已经进行了多轮工具调用但没有发送任何回复。现在你必须做出最终决定：调用 send_message 向用户发送最终回复，或调用 stay_silent 结束本回合。不要再调用其他查询工具。'})
+            try:
+                _final_reply = await self._complete_chat(system_blocks, model_messages, tools, temperature)
+                if _final_reply and _final_reply.tool_calls:
+                    for call in _final_reply.tool_calls:
+                        if call.name == 'stay_silent':
+                            final_reply = '\n'.join(entry['text'] for entry in sent_entries)
+                            _loop_guard_ms = int((time.perf_counter() - started_at) * 1000)
+                            await self._record_turn_log(
+                                scope_type, scope_id, agent_id, model_messages,
+                                raw_reply=json.dumps(_final_reply.raw_content, ensure_ascii=False),
+                                final_reply=final_reply, temperature=temperature,
+                                turn_meta=turn_meta, tool_iterations=tool_iterations,
+                                generation_ms=_loop_guard_ms,
+                            )
+                            return {'message': final_reply, 'think_note': '', 'tool_context_messages': tool_context_messages}, _loop_guard_ms, used_tools
+                        elif call.name == 'send_message':
+                            self._execute_live_action_tool_call(
+                                scope_type, scope_id, agent_id, live_message,
+                                call, context, allow_notify_master, allow_tasks, sent_entries,
+                            )
+                            final_reply = '\n'.join(entry['text'] for entry in sent_entries)
+                            _loop_guard_ms = int((time.perf_counter() - started_at) * 1000)
+                            await self._record_turn_log(
+                                scope_type, scope_id, agent_id, model_messages,
+                                raw_reply=json.dumps(_final_reply.raw_content, ensure_ascii=False),
+                                final_reply=final_reply, temperature=temperature,
+                                turn_meta=turn_meta, tool_iterations=tool_iterations,
+                                generation_ms=_loop_guard_ms,
+                            )
+                            return {'message': final_reply, 'think_note': '', 'tool_context_messages': tool_context_messages}, _loop_guard_ms, used_tools
+                elif _final_reply and _final_reply.text.strip():
+                    final_reply = _final_reply.text.strip()
+                    _loop_guard_ms = int((time.perf_counter() - started_at) * 1000)
+                    await self._record_turn_log(
+                        scope_type, scope_id, agent_id, model_messages,
+                        raw_reply=json.dumps(_final_reply.raw_content, ensure_ascii=False),
+                        final_reply=final_reply, temperature=temperature,
+                        turn_meta=turn_meta, tool_iterations=tool_iterations,
+                        generation_ms=_loop_guard_ms,
+                    )
+                    return {'message': final_reply, 'think_note': '', 'tool_context_messages': tool_context_messages}, _loop_guard_ms, used_tools
+            except Exception as _exc:
+                warn(f'[AI][turn] loop_guard final re-prompt failed: {_exc}')
 
         self.tools.record_tool_use(
             scope_type,
@@ -2614,6 +3419,7 @@ class AIOrchestrator:
             limit=self.config.history_limit,
         )
         final_reply = '\n'.join(entry['text'] for entry in sent_entries) if live_message is not None else ''
+        _loop_guard_ms = int((time.perf_counter() - started_at) * 1000)
         await self._record_turn_log(
             scope_type,
             scope_id,
@@ -2624,9 +3430,14 @@ class AIOrchestrator:
             temperature=temperature,
             turn_meta=turn_meta,
             tool_iterations=tool_iterations,
-            generation_ms=int((time.perf_counter() - started_at) * 1000),
+            generation_ms=_loop_guard_ms,
         )
-        return {'message': final_reply, 'think_note': '', 'tool_context_messages': tool_context_messages}, int((time.perf_counter() - started_at) * 1000), used_tools
+        warn(
+            f'[AI][turn] loop_guard scope={scope_type}:{scope_id} '
+            f'agent={agent_id} ms={_loop_guard_ms} '
+            f'iterations={len(tool_iterations)}'
+        )
+        return {'message': final_reply, 'think_note': '', 'tool_context_messages': tool_context_messages}, _loop_guard_ms, used_tools
 
     def _apply_directive_tools(
         self,
@@ -2640,6 +3451,14 @@ class AIOrchestrator:
     ) -> str:
         context = context or {}
         message_parts: list[str] = []
+        # 后台链路里 send_message 会被聚合成本回合的最终回复文本。若模型在同一批里
+        # 既发了消息又创建了 set_alarm，则那条聚合回复已相当于确认，无需系统再补发；
+        # 若模型没发消息，则仍需 _handle_set_alarm 发系统确认，否则用户收不到任何反馈。
+        model_sent_message = any(
+            getattr(call, 'name', '') == 'send_message'
+            and str((getattr(call, 'input', None) or {}).get('content') or '').strip()
+            for call in tool_calls
+        )
 
         for call in tool_calls:
             tool_input = dict(call.input or {})
@@ -2692,6 +3511,8 @@ class AIOrchestrator:
                     message_parts.append('（这个操作需要号主本人才能发起，我暂时没法帮你做。）')
                 elif kind:
                     payload = self._normalize_task_payload(content, scope_type, scope_id, agent_id, context)
+                    if kind == 'set_alarm' and model_sent_message:
+                        payload.setdefault('direct_ack_sent', True)
                     task = self.tools.create_task(agent_id, kind, payload)
                     self.queue.put_nowait({'kind': 'task', 'task_id': task.task_id, 'message_epoch': self._message_epoch})
                     self.tools.record_tool_use(
@@ -2743,6 +3564,36 @@ class AIOrchestrator:
         content = re.sub(r'\[\[.*?\]\]', '', content).strip()
         if message.chat_type == 'private':
             content = re.sub(r'\[CQ:at,qq=\d+\]', '', content).strip()
+        # 无代码块：走原逻辑，行为与改动前完全一致。
+        if not has_code_block(content):
+            return self._send_text_lines(message, content)
+        # 有代码块：按原文顺序分段发送，text 段照原逻辑发，code 段渲染成图片发。
+        # 整个分段流程再包一层兜底：任何意外都回退到原样逐行发送，绝不吞消息。
+        try:
+            segments = split_code_block_segments(content)
+        except Exception as exc:
+            warn(f'[AI][code2img] 分段失败，回退纯文本发送: {exc}')
+            return self._send_text_lines(message, content)
+        entries: list[dict] = []
+        for seg in segments:
+            if seg.get('kind') == 'code':
+                img_entry = self._try_send_code_image(
+                    message,
+                    seg.get('code') or '',
+                    seg.get('language'),
+                    seg.get('raw') or '',
+                )
+                if img_entry is not None:
+                    entries.append(img_entry)
+                    continue
+                # 渲染或发图失败：降级为原样发送该段 raw 文本（含 ``` 围栏）。
+                entries.extend(self._send_text_lines(message, seg.get('raw') or ''))
+            else:
+                entries.extend(self._send_text_lines(message, seg.get('text') or ''))
+        return entries
+
+    def _send_text_lines(self, message: ChatMessage, content: str) -> list[dict]:
+        """把一段纯文本按原逻辑拆行并逐行发送。等价于原 _send_scope_message 的发送循环。"""
         content = self._split_long_reply_lines(content)
         entries: list[dict] = []
         for line in content.split('\n'):
@@ -2756,6 +3607,55 @@ class AIOrchestrator:
             entries.append({'text': line, 'message_id': message_id})
         return entries
 
+    def _try_send_code_image(
+        self,
+        message: ChatMessage,
+        code: str,
+        language: str | None,
+        raw: str = '',
+    ) -> dict | None:
+        """把一段代码渲染成 PNG 并通过发图链路发送。
+
+        成功返回 entry（entry['text'] 保留代码块 raw 原文，含 ``` 围栏，
+        供下游拼历史/turn_log 无损保留上下文），发送成功后删除临时图；
+        任何环节失败返回 None，由调用方降级为原样发文本。
+        """
+        if not (code or '').strip():
+            return None
+        out_path = None
+        try:
+            from core.code2img import render_code_to_image
+            import base64 as _base64
+            fname = f'codeblk_{int(time.time() * 1000)}_{random.randint(1000, 9999)}.png'
+            out_path = render_code_to_image(code, language=language, out_path=fname)
+            data_bytes = None
+            with open(out_path, 'rb') as fp:
+                data_bytes = fp.read()
+            b64 = _base64.b64encode(data_bytes).decode('ascii')
+            file_arg = f'base64://{b64}'
+            try:
+                target_id = int(message.chat_id)
+            except (TypeError, ValueError):
+                target_id = message.chat_id
+            response = self.bot.send_image(message.chat_type, target_id, file_arg)
+            message_id = None
+            if isinstance(response, dict):
+                message_id = (response.get('data') or {}).get('message_id')
+            # 发送成功后删除临时图；删除失败只记录，不影响已发送结果。
+            self._safe_remove_file(out_path)
+            # entry['text'] 保留 raw 原文（含 ``` 围栏），下游拼历史无损。
+            return {'text': raw or code, 'message_id': message_id}
+        except Exception as exc:
+            warn(f'[AI][code2img] 渲染或发图失败，降级为文本: {exc}')
+            if out_path:
+                self._safe_remove_file(out_path)
+            return None
+
+    def _safe_remove_file(self, path) -> None:
+        try:
+            os.remove(path)
+        except Exception as exc:
+            warn(f'[AI][code2img] 删除临时图失败（忽略）: {exc}')
     def _execute_live_action_tool_call(
         self,
         scope_type: str,
@@ -2770,6 +3670,11 @@ class AIOrchestrator:
     ) -> str:
         context = context or {}
         tool_input = dict(call.input or {})
+        info(
+            f'[AI][live_tool] scope={scope_type}:{scope_id} '
+            f'agent={agent_id} tool={call.name} '
+            f'input_keys={list(tool_input.keys())}'
+        )
         if call.name == 'send_message':
             content = str(tool_input.get('content') or '').strip()
             entries = self._send_scope_message(message, content)
@@ -2778,7 +3683,9 @@ class AIOrchestrator:
             sent_entries.extend(entries)
             ids = ', '.join(str(entry['message_id']) for entry in entries if entry.get('message_id') is not None)
             suffix = f'，message_id: {ids}' if ids else ''
-            return f'已发送 {len(entries)} 条消息{suffix}。'
+            # 关键修复：在返回结果中包含实际发送的内容，避免 AI 因看不到自己刚发的消息而重复发送
+            sent_text = '\n'.join(entry['text'] for entry in entries)
+            return f'已发送 {len(entries)} 条消息{suffix}。发送内容：\n{sent_text}'
         if call.name == 'recall_message':
             message_id = tool_input.get('message_id')
             if not message_id:
@@ -2840,6 +3747,10 @@ class AIOrchestrator:
                 )
                 return result
             payload = self._normalize_task_payload(content, scope_type, scope_id, agent_id, context)
+            if kind == 'set_alarm':
+                # 主聊天链路：子AI本轮已用 send_message 自然回复，无需 _handle_set_alarm
+                # 再往会话灌一条机器人腔的“闹钟已设定”确认。
+                payload.setdefault('direct_ack_sent', True)
             task = self.tools.create_task(agent_id, kind, payload)
             self.queue.put_nowait({'kind': 'task', 'task_id': task.task_id, 'message_epoch': self._message_epoch})
             result = f'已创建任务 {task.task_id}。'
@@ -2853,7 +3764,10 @@ class AIOrchestrator:
                 limit=self.config.history_limit,
             )
             return result
-        return f'当前不支持调用该工具: {call.name}'
+        _known_restricted = {'notify_master', 'create_task'}
+        if call.name in _known_restricted:
+            return f'工具 {call.name} 当前未启用（权限开关关闭），本次未执行。'
+        return f'未知或不可用的工具: {call.name}，本次未执行。'
 
     def _build_pending_fold_reminder(self, pending: dict) -> str:
         trigger_messages = pending.get('trigger_messages') or []
@@ -2897,6 +3811,16 @@ class AIOrchestrator:
         if task.get('status') == 'done':
             return
 
+        _task_kind = task.get('kind', '?')
+        _task_start = time.perf_counter()
+        _task_scope = str(task.get('origin_scope') or '')
+        info(
+            f'[AI][task] start task_id={task_id} kind={_task_kind} '
+            f'source={task.get("source_agent", "?")} '
+            f'status={task.get("status", "?")}'
+        )
+        get_bot_logger().info(CAT_TASK, _task_scope, f'任务开始: task_id={task_id} kind={_task_kind} source={task.get("source_agent", "?")}')
+
         # 发送类 task 需占用目标 scope 会话锁，避免与 message turn 并发写同一会话。
         scope_key = self._scope_key_for_task(task)
         prereserved = bool(item.get('scope_prereserved'))
@@ -2906,8 +3830,17 @@ class AIOrchestrator:
                 return
         try:
             await self._dispatch_task(task, task_id, run_epoch=run_epoch)
+        except Exception as exc:
+            _task_ms = int((time.perf_counter() - _task_start) * 1000)
+            warn(f'[AI][task] error task_id={task_id} kind={_task_kind} ms={_task_ms} error={exc}')
+            get_bot_logger().error(CAT_TASK, _task_scope, f'任务异常: task_id={task_id} kind={_task_kind} ms={_task_ms}ms error={type(exc).__name__}: {exc}')
         finally:
             # 覆盖正常返回/异常/prereserved 等所有退出路径，确保占用的锁被释放。
+            _task_ms = int((time.perf_counter() - _task_start) * 1000)
+            info(
+                f'[AI][task] done task_id={task_id} kind={_task_kind} ms={_task_ms}'
+            )
+            get_bot_logger().info(CAT_TASK, _task_scope, f'任务完成: task_id={task_id} kind={_task_kind} ms={_task_ms}ms')
             if scope_key:
                 self._release_task_scope(scope_key)
 
@@ -2964,6 +3897,21 @@ class AIOrchestrator:
             self.repo.update_task(task_id, 'done', result)
             return
 
+        if kind == 'summarize_diary':
+            result = await self._handle_summarize_diary(task)
+            self.repo.update_task(task_id, 'done', result)
+            return
+
+        if kind == 'meta_summarize_diary':
+            result = await self._handle_meta_summarize_diary(task)
+            self.repo.update_task(task_id, 'done', result)
+            return
+
+        if kind == 'intelligence_round':
+            result = await self._handle_intelligence_round(task)
+            self.repo.update_task(task_id, 'done', result)
+            return
+
         if kind == 'dev_agent':
             dev_task = self.loop.create_task(self._run_dev_agent_task(task))
             self._dev_agent_tasks.add(dev_task)
@@ -3003,255 +3951,138 @@ class AIOrchestrator:
         )
         await self.queue.put({'kind': 'task', 'task_id': task.task_id, 'message_epoch': self._message_epoch})
 
-    def _detect_master_request(self, message: ChatMessage, cleaned: str) -> dict | None:
-        history = self.repo.list_messages(message.chat_type, str(message.chat_id))[-8:]
-        patterns = [
-            r'(?:帮我)?给\s*(?P<qq>\d{5,12})\s*(?:发|法)(?:个)?\s*消息\s*(?:说|讲)?\s*(?P<content>.+)',
-            r'帮我给\s*(?P<qq>\d{5,12})\s*(?:发|法)\s*消息\s*(?:说|讲)?\s*(?P<content>.+)',
-            r'帮我告诉\s*(?P<qq>\d{5,12})\s*(?P<content>.+)',
-            r'替我跟\s*(?P<qq>\d{5,12})\s*说\s*(?P<content>.+)',
-            r'(?:喊|叫|联系)\s*(?P<qq>\d{5,12})\s*(?P<content>.+)',
-        ]
-        for pattern in patterns:
-            matched = re.search(pattern, cleaned)
-            if matched:
-                target_qq = matched.group('qq').strip()
-                content = matched.group('content').strip(' ：:，,。')
-                if not content:
-                    return None
-                return self._build_contact_request(message, cleaned, target_qq, content)
+    @staticmethod
+    def _flatten_diary_context(diary_ctx: dict) -> list[dict]:
+        result = []
+        for d in (diary_ctx.get('window') or []):
+            result.extend(d.get('messages') or [])
+        result.extend(diary_ctx.get('current') or [])
+        return result
 
-        contextual_content = self._extract_contextual_contact_content(cleaned)
-        if contextual_content:
-            target_qq = self._find_recent_target_qq(history, str(message.user_id))
-            if target_qq:
-                return self._build_contact_request(message, cleaned, target_qq, contextual_content)
-        return None
-
-    def _build_contact_request(self, message: ChatMessage, cleaned: str, target_qq: str, content: str) -> dict:
-        normalized_content = self._normalize_contact_content(content)
-        return {
-            'request_type': 'coordinate_contact',
-            'target_scope_type': 'private',
-            'target_scope_id': target_qq,
-            'content': normalized_content,
-            'instruction': f'如果合适，请你主动联系这个会话，并自然转达：{normalized_content}',
-            'reason': '用户要求联系目标会话',
-            'scope_type': message.chat_type,
-            'scope_id': str(message.chat_id),
-            'requester_qq': str(message.user_id),
-            'requester_name': message.nickname,
-            'source_message': cleaned,
-        }
-
-    def _detect_global_preference_request(self, message: ChatMessage, cleaned: str) -> dict | None:
-        style_match = re.search(
-            r'(?:让|叫|希望)?(?P<target>[A-Za-z0-9_\-\u4e00-\u9fa5·]{2,24})(?:用户)?(?:的ai|的AI|那边的ai|那边)?对(?:我|他|她|这个人)?(?P<style>语气好一点|态度好一点|好一点|温柔一点|客气一点|友好一点|热情一点|别那么凶|不要那么凶)',
-            cleaned,
+    async def _maybe_schedule_diary_summarization(self, scope_type: str, scope_id: str):
+        pending = await asyncio.to_thread(self.repo.get_pending_diary, scope_type, scope_id)
+        if not pending:
+            return
+        agent_id = self.repo.get_or_create_agent(scope_type, scope_id).agent_id
+        task = self.tools.create_task(
+            agent_id,
+            'summarize_diary',
+            {'scope_type': scope_type, 'scope_id': scope_id, 'diary_index': pending['index']},
         )
-        if style_match:
-            target_query = style_match.group('target').strip()
-            style = style_match.group('style').strip()
-            return {
-                'request_type': 'set_user_preference',
-                'target_query': target_query,
-                'preference_text': f'全局对待策略：对这个人说话 {style}。',
-                'scope_type': message.chat_type,
-                'scope_id': str(message.chat_id),
-                'requester_qq': str(message.user_id),
-                'requester_name': message.nickname,
-                'source_message': cleaned,
-            }
+        await self.queue.put({'kind': 'task', 'task_id': task.task_id, 'message_epoch': self._message_epoch})
 
-        relation_match = re.search(
-            r'(?P<target>[A-Za-z0-9_\-\u4e00-\u9fa5·]{2,24})是我(?:的)?(?P<relation>女友|女朋友|对象|老婆|男朋友|老公|cp)',
-            cleaned,
-        )
-        if relation_match:
-            target_query = relation_match.group('target').strip()
-            relation = relation_match.group('relation').strip()
-            return {
-                'request_type': 'set_user_preference',
-                'target_query': target_query,
-                'preference_text': f'全局关系设定：这个人是 {message.nickname}({message.user_id}) 的{relation}，互动时应明显更亲近、更照顾、更有耐心。',
-                'scope_type': message.chat_type,
-                'scope_id': str(message.chat_id),
-                'requester_qq': str(message.user_id),
-                'requester_name': message.nickname,
-                'source_message': cleaned,
-            }
-        return None
+    async def _handle_summarize_diary(self, task: dict) -> str:
+        payload = task.get('payload') or {}
+        scope_type = str(payload.get('scope_type') or '').strip()
+        scope_id = str(payload.get('scope_id') or '').strip()
+        diary_index = int(payload.get('diary_index') or 0)
+        if not scope_type or not scope_id:
+            return '缺少 scope 参数。'
+        pending = await asyncio.to_thread(self.repo.get_pending_diary, scope_type, scope_id)
+        if not pending or int(pending.get('index') or 0) != diary_index:
+            return f'diary #{diary_index} 不在待总结队列中，可能已处理。'
+        messages = pending.get('messages') or []
+        if not messages:
+            needs_meta = await asyncio.to_thread(self.repo.store_diary_summary, scope_type, scope_id, diary_index, '（空日记段，无内容）')
+            if needs_meta:
+                await self._maybe_schedule_meta_summarization(scope_type, scope_id)
+            return f'diary #{diary_index} 为空，已略过。'
+        prompt = self._build_diary_summary_prompt(scope_type, scope_id, messages)
+        try:
+            reply = await self._complete_chat(
+                self._static_system_blocks(self._diary_summary_system_prompt()),
+                [{'role': 'user', 'content': prompt}],
+                None,
+                0.3,
+            )
+        except Exception as exc:
+            error(f'[AI][diary] summarize failed scope={scope_type}:{scope_id} index={diary_index} error={exc}')
+            return f'总结 diary #{diary_index} 失败: {exc}'
+        summary = (reply.text if reply else '').strip()
+        if not summary:
+            return f'diary #{diary_index} 总结结果为空。'
+        needs_meta = await asyncio.to_thread(self.repo.store_diary_summary, scope_type, scope_id, diary_index, summary)
+        info(f'[AI][diary] summarized scope={scope_type}:{scope_id} index={diary_index} chars={len(summary)}')
+        if needs_meta:
+            await self._maybe_schedule_meta_summarization(scope_type, scope_id)
+        return f'已总结 diary #{diary_index}。'
 
-    def _extract_contextual_contact_content(self, cleaned: str) -> str | None:
-        text = cleaned.strip(' ：:，,。')
-        patterns = [
-            r'^(?:喊|叫|联系)(?:他|她|一下)?(?P<content>.+)$',
-            r'^(?:让)?(?:他|她)(?P<content>来.+)$',
-            r'^(?P<content>(?:来|去).+)$',
-        ]
-        for pattern in patterns:
-            matched = re.search(pattern, text)
-            if matched:
-                content = (matched.groupdict().get('content') or '').strip(' ：:，,。')
-                if content:
-                    return content
-        return None
-
-    def _find_recent_target_qq(self, history: list[dict], requester_qq: str) -> str | None:
-        for item in reversed(history):
-            if str(item.get('user_id')) != requester_qq:
-                continue
-            text = str(item.get('text') or '').strip()
-            matched = re.fullmatch(r'\d{5,12}', text)
-            if matched:
-                return matched.group(0)
-        return None
-
-    def _detect_contact_target_only(self, message: ChatMessage, cleaned: str) -> str | None:
-        text = cleaned.strip()
-        if not re.fullmatch(r'\d{5,12}', text):
-            return None
-        history = self.repo.list_messages(message.chat_type, str(message.chat_id))[-8:]
-        if self._recent_contact_context_exists(history):
-            return text
-        return None
-
-    def _normalize_contact_content(self, content: str) -> str:
-        text = content.strip(' ：:，,。')
-        if re.match(r'^(来|去|一起)', text):
-            return f'喊你{text}'
-        return text
-
-    def _recent_contact_context_exists(self, history: list[dict]) -> bool:
-        patterns = [
-            r'喊',
-            r'叫',
-            r'联系',
-            r'帮你联系',
-            r'给我.*QQ号',
-            r'去哪喊',
-        ]
-        for item in reversed(history):
-            text = str(item.get('text') or '').strip()
-            if any(re.search(pattern, text) for pattern in patterns):
-                return True
-        return False
-
-    def _detect_status_request(self, message: ChatMessage, cleaned: str) -> dict | None:
-        if not self._looks_like_status_query(cleaned):
-            return None
-        recent = self._find_recent_contact_request(
-            message.chat_type,
-            str(message.chat_id),
-            query_text=cleaned,
-            requester_qq=str(message.user_id),
-        )
-        if not recent:
-            return None
-        return {
-            'request_type': 'query_contact_status',
-            'scope_type': message.chat_type,
-            'scope_id': str(message.chat_id),
-            'requester_qq': str(message.user_id),
-            'requester_name': message.nickname,
-            'trace_id': recent.get('trace_id'),
-            'target_scope_type': recent.get('target_scope_type'),
-            'target_scope_id': recent.get('target_scope_id'),
-            'instruction': recent.get('instruction'),
-            'content': recent.get('content'),
-            'source_message': cleaned,
-        }
-
-    def _looks_like_status_query(self, cleaned: str) -> bool:
-        text = cleaned.strip()
-        patterns = [
-            r'让你发的消息.*(怎么样|咋样|如何|后续|进展)',
-            r'消息.*(怎么样|咋样|如何|后续|进展)',
-            r'(他|她|对方).*(回复|回了|理你|怎么说)',
-            r'(有|有没有).*(回复|回信|回我)',
-            r'(后续|进展).*(呢|咋样|如何)?',
-            r'怎么样了',
-        ]
-        return any(re.search(pattern, text) for pattern in patterns)
-
-    def _find_recent_contact_request(
-        self,
-        scope_type: str,
-        scope_id: str,
-        query_text: str = '',
-        requester_qq: str = '',
-    ) -> dict | None:
-        candidates = []
-        for task in reversed(self.repo.list_tasks(kinds=['notify_master'])):
-            payload = task.get('payload') or {}
-            if task.get('kind') != 'notify_master':
-                continue
-            if payload.get('request_type') != 'coordinate_contact':
-                continue
-            if payload.get('scope_type') != scope_type or str(payload.get('scope_id')) != str(scope_id):
-                continue
-            if requester_qq and str(payload.get('requester_qq') or '') != requester_qq:
-                continue
-            candidate = {
-                'task_id': task.get('task_id'),
-                'created_at': task.get('created_at'),
-                'trace_id': str(payload.get('trace_id') or task.get('task_id') or ''),
-                'target_scope_type': payload.get('target_scope_type') or 'private',
-                'target_scope_id': str(payload.get('target_scope_id') or ''),
-                'instruction': payload.get('instruction'),
-                'content': payload.get('content'),
-                'requester_qq': payload.get('requester_qq'),
-                'requester_name': payload.get('requester_name'),
-                'source_message': payload.get('source_message'),
-            }
-            candidates.append(candidate)
+    async def _maybe_schedule_meta_summarization(self, scope_type: str, scope_id: str):
+        """当日记摘要超过上限时，调度一个元总结任务。"""
+        candidates = await asyncio.to_thread(self.repo.get_meta_summary_candidates, scope_type, scope_id)
         if not candidates:
-            return None
-        if len(candidates) == 1:
-            return candidates[0]
-        scored = [
-            (self._score_contact_request_candidate(query_text, item), item)
-            for item in candidates
-        ]
-        scored.sort(key=lambda pair: (pair[0], float(pair[1].get('created_at') or 0.0)), reverse=True)
-        return scored[0][1]
-
-    def _score_contact_request_candidate(self, query_text: str, candidate: dict) -> int:
-        query_text = str(query_text or '').strip()
-        if not query_text:
-            return int(float(candidate.get('created_at') or 0.0))
-        score = 0
-        target_scope_id = str(candidate.get('target_scope_id') or '').strip()
-        if target_scope_id and target_scope_id in query_text:
-            score += 80
-        haystack = ' '.join(
-            [
-                str(candidate.get('content') or ''),
-                str(candidate.get('instruction') or ''),
-                str(candidate.get('source_message') or ''),
-            ]
+            return
+        agent_id = self.repo.get_or_create_agent(scope_type, scope_id).agent_id
+        task = self.tools.create_task(
+            agent_id,
+            'meta_summarize_diary',
+            {'scope_type': scope_type, 'scope_id': scope_id},
         )
-        query_terms = self._extract_status_focus_terms(query_text)
-        for term in query_terms:
-            if len(term) < 2:
-                continue
-            if term in haystack:
-                score += 15
-        if re.search(r'(上次|之前|前面|那次|昨天|刚才)', query_text):
-            score += 10
-        score += min(20, len(query_terms) * 2)
-        created_at = float(candidate.get('created_at') or 0.0)
-        if created_at:
-            age_hours = max(0.0, (time.time() - created_at) / 3600.0)
-            score += max(0, int(24 - min(age_hours, 24)))
-        return score
+        await self.queue.put({'kind': 'task', 'task_id': task.task_id, 'message_epoch': self._message_epoch})
 
-    def _extract_status_focus_terms(self, text: str) -> list[str]:
-        text = str(text or '').strip()
-        text = re.sub(r'(怎么样|咋样|如何|后续|进展|回复|回信|回我|回了|让你发的消息|消息|有|有没有|呢)', ' ', text)
-        text = re.sub(r'[^\w\u4e00-\u9fa5]+', ' ', text)
-        parts = [item.strip() for item in text.split() if item.strip()]
-        return parts[:8]
+    async def _handle_meta_summarize_diary(self, task: dict) -> str:
+        """将最旧的 50 条日记摘要合并为一条元总结。"""
+        payload = task.get('payload') or {}
+        scope_type = str(payload.get('scope_type') or '').strip()
+        scope_id = str(payload.get('scope_id') or '').strip()
+        if not scope_type or not scope_id:
+            return '缺少 scope 参数。'
+        candidates = await asyncio.to_thread(self.repo.get_meta_summary_candidates, scope_type, scope_id)
+        if not candidates:
+            return '没有需要元总结的日记摘要（可能已被其他任务处理）。'
+        prompt = self._build_meta_summary_prompt(scope_type, scope_id, candidates)
+        try:
+            reply = await self._complete_chat(
+                self._static_system_blocks(self._meta_summary_system_prompt()),
+                [{'role': 'user', 'content': prompt}],
+                None,
+                0.3,
+            )
+        except Exception as exc:
+            error(f'[AI][diary] meta-summarize failed scope={scope_type}:{scope_id} error={exc}')
+            return f'元总结失败: {exc}'
+        summary = (reply.text if reply else '').strip()
+        if not summary:
+            return '元总结结果为空。'
+        await asyncio.to_thread(self.repo.store_meta_summary, scope_type, scope_id, summary)
+        info(f'[AI][diary] meta-summarized scope={scope_type}:{scope_id} chars={len(summary)}')
+        return f'已合并 {len(candidates)} 条日记摘要为一条元总结。'
+
+    def _build_meta_summary_prompt(self, scope_type: str, scope_id: str, candidates: list[dict]) -> str:
+        lines = [f'以下是会话 {scope_type}:{scope_id} 的 {len(candidates)} 条历史日记摘要（从旧到新），请将它们合并浓缩为一条更精炼的元总结：', '']
+        for s in candidates:
+            idx = int(s.get('index', 0)) + 1
+            text = str(s.get('text') or '')[:400]
+            lines.append(f'【第{idx}段】{text}')
+        lines += ['', '请用简洁的中文段落将上述所有摘要浓缩为一条元总结，覆盖关键人物、重要事件、关系变化和核心结论，长度控制在500字以内。']
+        return '\n'.join(lines)
+
+    def _meta_summary_system_prompt(self) -> str:
+        return (
+            '你在为一个AI聊天机器人做日记摘要的二次浓缩（元总结）。'
+            '任务是将多段历史日记摘要合并为一条更精炼的元总结，以便AI在未来对话中能快速回顾很久以前的事。'
+            '总结要涵盖：主要人物及关系变化、重要事件、话题演变、AI的关键决策和结论。'
+            '用第三人称描述，保留关键细节，省略重复和无意义内容。'
+        )
+
+
+    def _build_diary_summary_prompt(self, scope_type: str, scope_id: str, messages: list[dict]) -> str:
+        lines = [f'以下是会话 {scope_type}:{scope_id} 的一段历史对话（共 {len(messages)} 条），请进行浓缩总结：', '']
+        for msg in messages:
+            src = str(msg.get('source_label') or msg.get('nickname') or msg.get('role') or '未知')
+            text = str(msg.get('text') or '')[:300]
+            if text:
+                lines.append(f'[{src}]: {text}')
+        lines += ['', '请用简洁的中文段落总结上述对话的核心内容、重要事件、话题走向及关键结论，长度控制在400字以内。']
+        return '\n'.join(lines)
+
+    def _diary_summary_system_prompt(self) -> str:
+        return (
+            '你在为一个AI聊天机器人总结历史对话记录。'
+            '任务是将一段对话历史提炼成简洁摘要，以便AI在未来的对话中能快速回顾过去发生的事。'
+            '总结要涵盖：对话主要话题、重要事件、涉及人物及关系、AI的关键行为和结论。'
+            '用第三人称描述，保留关键细节，省略无意义寒暄。'
+        )
 
     def _build_global_identity_context_for_message(self, message: ChatMessage, cleaned: str) -> str:
         lines: list[str] = []
@@ -3279,6 +4110,85 @@ class AIOrchestrator:
             if summary:
                 lines.append(summary)
         return '\n\n'.join(lines).strip()
+
+    async def _build_group_context(self, scope_type: str, scope_id: str) -> str:
+        """构建群聊前置上下文：群人数、群主、管理员列表、成员列表。
+
+        群人数 < 20 时列出全员；否则只列近期发言过的成员。
+
+        注意：NapCat 的 get_group_info 不返回 owner_id/admins，
+        owner/admin 信息只能从 get_group_member_list 的 role 字段获取。
+        """
+        if scope_type != 'group':
+            return ''
+        try:
+            members = await asyncio.to_thread(self.bot.get_group_member_list, int(scope_id))
+            member_count = len(members)
+
+            # 从成员列表中提取 owner 和 admin（通过 role 字段）
+            owner_id: str | None = None
+            owner_nick: str = ''
+            admin_list: list[dict] = []
+            member_map: dict[str, str] = {}
+            for m in members:
+                uid = str(m.get('user_id') or '')
+                nick = str(m.get('nickname') or m.get('card') or '')
+                role = str(m.get('role') or '').lower()
+                if uid:
+                    member_map[uid] = nick
+                if role == 'owner':
+                    owner_id = uid
+                    owner_nick = nick
+                elif role == 'admin':
+                    admin_list.append({'user_id': uid, 'nickname': nick})
+
+            parts = [f'群人数: {member_count}']
+
+            # 群主
+            if owner_id:
+                parts.append(f'群主: {owner_nick or owner_id}({owner_id})')
+
+            # 管理员
+            if admin_list:
+                admin_lines: list[str] = []
+                for a in admin_list:
+                    display = a['nickname'] or a['user_id']
+                    admin_lines.append(f'  - {display}({a["user_id"]})')
+                parts.append('管理员:' + '\n' + '\n'.join(admin_lines))
+            else:
+                parts.append('管理员: 无')
+
+            # 成员列表
+            if member_count < 20:
+                parts.append('群成员（全员）:')
+                for m in members:
+                    uid = str(m.get('user_id') or '')
+                    nick = member_map.get(uid) or str(uid)
+                    parts.append(f'  - {nick}({uid})')
+            else:
+                # 大群：从近期消息历史提取发言者
+                recent_msgs = await asyncio.to_thread(self.repo.list_messages, scope_type, scope_id)
+                speakers: dict[str, str] = {}
+                for msg in recent_msgs[-300:]:
+                    uid = str(msg.get('user_id') or '')
+                    nick = str(msg.get('nickname') or '')
+                    if uid and uid not in speakers:
+                        speakers[uid] = nick
+                # 确保 owner 和 admin 在列表里
+                if owner_id:
+                    speakers.setdefault(owner_id, owner_nick or owner_id)
+                for a in admin_list:
+                    aid = a['user_id']
+                    if aid and aid not in speakers:
+                        speakers[aid] = a['nickname'] or aid
+                parts.append(f'近期发言成员（共{len(speakers)}人）:')
+                for uid, nick in speakers.items():
+                    parts.append(f'  - {nick}({uid})')
+
+            return '\n'.join(parts)
+        except Exception as exc:
+            warn(f'[AI][group_context] failed scope={scope_type}:{scope_id} error={exc}')
+            return ''
 
     def _format_user_profile_summary(self, profile: dict | None, title: str) -> str:
         if not profile:
@@ -3528,6 +4438,7 @@ class AIOrchestrator:
             allow_notify_master=False,
             allow_search=False,
             allow_update_tools=True,
+            allow_config_tools=True,
         )
         try:
             for _ in range(5):
@@ -3548,7 +4459,7 @@ class AIOrchestrator:
                         result = await self._run_ai_tool_call('master', 'global', 'master:global', call.name, call.input)
                     else:
                         result = '本轮先处理查询/更新类工具，这个操作未执行；如仍需要，请在工具结果后再次调用。'
-                    result_blocks.append({'type': 'tool_result', 'tool_use_id': call.call_id, 'content': result})
+                    result_blocks.append({'type': 'tool_result', 'tool_use_id': call.call_id, 'content': result if result is not None else '（工具无返回）'})
                 master_messages.append({'role': 'assistant', 'content': self._filter_thinking_blocks(master_reply.raw_content)})
                 master_messages.append({'role': 'user', 'content': result_blocks})
         except Exception as exc:
@@ -3858,7 +4769,7 @@ class AIOrchestrator:
         if related_report:
             threshold = float(related_report.get('updated_at') or 0.0)
         for item in reversed(messages):
-            if item.get('user_id') == self.bot.self_id:
+            if str(item.get('user_id')) == str(self.bot.self_id):
                 continue
             timestamp = float(item.get('timestamp') or 0.0)
             if threshold and timestamp and timestamp < threshold:
@@ -3983,9 +4894,13 @@ class AIOrchestrator:
         origin_scope_id = payload.get('origin_scope_id')
         callback_only = bool(payload.get('callback_only'))
         followup_only = bool(payload.get('followup_only'))
+        # 情报查询：主AI 定期情报轮向子AI 拉取会话事件摘要，子AI 只回报、不发消息给用户。
+        intel_query = bool(payload.get('intel_query'))
+        intel_round_id = str(payload.get('intel_round_id') or '')
 
         agent = self.repo.get_or_create_agent(target_scope_type, target_scope_id)
-        history = self.repo.list_messages(target_scope_type, target_scope_id)
+        _dctx = self.repo.get_diary_context(target_scope_type, target_scope_id)
+        history = self._flatten_diary_context(_dctx)
         tool_logs = self.tools.list_tool_uses(target_scope_type, target_scope_id)
         global_identity_context = self._build_global_identity_context_for_scope(
             target_scope_type,
@@ -4005,6 +4920,7 @@ class AIOrchestrator:
             callback_only,
             followup_only,
             global_identity_context,
+            intel_query=intel_query,
         )
         reply_bundle, generation_ms, _used_tools = await self._complete_child_turn(
             target_scope_type,
@@ -4014,10 +4930,10 @@ class AIOrchestrator:
             0.75,
             run_epoch=run_epoch,
             context=self._build_tool_context_from_task(payload, instruction, agent.agent_id),
-            allow_notify_master=not callback_only,
-            allow_tasks=not callback_only,
+            allow_notify_master=not (callback_only or intel_query),
+            allow_tasks=not (callback_only or intel_query),
             turn_meta={
-                'turn_kind': 'delegate',
+                'turn_kind': 'intel_query' if intel_query else 'delegate',
                 'instruction': instruction,
                 'callback_only': callback_only,
                 'followup_only': followup_only,
@@ -4026,6 +4942,24 @@ class AIOrchestrator:
         )
         reply = str((reply_bundle or {}).get('message') or '')
         think_note = str((reply_bundle or {}).get('think_note') or '')
+
+        # 情报查询分支：把子AI 的会话事件摘要回报给情报轮状态机，绝不发消息给用户。
+        if intel_query:
+            report_text = (reply or think_note or '').strip()
+            await self._report_child_result(
+                agent.agent_id,
+                {
+                    'result_type': 'intel_report',
+                    'intel_round_id': intel_round_id,
+                    'target_scope_type': target_scope_type,
+                    'target_scope_id': target_scope_id,
+                    'instruction': instruction,
+                    'intel_report': report_text,
+                    'trace_id': payload.get('trace_id'),
+                },
+            )
+            return f'情报查询完成 {target_scope_type}:{target_scope_id}，已回报 {len(report_text)} 字。'
+
         if not reply:
             if not callback_only and not followup_only:
                 await self._report_child_result(
@@ -4089,6 +5023,10 @@ class AIOrchestrator:
         requester_name = str(payload.get('requester_name') or payload.get('requester_qq') or '').strip()
         sent_text = str(payload.get('sent_text') or '').strip()
         instruction = str(payload.get('instruction') or '').strip()
+
+        # 情报回报：来自定期情报轮的子AI 摘要，交给情报轮状态机处理，不走跨会话回信链路。
+        if result_type == 'intel_report':
+            return await self._handle_child_intelligence_report(payload)
 
         self.repo.add_note(
             'master',
@@ -4314,11 +5252,24 @@ class AIOrchestrator:
         callback_only: bool,
         followup_only: bool,
         global_identity_context: str,
+        intel_query: bool = False,
     ) -> str:
         history_lines = self._format_history_for_prompt(history)
         tool_log_lines = self._format_tool_logs_for_prompt(tool_logs)
         knowledge_lines = [f"- {item.get('content')}" for item in self.repo.get_knowledge_base() if str(item.get('content') or '').strip()]
-        if callback_only:
+        if intel_query:
+            action_prompt = (
+                "这是一次内部情报查询工单，不是新的人设，也不是要你发消息给用户。"
+                "你仍然是完整个体在这个会话里的分身，现在需要向自己的调度层回报本会话最近的情况。"
+                "【重要】不要发消息给用户，不要调用 send_message；直接用普通文字输出你的情报摘要即可。"
+                "请基于本会话最近的聊天记录，简明扼要地回报以下内容："
+                "①最近与角色性格/人设相关的事件或表现；"
+                "②本会话里人物关系、好感、态度的变化；"
+                "③值得主AI 关注的新情况或潜在需求。"
+                "如果本会话最近没有值得一提的事件，就直接回一句“无重要情报”。"
+                "只回报事实与观察，不要编造，控制在 200 字以内。"
+            )
+        elif callback_only:
             action_prompt = (
                 "这是一次临时结果回传工单，不是新的人设，也不是长期备注。"
                 "你还是同一个完整个体的分身，只是现在要替自己把最新结果回给当前会话。"
@@ -4744,22 +5695,20 @@ class AIOrchestrator:
             think_note=think_note,
             tool_context_messages=tool_context_messages,
         )
-        await asyncio.to_thread(
+        _has_pending = await asyncio.to_thread(
             self.repo.append_message,
             scope_type,
             scope_id,
             item,
             self.config.history_limit,
+            self.config.diary_size,
         )
+        if _has_pending:
+            await self._maybe_schedule_diary_summarization(scope_type, scope_id)
         if scope_type == 'group':
             scope_key = f'{scope_type}:{scope_id}'
             self._arm_group_reply_window(scope_key, scope_id)
         return item
-
-    def _at_if_needed(self, message: ChatMessage) -> str:
-        if message.chat_type == 'group':
-            return self.bot.at(message.user_id)
-        return ''
 
     def _arm_group_reply_window(self, scope_key: str, scope_id: str) -> None:
         existing = self._group_reply_windows.pop(scope_key, None)
@@ -4803,10 +5752,18 @@ class AIOrchestrator:
         except asyncio.CancelledError:
             pass
         finally:
-            self._group_reply_windows.pop(scope_key, None)
+            # 仅当窗口仍是本 runner 创建的那个实例时才清除，
+            # 防止 _arm_group_reply_window 取消旧任务后新建的窗口被误删。
+            if self._group_reply_windows.get(scope_key) is window:
+                self._group_reply_windows.pop(scope_key, None)
 
     def _fire_group_reply_trigger(self, scope_key: str, scope_id: str, epoch: int) -> None:
         if self._is_epoch_stale(epoch):
+            return
+        # 如果该 scope 正在处理消息或有积压的延迟消息，不触发防抖回复
+        # 避免 AI 在处理完积压消息后"冷不丁"接续旧对话
+        if scope_key in self._active_scope_turns or scope_key in self._pending_scope_turns:
+            debug(f'[AI][debounce] scope busy/pending, suppressing trigger for {scope_key}')
             return
         synthetic = ChatMessage(
             chat_type='group',
@@ -4907,6 +5864,248 @@ class AIOrchestrator:
             raw_data={'source': 'recurring_task', 'task_id': task['id']},
         )
         self._submit_message(synthetic)
+
+    # ── 定期情报轮（每 4 小时主AI 主动情报收集与分发） ──────────────────
+    async def _intelligence_scheduler_loop(self) -> None:
+        """按 cron(默认每4小时) 触发一轮 intelligence_round 任务。"""
+        try:
+            self._intel_next_run = self._calc_next_cron_run(self._intel_schedule)
+        except Exception as e:
+            error(f'[AI][intel] 初始化 cron 失败: {e}')
+            self._intel_next_run = time.time() + self._intel_active_window
+        while True:
+            try:
+                await asyncio.sleep(30)
+                now = time.time()
+                if now < (self._intel_next_run or 0):
+                    continue
+                # 计算下一次触发时间，避免重复触发
+                try:
+                    self._intel_next_run = self._calc_next_cron_run(self._intel_schedule, now)
+                except Exception:
+                    self._intel_next_run = now + self._intel_active_window
+                task = self.tools.create_task(
+                    'master:global',
+                    'intelligence_round',
+                    {'triggered_at': now, 'source': 'intel_scheduler'},
+                )
+                await self.queue.put(
+                    {'kind': 'task', 'task_id': task.task_id, 'message_epoch': self._message_epoch}
+                )
+                info(f"[AI][intel] 情报轮已触发 task={task.task_id[:8]}, 下次={self._intel_next_run:.0f}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                error(f'[AI][intel] scheduler error: {e}')
+
+    def _discover_active_scopes(self) -> list[tuple[str, str]]:
+        """遍历已知 agent，筛出最近 _intel_active_window 秒内有消息活动的会话。"""
+        now = time.time()
+        active: list[tuple[str, str]] = []
+        for agent in self.repo.list_agents():
+            scope_type = str(agent.get('scope_type') or '').strip()
+            scope_id = str(agent.get('scope_id') or '').strip()
+            if not scope_type or not scope_id:
+                continue
+            if scope_type == 'master':
+                continue
+            # 先用 agent.updated_at 做便宜的预筛，再用真实消息时间戳确认
+            if (now - float(agent.get('updated_at') or 0.0)) > self._intel_active_window:
+                continue
+            try:
+                messages = self.repo.list_messages(scope_type, scope_id)
+            except Exception:
+                messages = []
+            latest_ts = 0.0
+            for item in messages:
+                ts = self._coerce_timestamp(item.get('timestamp')) or 0.0
+                if ts > latest_ts:
+                    latest_ts = ts
+            if latest_ts and (now - latest_ts) <= self._intel_active_window:
+                active.append((scope_type, scope_id))
+        return active
+
+    async def _handle_intelligence_round(self, task: dict) -> str:
+        """情报轮主流程：发现活跃会话 -> 向各子AI 发情报查询 -> 登记状态机等回报。"""
+        round_id = str(task.get('task_id') or uuid.uuid4().hex[:12])
+        active_scopes = self._discover_active_scopes()
+        if not active_scopes:
+            self.repo.add_note('master', 'global', '[情报轮] 本轮未发现最近4小时内活跃的会话，跳过。')
+            return '情报轮：无活跃会话，跳过。'
+
+        now = time.time()
+        deadline = now + self._intel_report_timeout
+        waiting = {self._scope_key(st, sid) for st, sid in active_scopes}
+        self._intelligence_rounds[round_id] = {
+            'status': 'collecting',
+            'started_at': now,
+            'deadline': deadline,
+            'waiting': set(waiting),
+            'received': {},
+            'scopes': list(active_scopes),
+        }
+
+        intel_instruction = (
+            '这是一次内部情报查询：请回报本会话最近与角色性格、人设表现、'
+            '人物关系与态度变化相关的事件摘要，不要发消息给用户。'
+        )
+        for scope_type, scope_id in active_scopes:
+            query_task = self.tools.create_task(
+                'master:global',
+                'delegate_to_child',
+                {
+                    'target_scope_type': scope_type,
+                    'target_scope_id': scope_id,
+                    'instruction': intel_instruction,
+                    'callback_only': True,
+                    'intel_query': True,
+                    'intel_round_id': round_id,
+                    'requester_name': '定期情报轮',
+                    'trace_id': round_id,
+                },
+            )
+            self.queue.put_nowait(
+                {'kind': 'task', 'task_id': query_task.task_id, 'message_epoch': self._message_epoch}
+            )
+
+        # 超时兜底：到 deadline 仍未收齐则强制进入汇总
+        self.loop.create_task(self._intelligence_round_timeout(round_id))
+        self.repo.add_note(
+            'master',
+            'global',
+            f'[情报轮] 已向 {len(active_scopes)} 个活跃会话发出情报查询，round={round_id[:8]}。',
+        )
+        return f'情报轮已启动：向 {len(active_scopes)} 个活跃会话发出情报查询。'
+
+    async def _intelligence_round_timeout(self, round_id: str) -> None:
+        """5 分钟超时兜底：仍在收集中就用已收到的回报强制汇总。"""
+        state = self._intelligence_rounds.get(round_id)
+        if not state:
+            return
+        delay = max(1.0, float(state.get('deadline') or 0.0) - time.time())
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        state = self._intelligence_rounds.get(round_id)
+        if not state or state.get('status') != 'collecting':
+            return
+        missing = len(state.get('waiting') or set())
+        info(f'[AI][intel] round={round_id[:8]} 超时兜底，仍缺 {missing} 个回报，强制汇总。')
+        await self._finalize_intelligence_round(round_id, reason='timeout')
+
+    async def _handle_child_intelligence_report(self, payload: dict) -> str:
+        """接收子AI 的情报回报，更新状态机；收齐则进入汇总。"""
+        round_id = str(payload.get('intel_round_id') or payload.get('trace_id') or '')
+        scope_type = str(payload.get('target_scope_type') or '').strip()
+        scope_id = str(payload.get('target_scope_id') or '').strip()
+        report_text = str(payload.get('intel_report') or '').strip()
+        state = self._intelligence_rounds.get(round_id)
+        if not state:
+            # 轮次已结束或超时清理，仅记录
+            return f'情报回报到达，但情报轮 {round_id[:8]} 已结束，忽略。'
+        scope_key = self._scope_key(scope_type, scope_id)
+        state['received'][scope_key] = report_text
+        state['waiting'].discard(scope_key)
+        if not state['waiting'] and state.get('status') == 'collecting':
+            await self._finalize_intelligence_round(round_id, reason='all_reported')
+        return f'情报回报已登记 {scope_key}（剩余 {len(state["waiting"])} 个待回报）。'
+
+    async def _finalize_intelligence_round(self, round_id: str, reason: str = '') -> None:
+        """汇总分析所有回报，更新用户画像与主AI备忘，并分发给所有子AI。"""
+        state = self._intelligence_rounds.get(round_id)
+        if not state or state.get('status') != 'collecting':
+            return
+        state['status'] = 'finalizing'
+        received = dict(state.get('received') or {})
+        # 过滤掉无实质内容的回报
+        meaningful = {
+            k: v for k, v in received.items()
+            if v and v not in {'无重要情报', '无', '无重要情报。'}
+        }
+        if not meaningful:
+            state['status'] = 'done'
+            self.repo.add_note('master', 'global', f'[情报轮] round={round_id[:8]} 无实质情报，结束（{reason}）。')
+            self._intelligence_rounds.pop(round_id, None)
+            return
+
+        prompt = self._build_intelligence_analysis_prompt(meaningful, reason)
+        summary = ''
+        try:
+            reply = await self._complete_chat(
+                self._static_system_blocks(self._master_system_prompt()),
+                [{'role': 'user', 'content': prompt}],
+                None,
+                0.3,
+            )
+            summary = (reply.text if reply else '').strip()
+        except Exception as e:
+            error(f'[AI][intel] 汇总 LLM 调用失败 round={round_id[:8]}: {e}')
+
+        if summary:
+            self.repo.add_note('master', 'global', f'[情报轮汇总] {summary}')
+            admin_qq = str(getattr(self.config, 'admin_qq', 0) or '').strip()
+            if admin_qq and admin_qq != '0':
+                try:
+                    self.repo.add_user_fact(
+                        admin_qq,
+                        f'[情报轮画像] {summary[:200]}',
+                        source_scope_type='master',
+                        source_scope_id='global',
+                        source_agent='intelligence_round',
+                    )
+                except Exception as e:
+                    warn(f'[AI][intel] add_user_fact 失败: {e}')
+            await self._distribute_intelligence(summary, state)
+        else:
+            self.repo.add_note('master', 'global', f'[情报轮] round={round_id[:8]} 汇总为空，未分发。')
+
+        state['status'] = 'done'
+        self._intelligence_rounds.pop(round_id, None)
+
+    def _build_intelligence_analysis_prompt(self, reports: dict[str, str], reason: str = '') -> str:
+        """构造汇总分析 prompt：让主AI 汇总各会话回报、分析性格与关系变化。"""
+        lines = []
+        for scope_key, text in reports.items():
+            lines.append(f'【{scope_key}】\n{text}')
+        joined = '\n\n'.join(lines)
+        return (
+            f'当前时间: {self._now_text()}\n'
+            '你是主AI，刚刚完成了一轮定期情报收集。以下是各活跃会话的子AI 回报的情报摘要：\n\n'
+            f'{joined}\n\n'
+            '请你综合分析并输出一份简洁的情报汇总，包含：\n'
+            '1. 各角色/会话的性格模式与人设表现；\n'
+            '2. 值得注意的人物关系、好感或态度变化；\n'
+            '3. 对号主本人有价值的新画像信息（若有）；\n'
+            '4. 需要各子AI 后续注意或消化的要点。\n'
+            '控制在 300 字以内，用陈述式条理表达，不要编造未提及的信息。'
+        )
+
+    async def _distribute_intelligence(self, summary: str, state: dict) -> None:
+        """把汇总后的情报摘要分发给本轮所有活跃会话的子AI 消化（callback_only，不发用户）。"""
+        distribute_instruction = (
+            '这是主AI 汇总后回传给你的最新情报摘要，供你消化理解，不需要发消息给用户：\n'
+            f'{summary}\n'
+            '请结合本会话语境记住这些要点即可。'
+        )
+        for scope_type, scope_id in state.get('scopes') or []:
+            dist_task = self.tools.create_task(
+                'master:global',
+                'delegate_to_child',
+                {
+                    'target_scope_type': scope_type,
+                    'target_scope_id': scope_id,
+                    'instruction': distribute_instruction,
+                    'callback_only': True,
+                    'intel_query': True,
+                    'intel_round_id': f'distribute',
+                    'requester_name': '情报分发',
+                    'trace_id': f'intel_distribute',
+                },
+            )
+            self.queue.put_nowait(
+                {'kind': 'task', 'task_id': dist_task.task_id, 'message_epoch': self._message_epoch}
+            )
 
     async def _auto_update_check_loop(self) -> None:
         while True:

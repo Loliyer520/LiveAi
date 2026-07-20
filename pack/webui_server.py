@@ -130,6 +130,14 @@ class WebUIService:
                     else:
                         body['message'] = result
                     return self._write_json(body, status=200 if ok else 400)
+                if parsed.path == '/api/upstream_balance':
+                    ok, result = service.fetch_upstream_balance(payload)
+                    body = {'ok': ok}
+                    if ok:
+                        body['balance'] = result
+                    else:
+                        body['message'] = result
+                    return self._write_json(body, status=200 if ok else 400)
                 return self._write_json({'error': 'not found'}, status=404)
 
             def _read_json(self):
@@ -557,10 +565,9 @@ class WebUIService:
 
         # Return default structure
         return {
+            'upstreams': [],
             'channels': [],
-            'vision': {'strategy': 'random', 'models': []},
-            'main': {'strategy': 'random', 'models': []},
-            'tiered': {'strategy': 'random', 'models': []},
+            'roles': {},
         }
 
     def update_models_config(self, payload: dict) -> tuple[bool, str]:
@@ -625,6 +632,53 @@ class WebUIService:
             if item and item not in result:
                 result.append(item)
         return result
+
+    def fetch_upstream_balance(self, payload: dict) -> tuple[bool, str]:
+        """查询上游余额：优先尝试 OpenAI/Anthropic 官方路径，不支持则返回提示。"""
+        base_url = str((payload or {}).get('base_url') or '').strip().rstrip('/')
+        api_key = str((payload or {}).get('api_key') or '').strip()
+        if not base_url:
+            return False, '缺少 Base URL。'
+
+        headers = {'Authorization': f'Bearer {api_key}', 'x-api-key': api_key, 'Accept': 'application/json'}
+        base = base_url.rstrip('/')
+        # 去掉末尾 /v1 或 /anthropic 等路径，尝试根路径
+        candidates_base = [base]
+        for suffix in ('/anthropic', '/v1', '/compatible-mode/v1'):
+            if base.endswith(suffix):
+                candidates_base.append(base[:-len(suffix)])
+
+        balance_paths = [
+            '/dashboard/billing/credit_grants',
+            '/v1/dashboard/billing/credit_grants',
+            '/dashboard/billing/subscription',
+        ]
+        for cb in candidates_base:
+            for path in balance_paths:
+                url = cb.rstrip('/') + path
+                try:
+                    resp = requests.get(url, headers=headers, timeout=10)
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                        except ValueError:
+                            continue
+                        # OpenAI credit_grants 格式
+                        total = data.get('total_granted') or data.get('hard_limit_usd')
+                        used = data.get('total_used')
+                        remaining = data.get('total_available') or data.get('soft_limit_usd')
+                        if total is not None or remaining is not None:
+                            parts = []
+                            if remaining is not None:
+                                parts.append(f'剩余 ${float(remaining):.2f}')
+                            if used is not None:
+                                parts.append(f'已用 ${float(used):.2f}')
+                            if total is not None:
+                                parts.append(f'总额 ${float(total):.2f}')
+                            return True, ' | '.join(parts) if parts else str(data)
+                except Exception:
+                    continue
+        return False, '该上游不支持余额查询（未找到标准接口）。'
 
     def fetch_channel_models(self, payload: dict) -> tuple[bool, list[str] | str]:
         """从渠道接口拉取模型列表"""

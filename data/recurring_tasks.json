@@ -1,0 +1,26 @@
+{
+  "tasks": {
+    "477ba19b-7552-46eb-be68-b2d428001b68": {
+      "id": "477ba19b-7552-46eb-be68-b2d428001b68",
+      "schedule": "0 * * * *",
+      "instruction": "Phase2主AI升级已由agent 6a0696bf88a0完成（代码编译通过、已备份）。本轮检查：用list_agents看还有没有卡死/超时的常驻agent，有就peek确认、必要时销毁；确认渠道（克劳德=ccm→kiro→aipai）是否可用；把简短进度/状态简报发给洛神赋(private:241898129)。如无异常一句话报平安即可。",
+      "target_scope": "private:241898129",
+      "enabled": true,
+      "created_at": 1784391158.7101877,
+      "last_run": 1784520010.284621,
+      "next_run": 1784523600.0,
+      "creator_scope": "private:241898129"
+    },
+    "da790434-0230-49eb-810e-54b27da4317d": {
+      "id": "da790434-0230-49eb-810e-54b27da4317d",
+      "schedule": "*/30 * * * *",
+      "instruction": "检查群 1090088365 的 agent 进度：用 peek_agent 查 2a6cbee2e5c8（MC autoplay minecraft-data-generator）的状态。qqbot.vue（4ff76f57414b）已完成无需再管。有进展播报，报错/超时就重建。",
+      "target_scope": "group:1090088365",
+      "enabled": true,
+      "created_at": 1784391447.5822184,
+      "last_run": 1784521810.5165064,
+      "next_run": 1784523600.0,
+      "creator_scope": "group:1090088365"
+    }
+  }
+}

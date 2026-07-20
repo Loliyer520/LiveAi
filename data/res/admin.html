@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0">
   <title>砂糖云 - 控制台</title>
   <style>
     :root {
@@ -38,15 +38,33 @@
       }
     }
     * { box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; background: #333333; color: var(--text-main); height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+    html, body { height: 100%; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #333333; color: var(--text-main); height: 100dvh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
     
     .window-wrapper { width: 92vw; max-width: 1200px; height: 85vh; max-height: 850px; display: flex; flex-direction: column; background: var(--bg-main); border-radius: 8px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5); overflow: hidden; border: 1px solid var(--border); }
+    
+    /* 小屏幕自适应全屏 */
+    @media (max-width: 768px) {
+      body { height: 100%; } /* Fallback for browsers that don't support dvh */
+      body { height: 100dvh; }
+      .window-wrapper { 
+        width: 100%; 
+        max-width: none; 
+        height: 100%; 
+        max-height: none; 
+        border-radius: 0; 
+        border: none; 
+        box-shadow: none; 
+      }
+      .sidebar { width: 200px; } /* 稍微收窄侧边栏以给聊天区域留出空间 */
+    }
     
     .app-container { display: flex; flex: 1; overflow: hidden; }
 
     /* Main Nav */
-    .main-nav { width: 60px; flex-shrink: 0; background: var(--bg-nav); display: flex; flex-direction: column; align-items: center; padding: 20px 0; gap: 20px; z-index: 10; border-right: 1px solid var(--border); }
-    .nav-avatar { width: 36px; height: 36px; border-radius: 50%; background: #ccc; overflow: hidden; position: relative; overflow: visible; }
+    .main-nav { width: 60px; flex-shrink: 0; background: var(--bg-nav); display: flex; flex-direction: column; align-items: center; padding: 20px 0; gap: 20px; z-index: 10; border-right: 1px solid var(--border); overflow-y: auto; overflow-x: hidden; }
+    .main-nav::-webkit-scrollbar { display: none; } /* 隐藏滚动条让侧边更清爽 */
+    .nav-avatar { width: 36px; height: 36px; border-radius: 50%; background: #ccc; overflow: hidden; position: relative; overflow: visible; flex-shrink: 0; }
     .nav-avatar::after { content: ''; position: absolute; bottom: 0; right: 0; width: 10px; height: 10px; background: #4caf50; border-radius: 50%; border: 2px solid var(--bg-nav); }
     .nav-item { width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border-radius: 8px; color: var(--text-muted); cursor: pointer; transition: 0.2s; }
     .nav-item:hover { background: rgba(0,0,0,0.05); color: var(--text-main); }
@@ -163,8 +181,8 @@
     .model-item-remove:hover { background: #fee; color: #e53935; border-color: #e53935; }
     .btn-sm { padding: 6px 12px; font-size: 13px; border-radius: 10px; }
 
-    /* Channel Item */
-    .channel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+    /* 上游/渠道 卡片通用 */
+    .channel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
     .channel-item { border: 1px solid var(--border); border-radius: 18px; background: linear-gradient(180deg, var(--bg-panel), var(--bg-main)); padding: 16px; box-shadow: 0 8px 26px rgba(0,0,0,0.05); transition: 0.18s ease; }
     .channel-item:hover { transform: translateY(-1px); box-shadow: 0 10px 30px rgba(0,0,0,0.08); }
     .channel-item-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
@@ -173,9 +191,19 @@
     .channel-item-body { display: grid; gap: 11px; }
     .channel-field { display: flex; flex-direction: column; gap: 5px; }
     .channel-field label { font-size: 12px; color: var(--text-muted); }
-    .channel-field input { padding: 9px 11px; border-radius: 11px; border: 1px solid var(--border); background: var(--bg-panel); color: var(--text-main); outline: none; font-size: 13px; }
-    .channel-field input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0,153,255,0.08); }
+    .channel-field input, .channel-field select { padding: 9px 11px; border-radius: 11px; border: 1px solid var(--border); background: var(--bg-panel); color: var(--text-main); outline: none; font-size: 13px; }
+    .channel-field input:focus, .channel-field select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0,153,255,0.08); }
     .model-fetch-status { font-size: 11px; color: var(--text-muted); min-width: 70px; }
+    /* 渠道内嵌模型列表 */
+    .ch-model-row { display: flex; align-items: center; gap: 6px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+    .ch-model-row:last-child { border-bottom: none; }
+    .ch-model-row select, .ch-model-row input { flex: 1; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-main); color: var(--text-main); font-size: 12px; outline: none; }
+    /* 角色映射 */
+    .role-table { width: 100%; border-collapse: collapse; }
+    .role-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+    .role-table tr:last-child td { border-bottom: none; }
+    .role-table td:first-child { color: var(--text-muted); width: 140px; }
+    .role-table select { width: 100%; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg-panel); color: var(--text-main); font-size: 13px; outline: none; }
   </style>
 </head>
 <body>
@@ -187,9 +215,7 @@
       <div class="nav-avatar"></div>
       <div class="nav-item active" title="聊天" id="navChat" onclick="switchMainView('chat')"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg></div>
       <div class="nav-item" title="联系人" id="navContacts" onclick="switchMainView('contacts')"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg></div>
-      <div class="nav-item" title="收藏"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg></div>
       <div style="flex: 1"></div>
-      <div class="nav-item" title="设备"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect><line x1="12" y1="18" x2="12.01" y2="18"></line></svg></div>
       <div class="nav-item" title="关系网" onclick="openRelationsModal()"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line></svg></div>
       <div class="nav-item" title="知识库" onclick="openKnowledgeModal()"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path></svg></div>
       <div class="nav-item" title="模型配置" onclick="openModelsModal()"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg></div>
@@ -424,26 +450,42 @@
     </div>
   </div>
 
-  <!-- Models Modal -->
+  <!-- Models Modal — 三级：上游 / 渠道 / 模型角色 -->
   <div class="modal-backdrop" id="modelsModal" onclick="closeModelsModal(event)">
-    <div class="modal-card" style="width: min(900px, 95%);">
+    <div class="modal-card" style="width: min(960px, 95%);">
       <div class="modal-header">
         <div>模型配置</div>
         <button class="btn btn-secondary" onclick="forceCloseModelsModal()">关闭</button>
       </div>
 
       <!-- Tab navigation -->
-      <div style="display: flex; border-bottom: 1px solid var(--border); padding: 0 18px;">
-        <div class="model-tab active" onclick="switchModelTab('channels')">渠道</div>
-        <div class="model-tab" onclick="switchModelTab('models')">模型</div>
+      <div style="display:flex; border-bottom:1px solid var(--border); padding:0 18px;">
+        <div class="model-tab active" id="tab-upstreams" onclick="switchModelTab('upstreams')">上游</div>
+        <div class="model-tab" id="tab-channels" onclick="switchModelTab('channels')">渠道</div>
+        <div class="model-tab" id="tab-roles" onclick="switchModelTab('roles')">模型角色</div>
       </div>
 
-      <!-- Channels Tab -->
-      <div class="modal-body" id="channelsTab">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; gap:12px;">
+      <!-- Tab: 上游 -->
+      <div class="modal-body" id="upstreamsTab">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;">
           <div>
-            <div style="font-size: 15px; font-weight:700; color:var(--text-main);">渠道管理</div>
-            <div style="font-size: 13px; color: var(--text-muted); margin-top:3px;">配置多个 API 渠道以实现负载均衡和容错</div>
+            <div style="font-size:15px;font-weight:700;color:var(--text-main);">上游管理</div>
+            <div style="font-size:13px;color:var(--text-muted);margin-top:3px;">配置 API 提供方（base_url + key），可拉取模型列表和查询余额</div>
+          </div>
+          <div style="display:flex;gap:8px;">
+            <button class="btn btn-secondary" onclick="saveModelsConfig()">保存</button>
+            <button class="btn btn-primary" onclick="addUpstream()">+ 添加上游</button>
+          </div>
+        </div>
+        <div id="upstreamsList" class="channel-grid"></div>
+      </div>
+
+      <!-- Tab: 渠道 -->
+      <div class="modal-body" id="channelsTab" style="display:none;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;">
+          <div>
+            <div style="font-size:15px;font-weight:700;color:var(--text-main);">渠道管理</div>
+            <div style="font-size:13px;color:var(--text-muted);margin-top:3px;">每个渠道包含一组模型条目，可配置轮询策略</div>
           </div>
           <div style="display:flex;gap:8px;">
             <button class="btn btn-secondary" onclick="saveModelsConfig()">保存</button>
@@ -453,62 +495,12 @@
         <div id="channelsList" class="channel-grid"></div>
       </div>
 
-      <!-- Models Tab -->
-      <div class="modal-body" id="modelsTab" style="display: none;">
-        <div style="font-size: 14px; color: var(--text-muted); margin-bottom: 16px;">为不同功能配置模型，支持多模型轮询</div>
-
-        <!-- Vision Model Section -->
-        <div class="model-function-section">
-          <div class="model-function-header">
-            <div class="model-function-title">图片解析模型 (Vision)</div>
-            <button class="btn btn-primary btn-sm" onclick="addModelToFunction('vision')">+ 添加</button>
-          </div>
-          <div class="model-rotation-strategy">
-            <label>轮询策略:</label>
-            <select id="visionRotationStrategy">
-              <option value="random">每次随机选择</option>
-              <option value="roundrobin">每次轮询</option>
-              <option value="fallback">失败时轮询</option>
-            </select>
-          </div>
-          <div id="visionModelsList" class="models-list"></div>
-        </div>
-
-        <!-- Main AI Model Section -->
-        <div class="model-function-section">
-          <div class="model-function-header">
-            <div class="model-function-title">主 AI 模型</div>
-            <button class="btn btn-primary btn-sm" onclick="addModelToFunction('main')">+ 添加</button>
-          </div>
-          <div class="model-rotation-strategy">
-            <label>轮询策略:</label>
-            <select id="mainRotationStrategy">
-              <option value="random">每次随机选择</option>
-              <option value="roundrobin">每次轮询</option>
-              <option value="fallback">失败时轮询</option>
-            </select>
-          </div>
-          <div id="mainModelsList" class="models-list"></div>
-        </div>
-
-        <!-- Tiered AI Models Section -->
-        <div class="model-function-section">
-          <div class="model-function-header">
-            <div class="model-function-title">分级 AI 模型</div>
-            <button class="btn btn-primary btn-sm" onclick="addModelToFunction('tiered')">+ 添加</button>
-          </div>
-          <div class="model-rotation-strategy">
-            <label>轮询策略:</label>
-            <select id="tieredRotationStrategy">
-              <option value="random">每次随机选择</option>
-              <option value="roundrobin">每次轮询</option>
-              <option value="fallback">失败时轮询</option>
-            </select>
-          </div>
-          <div id="tieredModelsList" class="models-list"></div>
-        </div>
-
-        <div style="margin-top: 20px; text-align: right;">
+      <!-- Tab: 模型角色 -->
+      <div class="modal-body" id="rolesTab" style="display:none;">
+        <div style="font-size:15px;font-weight:700;color:var(--text-main);margin-bottom:4px;">模型角色</div>
+        <div style="font-size:13px;color:var(--text-muted);margin-bottom:18px;">为每个 AI 角色绑定一个渠道，渠道决定实际使用哪些模型及轮询方式</div>
+        <table class="role-table" id="rolesTable"></table>
+        <div style="margin-top:20px;text-align:right;">
           <button class="btn btn-primary" onclick="saveModelsConfig()">保存配置</button>
         </div>
       </div>
@@ -1561,232 +1553,191 @@
     }
 
     // ── Models Modal Functions ──
-    let modelsConfig = {
-      channels: [],
-      vision: { strategy: 'random', models: [] },
-      main: { strategy: 'random', models: [] },
-      tiered: { strategy: 'random', models: [] }
-    };
-    const channelModelCache = {};
+    let modelsConfig = { upstreams: [], channels: [], roles: {} };
+    const upstreamModelCache = {};
 
     async function openModelsModal() {
       document.getElementById('modelsModal').classList.add('open');
       await loadModelsConfig();
-      renderChannels();
-      renderModels();
     }
-
     function closeModelsModal(event) {
-      if (event.target && event.target.id === 'modelsModal') {
-        forceCloseModelsModal();
-      }
+      if (event.target && event.target.id === 'modelsModal') forceCloseModelsModal();
     }
-
     function forceCloseModelsModal() {
       document.getElementById('modelsModal').classList.remove('open');
     }
 
     function switchModelTab(tab) {
-      const tabs = document.querySelectorAll('.model-tab');
-      tabs.forEach(t => t.classList.remove('active'));
-      event.target.classList.add('active');
-
-      if (tab === 'channels') {
-        document.getElementById('channelsTab').style.display = 'block';
-        document.getElementById('modelsTab').style.display = 'none';
-      } else {
-        document.getElementById('channelsTab').style.display = 'none';
-        document.getElementById('modelsTab').style.display = 'block';
-      }
+      ['upstreams','channels','roles'].forEach(t => {
+        document.getElementById(t+'Tab').style.display = t===tab ? 'block' : 'none';
+        const el = document.getElementById('tab-'+t);
+        if (el) el.classList.toggle('active', t===tab);
+      });
     }
 
     async function loadModelsConfig() {
       try {
         const data = await fetchJson('/api/models_config');
-        modelsConfig = data;
-        modelsConfig.channels = modelsConfig.channels || [];
-        for (const key of ['vision', 'main', 'tiered']) {
-          modelsConfig[key] = modelsConfig[key] || {};
-          modelsConfig[key].models = modelsConfig[key].models || [];
-          modelsConfig[key].strategy = modelsConfig[key].strategy || 'fallback';
-        }
-        document.getElementById('visionRotationStrategy').value = modelsConfig.vision.strategy || 'random';
-        document.getElementById('mainRotationStrategy').value = modelsConfig.main.strategy || 'random';
-        document.getElementById('tieredRotationStrategy').value = modelsConfig.tiered.strategy || 'random';
-      } catch (err) {
-        console.error('加载模型配置失败:', err);
-      }
+        modelsConfig.upstreams = data.upstreams || [];
+        modelsConfig.channels = data.channels || [];
+        modelsConfig.roles = data.roles || {};
+        renderUpstreams(); renderChannels(); renderRoles();
+      } catch (err) { console.error('加载模型配置失败:', err); }
     }
 
-    function renderChannels() {
-      const container = document.getElementById('channelsList');
-      if (!modelsConfig.channels.length) {
-        container.innerHTML = '<div style="font-size:13px;color:var(--text-muted);padding:20px;text-align:center;grid-column:1/-1;">暂无渠道，点击右上角添加</div>';
+    // ── 上游 ──
+    function renderUpstreams() {
+      const c = document.getElementById('upstreamsList');
+      if (!modelsConfig.upstreams.length) {
+        c.innerHTML = '<div style="font-size:13px;color:var(--text-muted);padding:20px;text-align:center;grid-column:1/-1;">暂无上游，点击右上角添加</div>';
         return;
       }
-      container.innerHTML = modelsConfig.channels.map((ch, idx) => `
+      c.innerHTML = modelsConfig.upstreams.map((u,i) => `
         <div class="channel-item">
           <div class="channel-item-header">
-            <div class="channel-item-title"><span class="channel-badge">${idx + 1}</span>${escapeHtml(ch.name || '未命名渠道')}</div>
-            <button class="model-item-remove" onclick="removeChannel(${idx})" title="删除">×</button>
+            <div class="channel-item-title"><span class="channel-badge">${i+1}</span>${escapeHtml(u.name||'未命名')}</div>
+            <button class="model-item-remove" onclick="removeUpstream(${i})" title="删除">×</button>
           </div>
           <div class="channel-item-body">
-            <div class="channel-field">
-              <label>渠道名称</label>
-              <input type="text" value="${escapeHtml(ch.name || '')}" oninput="updateChannelField(${idx}, 'name', this.value)" placeholder="例如: DeepSeek 主渠道">
+            <div class="channel-field"><label>名称</label>
+              <input type="text" value="${escapeHtml(u.name||'')}" oninput="updateUpstreamField(${i},'name',this.value)" placeholder="例如: deepseek">
             </div>
-            <div class="channel-field">
-              <label>Base URL</label>
-              <input type="text" value="${escapeHtml(ch.base_url || '')}" oninput="updateChannelField(${idx}, 'base_url', this.value)" placeholder="https://api.example.com">
+            <div class="channel-field"><label>Base URL</label>
+              <input type="text" value="${escapeHtml(u.base_url||'')}" oninput="updateUpstreamField(${i},'base_url',this.value)" placeholder="https://api.example.com">
             </div>
-            <div class="channel-field">
-              <label>API Key</label>
-              <input type="password" value="${escapeHtml(ch.api_key || '')}" oninput="updateChannelField(${idx}, 'api_key', this.value)" placeholder="sk-...">
+            <div class="channel-field"><label>API Key</label>
+              <input type="password" value="${escapeHtml(u.api_key||'')}" oninput="updateUpstreamField(${i},'api_key',this.value)" placeholder="sk-...">
             </div>
-            <div class="channel-field">
-              <label>Messages Path <span style="color:var(--text-muted);font-size:11px;">Anthropic 兼容接口一般填 /v1/messages</span></label>
-              <input type="text" value="${escapeHtml(ch.messages_path || '')}" oninput="updateChannelField(${idx}, 'messages_path', this.value)" placeholder="/v1/messages">
+            <div class="channel-field"><label>Messages Path <span style="color:var(--text-muted);font-size:11px;">Anthropic 接口填 /v1/messages，OpenAI 留空</span></label>
+              <input type="text" value="${escapeHtml(u.messages_path||'')}" oninput="updateUpstreamField(${i},'messages_path',this.value)" placeholder="/v1/messages">
             </div>
-            <div style="display:flex;align-items:center;gap:8px;margin-top:2px;">
-              <button class="btn btn-secondary btn-sm" onclick="fetchChannelModels(${idx})">拉取模型列表</button>
-              <span class="model-fetch-status" id="channelFetchStatus_${idx}">${channelModelCache[idx] ? channelModelCache[idx].length + ' 个模型' : ''}</span>
+            <div style="display:flex;align-items:center;gap:8px;margin-top:2px;flex-wrap:wrap;">
+              <button class="btn btn-secondary btn-sm" onclick="fetchUpstreamModels(${i})">拉取模型</button>
+              <button class="btn btn-secondary btn-sm" onclick="queryUpstreamBalance(${i})">查询余额</button>
+              <span class="model-fetch-status" id="upstreamStatus_${i}">${upstreamModelCache[u.name]?upstreamModelCache[u.name].length+' 个模型':''}</span>
             </div>
           </div>
-        </div>
-      `).join('');
+        </div>`).join('');
+    }
+    function addUpstream() {
+      modelsConfig.upstreams.push({name:'',base_url:'',api_key:'',messages_path:''});
+      renderUpstreams();
+    }
+    function removeUpstream(i) {
+      if (!confirm('确认删除此上游？')) return;
+      modelsConfig.upstreams.splice(i,1); renderUpstreams();
+    }
+    function updateUpstreamField(i,f,v) { modelsConfig.upstreams[i][f]=v; }
+
+    async function fetchUpstreamModels(i) {
+      const u = modelsConfig.upstreams[i];
+      if (!u?.base_url) { alert('请先填写 Base URL'); return; }
+      const st = document.getElementById('upstreamStatus_'+i);
+      if (st) st.textContent='拉取中...';
+      try {
+        const data = await fetchJson('/api/channel_models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base_url:u.base_url,api_key:u.api_key})});
+        const name = u.name||String(i);
+        upstreamModelCache[name] = data.models||[];
+        if (st) st.textContent=upstreamModelCache[name].length+' 个模型';
+        renderChannels();
+      } catch(err) { if(st) st.textContent='拉取失败'; alert('拉取失败: '+err.message); }
     }
 
-    function addChannel() {
-      modelsConfig.channels.push({ name: '', base_url: '', api_key: '', messages_path: '' });
-      renderChannels();
+    async function queryUpstreamBalance(i) {
+      const u = modelsConfig.upstreams[i];
+      if (!u?.base_url) { alert('请先填写 Base URL'); return; }
+      const st = document.getElementById('upstreamStatus_'+i);
+      if (st) st.textContent='查询中...';
+      try {
+        const data = await fetchJson('/api/upstream_balance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base_url:u.base_url,api_key:u.api_key})});
+        if (st) st.textContent=data.ok?data.balance:'不支持余额查询';
+        if (!data.ok) alert(data.message||'不支持余额查询');
+      } catch(err) { if(st) st.textContent='查询失败'; }
     }
 
-    function removeChannel(idx) {
-      if (!confirm('确认删除此渠道？')) return;
-      modelsConfig.channels.splice(idx, 1);
-      renderChannels();
-    }
-
-    function updateChannelField(idx, field, value) {
-      modelsConfig.channels[idx][field] = value;
-    }
-
-    function renderModels() {
-      renderModelFunction('vision', modelsConfig.vision.models);
-      renderModelFunction('main', modelsConfig.main.models);
-      renderModelFunction('tiered', modelsConfig.tiered.models);
-    }
-
-    function renderModelFunction(funcName, models) {
-      const container = document.getElementById(`${funcName}ModelsList`);
-      if (!models.length) {
-        container.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:10px;">暂无模型，点击右上角添加</div>';
+    // ── 渠道 ──
+    function renderChannels() {
+      const c = document.getElementById('channelsList');
+      if (!modelsConfig.channels.length) {
+        c.innerHTML = '<div style="font-size:13px;color:var(--text-muted);padding:20px;text-align:center;grid-column:1/-1;">暂无渠道，点击右上角添加</div>';
         return;
       }
-      container.innerHTML = models.map((m, idx) => {
-        const channelIdx = String(m.channel ?? '');
-        const cachedModels = channelModelCache[channelIdx] || [];
-        const modelOptions = cachedModels.map(modelId => `
-          <option value="${escapeHtml(modelId)}" ${m.model_name === modelId ? 'selected' : ''}>${escapeHtml(modelId)}</option>
-        `).join('');
-        return `
-          <div class="model-item">
-            <div class="model-item-inputs">
-              <select onchange="updateModelChannel('${funcName}', ${idx}, this.value)">
-                <option value="">选择渠道</option>
-                ${modelsConfig.channels.map((ch, chIdx) => `
-                  <option value="${chIdx}" ${m.channel == chIdx ? 'selected' : ''}>${escapeHtml(ch.name || '渠道 ' + (chIdx + 1))}</option>
-                `).join('')}
-              </select>
-              ${cachedModels.length ? `
-                <select onchange="updateModelField('${funcName}', ${idx}, 'model_name', this.value)">
-                  <option value="">选择模型</option>
-                  ${m.model_name && !cachedModels.includes(m.model_name) ? `<option value="${escapeHtml(m.model_name)}" selected>${escapeHtml(m.model_name)}</option>` : ''}
-                  ${modelOptions}
-                </select>
-              ` : `
-                <input type="text" value="${escapeHtml(m.model_name || '')}" onchange="updateModelField('${funcName}', ${idx}, 'model_name', this.value)" placeholder="模型名称，例如: claude-sonnet-4-6">
-              `}
-              <button class="btn btn-secondary btn-sm" onclick="fetchModelsForModelRow('${funcName}', ${idx})">拉取</button>
-            </div>
-            <button class="model-item-remove" onclick="removeModel('${funcName}', ${idx})" title="删除">×</button>
+      c.innerHTML = modelsConfig.channels.map((ch,ci) => {
+        const strategy = ch.strategy||'fallback';
+        const modelRows = (ch.models||[]).map((m,mi) => {
+          const cached = upstreamModelCache[m.upstream]||[];
+          const opts = cached.map(id=>`<option value="${escapeHtml(id)}" ${m.model_id===id?'selected':''}>${escapeHtml(id)}</option>`).join('');
+          return `<div class="ch-model-row">
+            <select onchange="updateChannelModelField(${ci},${mi},'upstream',this.value);renderChannels()">
+              <option value="">选择上游</option>
+              ${modelsConfig.upstreams.map(u=>`<option value="${escapeHtml(u.name||'')}" ${m.upstream===(u.name||'')?'selected':''}>${escapeHtml(u.name||'')}</option>`).join('')}
+            </select>
+            ${cached.length?`<select onchange="updateChannelModelField(${ci},${mi},'model_id',this.value)"><option value="">选择模型</option>${opts}</select>`
+              :`<input type="text" value="${escapeHtml(m.model_id||'')}" placeholder="模型ID" oninput="updateChannelModelField(${ci},${mi},'model_id',this.value)">`}
+            <button class="model-item-remove" onclick="removeChannelModel(${ci},${mi})" style="width:24px;height:24px;min-width:24px;">×</button>
+          </div>`;
+        }).join('');
+        return `<div class="channel-item">
+          <div class="channel-item-header">
+            <div class="channel-item-title"><span class="channel-badge">${ci+1}</span>${escapeHtml(ch.name||'未命名渠道')}</div>
+            <button class="model-item-remove" onclick="removeChannel(${ci})" title="删除">×</button>
           </div>
-        `;
+          <div class="channel-item-body">
+            <div class="channel-field"><label>渠道名称</label>
+              <input type="text" value="${escapeHtml(ch.name||'')}" oninput="updateChannelField(${ci},'name',this.value)" placeholder="例如: 主力渠道">
+            </div>
+            <div class="channel-field"><label>轮询策略</label>
+              <select onchange="updateChannelField(${ci},'strategy',this.value)">
+                <option value="fallback" ${strategy==='fallback'?'selected':''}>失败时轮询</option>
+                <option value="random" ${strategy==='random'?'selected':''}>每次随机</option>
+                <option value="roundrobin" ${strategy==='roundrobin'?'selected':''}>每次轮询</option>
+              </select>
+            </div>
+            <div>
+              <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">模型列表</div>
+              ${modelRows||'<div style="font-size:12px;color:var(--text-muted);padding:6px 0;">暂无模型</div>'}
+              <button class="btn btn-secondary btn-sm" style="margin-top:8px;" onclick="addChannelModel(${ci})">+ 添加模型</button>
+            </div>
+          </div>
+        </div>`;
+      }).join('');
+    }
+    function addChannel() {
+      modelsConfig.channels.push({name:'',strategy:'fallback',models:[]});
+      switchModelTab('channels'); renderChannels();
+    }
+    function removeChannel(ci) {
+      if (!confirm('确认删除此渠道？')) return;
+      modelsConfig.channels.splice(ci,1); renderChannels(); renderRoles();
+    }
+    function updateChannelField(ci,f,v) { modelsConfig.channels[ci][f]=v; }
+    function addChannelModel(ci) {
+      (modelsConfig.channels[ci].models=modelsConfig.channels[ci].models||[]).push({upstream:'',model_id:''});
+      renderChannels();
+    }
+    function removeChannelModel(ci,mi) { modelsConfig.channels[ci].models.splice(mi,1); renderChannels(); }
+    function updateChannelModelField(ci,mi,f,v) { modelsConfig.channels[ci].models[mi][f]=v; }
+
+    // ── 模型角色 ──
+    const ROLE_LABELS = {main:'主AI',tiered:'分级AI',agent:'Agent',dev_agent:'Task/DevAgent',vision:'视觉'};
+    function renderRoles() {
+      const t = document.getElementById('rolesTable');
+      t.innerHTML = Object.entries(ROLE_LABELS).map(([role,label]) => {
+        const cur = modelsConfig.roles[role]||'';
+        return `<tr><td>${label}<br><span style="font-size:11px;color:var(--text-muted);">${role}</span></td><td>
+          <select onchange="modelsConfig.roles['${role}']=this.value">
+            <option value="">— 未绑定 —</option>
+            ${modelsConfig.channels.map(ch=>`<option value="${escapeHtml(ch.name||'')}" ${cur===(ch.name||'')?'selected':''}>${escapeHtml(ch.name||'未命名')}</option>`).join('')}
+          </select></td></tr>`;
       }).join('');
     }
 
-    function addModelToFunction(funcName) {
-      modelsConfig[funcName].models.push({ channel: '', model_name: '' });
-      renderModelFunction(funcName, modelsConfig[funcName].models);
-    }
-
-    function removeModel(funcName, idx) {
-      modelsConfig[funcName].models.splice(idx, 1);
-      renderModelFunction(funcName, modelsConfig[funcName].models);
-    }
-
-    function updateModelField(funcName, idx, field, value) {
-      modelsConfig[funcName].models[idx][field] = value;
-    }
-
-    function updateModelChannel(funcName, idx, value) {
-      modelsConfig[funcName].models[idx].channel = value;
-      modelsConfig[funcName].models[idx].model_name = '';
-      renderModelFunction(funcName, modelsConfig[funcName].models);
-    }
-
-    async function fetchChannelModels(idx) {
-      const ch = modelsConfig.channels[idx];
-      if (!ch || !ch.base_url) {
-        alert('请先填写渠道 Base URL');
-        return;
-      }
-      const status = document.getElementById(`channelFetchStatus_${idx}`);
-      if (status) status.textContent = '拉取中...';
-      try {
-        const data = await fetchJson('/api/channel_models', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ base_url: ch.base_url, api_key: ch.api_key }),
-        });
-        channelModelCache[idx] = data.models || [];
-        if (status) status.textContent = `${channelModelCache[idx].length} 个模型`;
-        renderModels();
-      } catch (err) {
-        if (status) status.textContent = '拉取失败';
-        alert('拉取失败: ' + err.message);
-      }
-    }
-
-    async function fetchModelsForModelRow(funcName, idx) {
-      const channelIdx = modelsConfig[funcName].models[idx].channel;
-      if (channelIdx === '' || channelIdx === undefined || channelIdx === null) {
-        alert('请先选择渠道');
-        return;
-      }
-      await fetchChannelModels(Number(channelIdx));
-      renderModelFunction(funcName, modelsConfig[funcName].models);
-    }
-
     async function saveModelsConfig() {
-      // Update strategies from select elements
-      modelsConfig.vision.strategy = document.getElementById('visionRotationStrategy').value;
-      modelsConfig.main.strategy = document.getElementById('mainRotationStrategy').value;
-      modelsConfig.tiered.strategy = document.getElementById('tieredRotationStrategy').value;
-
       try {
-        const data = await fetchJson('/api/models_config', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(modelsConfig),
-        });
-        alert(data.message || '保存成功');
+        const data = await fetchJson('/api/models_config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(modelsConfig)});
+        alert(data.message||'保存成功');
         await loadModelsConfig();
-        renderChannels();
-        renderModels();
-      } catch (err) {
-        alert('保存失败: ' + err.message);
-      }
+      } catch(err) { alert('保存失败: '+err.message); }
     }
 
     function escapeHtml(text) {
@@ -1795,6 +1746,7 @@
         .replaceAll('<', '&lt;')
         .replaceAll('>', '&gt;');
     }
+
 
     loadOverview();
     loadAgents();

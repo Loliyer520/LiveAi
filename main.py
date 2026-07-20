@@ -5,6 +5,7 @@ from pack.napcat import NapcatBot
 from core.config import AppConfig
 from core.ai_repository import AIRepository
 from core.ai_runtime import AIOrchestrator
+from core.model_manager import ModelManager
 from pack.satangyun import SatangyunModule
 from pack.webui_server import WebUIService
 from pack.anthropic_chat_model import AnthropicChatModel
@@ -58,21 +59,25 @@ def build_app() -> NapcatBot:
         http_access_token=config.napcat.http_access_token,
     )
 
+    model_manager = ModelManager(config.ai.models_config_path)
+    current = model_manager.get_current_model() or {}
+    _vision = model_manager.get_role_model('vision') or model_manager.get_vision_model() or {}
+
     shared_model = OpenAICompatibleChatModel(
-        base_url=config.ai.model_base_url,
-        api_key=config.ai.api_key,
-        model_name=config.ai.model_name,
+        base_url=current.get('base_url', ''),
+        api_key=current.get('api_key', ''),
+        model_name=current.get('model_name', ''),
     )
     anthropic_model = AnthropicChatModel(
-        base_url=config.ai.model_base_url,
-        api_key=config.ai.api_key,
-        model_name=config.ai.model_name,
-        messages_path=config.ai.model_messages_path,
+        base_url=current.get('base_url', ''),
+        api_key=current.get('api_key', ''),
+        model_name=current.get('model_name', ''),
+        messages_path=current.get('messages_path', '/v1/messages'),
     )
     vision_model = OpenAICompatibleVisionModel(
-        base_url=config.ai.vision_base_url,
-        api_key=config.ai.vision_api_key,
-        model_name=config.ai.vision_model_name,
+        base_url=_vision.get('base_url', ''),
+        api_key=_vision.get('api_key', ''),
+        model_name=_vision.get('model_name', ''),
     )
 
     satangyun_module = SatangyunModule(
@@ -134,19 +139,16 @@ if __name__ == "__main__":
         pass
 
     # ── 构建面板 ──
-    model_label = config.ai.default_chat_profile
-    _profile_map = {
-        'claude': (config.ai.claude_model_name, config.ai.claude_model_base_url),
-        'opus': (config.ai.claude_opus_model_name, config.ai.claude_opus_model_base_url),
-        'pro': (config.ai.pro_model_name, config.ai.pro_model_base_url),
-    }
-    model_name, model_url = _profile_map.get(model_label, (config.ai.model_name, config.ai.model_base_url))
+    _mm = ModelManager(config.ai.models_config_path)
+    _cur = _mm.get_current_model() or {}
+    model_name = _cur.get('display_name') or _cur.get('model_name', '未配置')
+    model_url = _cur.get('base_url', '')
 
     ws_host = config.napcat.ws_url.split('?')[0].replace('ws://', '').replace('wss://', '')
     qq_str = str(config.napcat.self_id) if config.napcat.self_id else '未设置'
 
     panel_lines = [
-        f"模型  {model_name}  ·  {_s(model_label, 'cyan')}  ·  {_s(model_url, 'gray')}",
+        f"模型  {model_name}  ·  {_s(model_url, 'gray')}",
         f"QQ    {qq_str}",
         '',
         f"WebSocket  {_s(ws_host, 'gray')}",

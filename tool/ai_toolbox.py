@@ -60,3 +60,20 @@ class AIToolbox:
 
     def send_chat_message(self, chat_type: str, target_id: int, content: str):
         return self.contact.send_chat_message(chat_type, target_id, content)
+
+    def send_chat_image(self, chat_type: str, target_id: int, file: str, text: str | None = None):
+        return self.contact.send_chat_image(chat_type, target_id, file, text)
+
+    def send_chat_file(self, chat_type: str, target_id: int, file: str, name: str | None = None):
+        return self.contact.send_chat_file(chat_type, target_id, file, name)
+
+    # ── 群管理 ──
+
+    def get_member_role(self, group_id: int, user_id: int) -> str:
+        return self.contact.get_member_role(group_id, user_id)
+
+    def set_group_ban(self, group_id: int, user_id: int, duration: int) -> dict:
+        return self.contact.set_group_ban(group_id, user_id, duration)
+
+    def set_group_whole_ban(self, group_id: int, enable: bool) -> dict:
+        return self.contact.set_group_whole_ban(group_id, enable)

@@ -4,6 +4,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 import requests
@@ -35,6 +36,8 @@ class NapcatBot:
         self._self_sent_ttl = 120.0
         # 占位表的兜底过期时间，避免请求异常/无 message_id 时占位残留过久误吞其他设备消息
         self._pending_self_sent_ttl = 30.0
+        # 单线程分发执行器：所有 WS 消息的 handler 调用串行化，彻底杜绝并发竞态
+        self._dispatch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='napcat-dispatch')
 
     def on_group_message(self, func: Callable[[ChatMessage], None]):
         self._event_handlers['group_message'].append(func)
@@ -155,7 +158,7 @@ class NapcatBot:
 
     def _dispatch(self, handlers, payload):
         for handler in handlers:
-            threading.Thread(target=handler, args=(payload,), daemon=True).start()
+            self._dispatch_executor.submit(handler, payload)
 
     def _event_self_ids(self, data: dict) -> set[str]:
         ids = {str(self.self_id)}
@@ -244,8 +247,12 @@ class NapcatBot:
             content = data.get('message')
             if content is None:
                 content = data.get('raw_message', '')
+            raw_content = data.get('raw_message', '')
             if self._is_recent_self_sent(data.get('message_id')) or (
-                message_type in {'group', 'private'} and self._is_pending_self_sent(message_type, target_id, content)
+                message_type in {'group', 'private'} and (
+                    self._is_pending_self_sent(message_type, target_id, content) or
+                    (raw_content and self._is_pending_self_sent(message_type, target_id, raw_content))
+                )
             ):
                 return
 
@@ -323,6 +330,26 @@ class NapcatBot:
         response = self.post('get_file', {'file_id': file_id})
         return response.get('data') or {}
 
+    def fetch_custom_face(self, count: int = 48) -> list[str]:
+        """获取账号收藏的表情（QQ 收藏表情），返回 URL 字符串列表。
+
+        NapCat 扩展动作 fetch_custom_face，data 可能是 URL 字符串数组，
+        也可能是对象数组（含 url 字段），两种都做兼容。
+        """
+        response = self.post('fetch_custom_face', {'count': count})
+        data = response.get('data') or []
+        urls: list[str] = []
+        for item in data:
+            if isinstance(item, str):
+                url = item.strip()
+            elif isinstance(item, dict):
+                url = str(item.get('url') or item.get('emoji_id') or '').strip()
+            else:
+                url = ''
+            if url:
+                urls.append(url)
+        return urls
+
     def get_group_list(self) -> list[dict]:
         response = self.post('get_group_list', {})
         return response.get('data') or []
@@ -339,6 +366,57 @@ class NapcatBot:
         response = self.post('get_group_info', {'group_id': group_id})
         return response.get('data') or {}
 
+    def get_group_member_list(self, group_id: int) -> list[dict]:
+        response = self.post('get_group_member_list', {'group_id': group_id})
+        return response.get('data') or []
+
+    def send_file(self, chat_type: str, target_id: int, file: str, name: str | None = None) -> dict:
+        """上传并发送本地文件到私聊或群聊。
+        chat_type: 'private' | 'group'
+        file: 服务器上的绝对路径
+        name: 可选，对方看到的文件名；不传则取路径末尾文件名
+        """
+        import os as _os
+        display_name = name or _os.path.basename(file)
+        if chat_type == 'group':
+            return self.post('upload_group_file', {
+                'group_id': target_id,
+                'file': file,
+                'name': display_name,
+            })
+        else:
+            return self.post('upload_private_file', {
+                'user_id': target_id,
+                'file': file,
+                'name': display_name,
+            })
+
+
+    def get_group_member_info(self, group_id: int, user_id: int, no_cache: bool = False) -> dict:
+        """获取群成员信息（含角色：owner/admin/member）。"""
+        response = self.post('get_group_member_info', {
+            'group_id': group_id,
+            'user_id': user_id,
+            'no_cache': no_cache,
+        })
+        return response.get('data') or {}
+
+    def set_group_ban(self, group_id: int, user_id: int, duration: int) -> dict:
+        """禁言群成员。duration 单位秒，0 表示解除禁言。"""
+        response = self.post('set_group_ban', {
+            'group_id': group_id,
+            'user_id': user_id,
+            'duration': duration,
+        })
+        return response.get('data') or {}
+
+    def set_group_whole_ban(self, group_id: int, enable: bool) -> dict:
+        """全员禁言开关。"""
+        response = self.post('set_group_whole_ban', {
+            'group_id': group_id,
+            'enable': enable,
+        })
+        return response.get('data') or {}
     @staticmethod
     def at(user_id: int) -> str:
         return f'[CQ:at,qq={user_id}]'
