@@ -22,6 +22,7 @@ ENV/
 
 # Data and state
 data/msgs/
+data/prompt/char.txt
 data/res/*.log
 data/github_update_workflow.md
 
