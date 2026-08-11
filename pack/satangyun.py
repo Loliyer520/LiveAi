@@ -1,4 +1,4 @@
-from pack.napcat import NapcatBot
+from core.transport import NapcatActionTransport, NapcatEventSource
 from core.events import ChatMessage, GroupIncreaseEvent
 from pack.chat_model import OpenAICompatibleChatModel
 from pack.encoding import file_to_base64_uri
@@ -9,7 +9,8 @@ from pack.satangyun_api import SatangyunAPI
 class SatangyunModule:
     def __init__(
         self,
-        bot: NapcatBot,
+        bot: NapcatActionTransport,
+        event_source: NapcatEventSource,
         group_id: int,
         api: SatangyunAPI,
         draw_service: NormalDrawingService,
@@ -18,6 +19,7 @@ class SatangyunModule:
         welcome_model_name: str | None = None,
     ):
         self.bot = bot
+        self.event_source = event_source
         self.group_id = group_id
         self.api = api
         self.draw_service = draw_service
@@ -26,8 +28,8 @@ class SatangyunModule:
         self.welcome_model_name = welcome_model_name
 
     def register(self):
-        self.bot.on_group_increase(self.handle_group_increase)
-        self.bot.on_group_message(self.handle_group_message)
+        self.event_source.on_group_increase(self.handle_group_increase)
+        self.event_source.on_group_message(self.handle_group_message)
 
     def _in_scope(self, message: ChatMessage) -> bool:
         return message.chat_type == 'group' and message.chat_id == self.group_id

@@ -1,10 +1,13 @@
 import hashlib
 import json
+import os
 import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
+from urllib.parse import urljoin, urlparse
 
 import requests
 import websocket
@@ -25,6 +28,8 @@ class NapcatBot:
             'private_message': [],
             'group_increase': [],
             'self_message': [],
+            'friend_request': [],
+            'group_request': [],
         }
         # 精确表：message_id（已归一化） -> 记录时间，用于 HTTP 响应拿到 message_id 后的精确去重
         self._recent_self_sent_ids: dict[int | str, float] = {}
@@ -35,6 +40,12 @@ class NapcatBot:
         self._self_sent_ttl = 120.0
         # 占位表的兜底过期时间，避免请求异常/无 message_id 时占位残留过久误吞其他设备消息
         self._pending_self_sent_ttl = 30.0
+        # 单线程分发执行器：所有 WS 消息的 handler 调用串行化，彻底杜绝并发竞态
+        self._dispatch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='napcat-dispatch')
+        self._shutdown_callbacks: list[Callable[[], None]] = []
+        # OneBot 11 没有标准“好友申请列表”动作；缓存本进程启动后收到的 request 事件供主AI查询。
+        self._request_cache: list[dict] = []
+        self._request_cache_lock = threading.Lock()
 
     def on_group_message(self, func: Callable[[ChatMessage], None]):
         self._event_handlers['group_message'].append(func)
@@ -48,8 +59,20 @@ class NapcatBot:
         self._event_handlers['group_increase'].append(func)
         return func
 
+    def on_friend_request(self, func: Callable[[dict], None]):
+        self._event_handlers['friend_request'].append(func)
+        return func
+
+    def on_group_request(self, func: Callable[[dict], None]):
+        self._event_handlers['group_request'].append(func)
+        return func
+
     def on_self_message(self, func: Callable[[ChatMessage], None]):
         self._event_handlers['self_message'].append(func)
+        return func
+
+    def on_shutdown(self, func: Callable[[], None]):
+        self._shutdown_callbacks.append(func)
         return func
 
     @staticmethod
@@ -155,7 +178,7 @@ class NapcatBot:
 
     def _dispatch(self, handlers, payload):
         for handler in handlers:
-            threading.Thread(target=handler, args=(payload,), daemon=True).start()
+            self._dispatch_executor.submit(handler, payload)
 
     def _event_self_ids(self, data: dict) -> set[str]:
         ids = {str(self.self_id)}
@@ -244,8 +267,12 @@ class NapcatBot:
             content = data.get('message')
             if content is None:
                 content = data.get('raw_message', '')
+            raw_content = data.get('raw_message', '')
             if self._is_recent_self_sent(data.get('message_id')) or (
-                message_type in {'group', 'private'} and self._is_pending_self_sent(message_type, target_id, content)
+                message_type in {'group', 'private'} and (
+                    self._is_pending_self_sent(message_type, target_id, content) or
+                    (raw_content and self._is_pending_self_sent(message_type, target_id, raw_content))
+                )
             ):
                 return
 
@@ -263,11 +290,26 @@ class NapcatBot:
                 raw_data=data,
             )
             self._dispatch(self._event_handlers['group_increase'], event)
+            return
+
+        if post_type == 'request':
+            cached = dict(data)
+            cached['_received_at'] = time.time()
+            with self._request_cache_lock:
+                self._request_cache.append(cached)
+                # flag 属于敏感、短期上下文，只保留最近 200 条且不落盘。
+                if len(self._request_cache) > 200:
+                    del self._request_cache[:-200]
+            # 除缓存外，把申请事件实时分发给订阅者（runtime 会唤醒主AI处理），
+            # 避免"新好友/加群申请到了但 AI 完全不知道"的同步空窗。
+            request_type = str(data.get('request_type') or '').strip()
+            if request_type == 'friend':
+                self._dispatch(self._event_handlers['friend_request'], cached)
+            elif request_type == 'group':
+                self._dispatch(self._event_handlers['group_request'], cached)
 
     def post(self, action: str, params: dict) -> dict:
-        headers = {'Content-Type': 'application/json'}
-        if self.http_access_token:
-            headers['Authorization'] = f'Bearer {self.http_access_token}'
+        headers = self._build_http_headers(include_json=True)
         response = requests.post(
             f'{self.http_url}/{action}',
             json=params,
@@ -277,12 +319,31 @@ class NapcatBot:
         response.raise_for_status()
         return response.json()
 
+    @staticmethod
+    def _require_action_success(action: str, response: dict) -> dict:
+        """OneBot HTTP 200 不代表动作成功；检查业务状态，避免向上层伪报成功。"""
+        if not isinstance(response, dict):
+            raise RuntimeError(f'{action} 返回了非 JSON 对象')
+        status = str(response.get('status') or '').lower()
+        retcode = response.get('retcode')
+        if status != 'ok' or retcode not in (0, '0', None):
+            message = response.get('message') or response.get('wording') or '协议端未提供错误详情'
+            raise RuntimeError(f'{action} 失败: retcode={retcode}, message={message}')
+        return response
+
+    def _cached_requests(self, request_type: str) -> list[dict]:
+        with self._request_cache_lock:
+            return [dict(item) for item in self._request_cache if item.get('request_type') == request_type]
+
     def send_text(self, chat_type: str, target_id: int, message: str):
         action = 'send_group_msg' if chat_type == 'group' else 'send_private_msg'
         key = 'group_id' if chat_type == 'group' else 'user_id'
         pending_key = self._mark_pending_self_sent(chat_type, target_id, message)
         try:
-            response = self.post(action, {key: target_id, 'message': message})
+            response = self._require_action_success(
+                action,
+                self.post(action, {key: target_id, 'message': message}),
+            )
             mid = (response.get('data') or {}).get('message_id') if isinstance(response, dict) else None
             self._remember_self_sent(mid)
         finally:
@@ -304,7 +365,57 @@ class NapcatBot:
         key = 'group_id' if chat_type == 'group' else 'user_id'
         pending_key = self._mark_pending_self_sent(chat_type, target_id, segments)
         try:
-            response = self.post(action, {key: target_id, 'message': segments})
+            response = self._require_action_success(
+                action,
+                self.post(action, {key: target_id, 'message': segments}),
+            )
+            mid = (response.get('data') or {}).get('message_id') if isinstance(response, dict) else None
+            self._remember_self_sent(mid)
+        finally:
+            self._clear_pending_self_sent(pending_key)
+        return response
+
+    def send_mface(
+        self,
+        chat_type: str,
+        target_id: int,
+        emoji_id: str,
+        emoji_package_id: str = '',
+        key: str = '',
+        summary: str | None = None,
+    ):
+        data = {'emoji_id': str(emoji_id or '').strip()}
+        if emoji_package_id:
+            data['emoji_package_id'] = str(emoji_package_id).strip()
+        if key:
+            data['key'] = str(key).strip()
+        if summary:
+            data['summary'] = str(summary).strip()
+        segments = [{'type': 'mface', 'data': data}]
+        action = 'send_group_msg' if chat_type == 'group' else 'send_private_msg'
+        key_name = 'group_id' if chat_type == 'group' else 'user_id'
+        pending_key = self._mark_pending_self_sent(chat_type, target_id, segments)
+        try:
+            response = self._require_action_success(
+                action,
+                self.post(action, {key_name: target_id, 'message': segments}),
+            )
+            mid = (response.get('data') or {}).get('message_id') if isinstance(response, dict) else None
+            self._remember_self_sent(mid)
+        finally:
+            self._clear_pending_self_sent(pending_key)
+        return response
+
+    def send_record(self, chat_type: str, target_id: int, file: str):
+        segments = [{'type': 'record', 'data': {'file': file}}]
+        action = 'send_group_msg' if chat_type == 'group' else 'send_private_msg'
+        key = 'group_id' if chat_type == 'group' else 'user_id'
+        pending_key = self._mark_pending_self_sent(chat_type, target_id, segments)
+        try:
+            response = self._require_action_success(
+                action,
+                self.post(action, {key: target_id, 'message': segments}),
+            )
             mid = (response.get('data') or {}).get('message_id') if isinstance(response, dict) else None
             self._remember_self_sent(mid)
         finally:
@@ -315,13 +426,160 @@ class NapcatBot:
         reply_code = f'[CQ:reply,id={message.message_id}]'
         return self.send_text(message.chat_type, message.chat_id, f'{reply_code}{content}')
 
-    def recall_message(self, message_id) -> dict:
+    def recall_message(self, message_id, scope_type: str | None = None, scope_id: int | None = None) -> dict:
         return self.post('delete_msg', {'message_id': message_id})
 
+    def _build_http_headers(self, include_json: bool = False, target_url: str | None = None) -> dict:
+        headers: dict[str, str] = {}
+        if include_json:
+            headers['Content-Type'] = 'application/json'
+        if self.http_access_token and self._should_attach_auth(target_url):
+            headers['Authorization'] = f'Bearer {self.http_access_token}'
+        return headers
+
+    def _should_attach_auth(self, target_url: str | None) -> bool:
+        if not target_url:
+            return True
+        parsed_target = urlparse(target_url)
+        if not parsed_target.scheme or not parsed_target.netloc:
+            return True
+        parsed_base = urlparse(self.http_url)
+        return (
+            parsed_target.scheme == parsed_base.scheme
+            and parsed_target.netloc == parsed_base.netloc
+        )
+
+    def _resolve_download_url(self, url: str) -> str:
+        text = str(url or '').strip()
+        if not text:
+            return ''
+        if text.startswith('http://') or text.startswith('https://'):
+            return text
+        return urljoin(f'{self.http_url}/', text.lstrip('/'))
+
     def get_file(self, file_id: str) -> dict:
-        """获取文件信息。返回 {file: '/本地路径', url: '...', name: '...', size: int}"""
+        """获取文件信息。返回 {file: '/本地路径', url: '...', name: '...', size: int}
+
+        严格校验协议端 status：返回 failed 时抛 RuntimeError，避免上层把错误当空结果。
+        若当前 NapCat 不支持 get_file action（如 "不支持的Api"），自动回退 get_file_v2。
+        """
         response = self.post('get_file', {'file_id': file_id})
-        return response.get('data') or {}
+        action_used = 'get_file'
+        if not (isinstance(response, dict) and str(response.get('status') or '').lower() == 'ok'):
+            message = str(response.get('message') or response.get('wording') or '')
+            if any(token in message for token in ('不支持', 'not support', 'not_support')):
+                response = self.post('get_file_v2', {'file_id': file_id})
+                action_used = 'get_file_v2'
+        response = self._require_action_success(action_used, response)
+        data = response.get('data') or {}
+        if not isinstance(data, dict):
+            return {}
+        normalized = dict(data)
+        file_aliases = ('file', 'path', 'file_path', 'local_path', 'temp_file')
+        for alias in file_aliases:
+            value = data.get(alias)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                normalized['file'] = text
+                break
+        url_aliases = ('url', 'download_url', 'origin_url')
+        for alias in url_aliases:
+            value = data.get(alias)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                normalized['url'] = self._resolve_download_url(text)
+                break
+        # size 字段做别名归一化：不同 NapCat 版本可能返回 size / file_size / length，
+        # 缺失时保持 0，由调用方（download_file 工具）做实际大小二次校验。
+        size_aliases = ('size', 'file_size', 'fileSize', 'length')
+        for alias in size_aliases:
+            value = data.get(alias)
+            if value is None:
+                continue
+            try:
+                normalized['size'] = int(value)
+            except (TypeError, ValueError):
+                pass
+            break
+        return normalized
+
+    def download_file_to(self, url: str, dest_path: str) -> None:
+        resolved_url = self._resolve_download_url(url)
+        if not resolved_url:
+            raise ValueError('download url is empty')
+        headers = self._build_http_headers(target_url=resolved_url)
+        with requests.get(resolved_url, headers=headers, timeout=60, stream=True) as response:
+            response.raise_for_status()
+            resp_headers = getattr(response, 'headers', None) or {}
+            content_type = str(resp_headers.get('Content-Type') or '').lower()
+            if content_type.startswith('application/json'):
+                raise RuntimeError(f'下载端点返回 JSON 响应（{content_type}），疑似协议错误而非文件')
+            with open(dest_path, 'wb') as fh:
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+        # 兜底：NapCat 错误响应体（如 {"status":"failed",...}）不能被当文件保存
+        self._reject_protocol_error_file(dest_path)
+
+    @staticmethod
+    def _reject_protocol_error_file(path: str) -> None:
+        """下载内容若是协议错误体（{..."status":"failed"...}）则删除并抛错。
+
+        只检查 ≤1KB 的文本文件，避免误伤真实的小 JSON/文本文件。
+        """
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        if size > 1024:
+            return
+        try:
+            with open(path, 'rb') as fh:
+                head = fh.read(256)
+        except OSError:
+            return
+        if head.lstrip().startswith(b'{') and b'"status"' in head and b'"failed"' in head:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise RuntimeError('下载内容为协议错误响应（{"status":...}），已删除占位文件')
+
+    def fetch_custom_face(self, count: int = 48) -> list[dict[str, str]]:
+        """获取账号收藏表情，返回保留稳定 ID 的结构化列表。"""
+        response = self.post('fetch_custom_face', {'count': count})
+        data = response.get('data') or []
+        stickers: list[dict[str, str]] = []
+        for item in data:
+            if isinstance(item, str):
+                url = item.strip()
+                if url:
+                    stickers.append({'url': url})
+            elif isinstance(item, dict):
+                sticker: dict[str, str] = {}
+                field_candidates = {
+                    'emoji_id': ['emoji_id', 'emojiId', 'id'],
+                    'emoji_package_id': ['emoji_package_id', 'emojiPackageId', 'package_id', 'packageId'],
+                    'key': ['key'],
+                    'url': ['url', 'origin_url', 'download_url'],
+                    'summary': ['summary', 'name', 'title'],
+                }
+                for target_key, aliases in field_candidates.items():
+                    for alias in aliases:
+                        value = item.get(alias)
+                        if value is None:
+                            continue
+                        normalized = str(value).strip()
+                        if normalized:
+                            sticker[target_key] = normalized
+                            break
+                if sticker:
+                    stickers.append(sticker)
+        return stickers
 
     def get_group_list(self) -> list[dict]:
         response = self.post('get_group_list', {})
@@ -331,6 +589,51 @@ class NapcatBot:
         response = self.post('get_friend_list', {})
         return response.get('data') or []
 
+    # ── 好友与群请求管理（敏感动作；调用权限由 AI runtime 强制限制） ──
+
+    def request_friend_add(self, user_id: int, comment: str = '') -> dict:
+        raise NotImplementedError('当前 NapCat OneBot 接口未提供主动添加好友动作；未发送任何请求。')
+
+    def get_friend_requests(self, count: int = 50) -> dict:
+        cached = self._cached_requests('friend')[-count:]
+        doubt: list[dict] = []
+        warning = ''
+        try:
+            response = self.post('get_doubt_friends_add_request', {'count': count})
+            self._require_action_success('get_doubt_friends_add_request', response)
+            data = response.get('data')
+            doubt = data if isinstance(data, list) else []
+        except Exception as exc:
+            warning = f'可疑好友申请扩展接口不可用: {exc}'
+        return {'event_cache': cached, 'doubt_requests': doubt, 'warning': warning}
+
+    def set_friend_add_request(self, flag: str, approve: bool, remark: str = '') -> dict:
+        params = {'flag': str(flag), 'approve': bool(approve)}
+        if remark:
+            params['remark'] = remark
+        response = self.post('set_friend_add_request', params)
+        return self._require_action_success('set_friend_add_request', response)
+
+    def request_group_join(self, group_id: int, comment: str = '') -> dict:
+        raise NotImplementedError('当前 NapCat OneBot 接口未提供主动申请加入群动作；未发送任何请求。')
+
+    def get_group_requests(self, count: int = 50) -> dict:
+        response = self.post('get_group_system_msg', {'count': count})
+        self._require_action_success('get_group_system_msg', response)
+        data = response.get('data') or {}
+        return {
+            'invited_requests': data.get('invited_requests') or data.get('InvitedRequest') or [],
+            'join_requests': data.get('join_requests') or [],
+            'event_cache': self._cached_requests('group')[-count:],
+        }
+
+    def set_group_add_request(self, flag: str, sub_type: str, approve: bool, reason: str = '') -> dict:
+        params = {'flag': str(flag), 'sub_type': sub_type, 'approve': bool(approve)}
+        if reason:
+            params['reason'] = reason
+        response = self.post('set_group_add_request', params)
+        return self._require_action_success('set_group_add_request', response)
+
     def get_stranger_info(self, user_id: int) -> dict:
         response = self.post('get_stranger_info', {'user_id': user_id})
         return response.get('data') or {}
@@ -339,6 +642,62 @@ class NapcatBot:
         response = self.post('get_group_info', {'group_id': group_id})
         return response.get('data') or {}
 
+    def get_group_member_list(self, group_id: int) -> list[dict]:
+        response = self.post('get_group_member_list', {'group_id': group_id})
+        return response.get('data') or []
+
+    def send_file(self, chat_type: str, target_id: int, file: str, name: str | None = None) -> dict:
+        """上传并发送本地文件到私聊或群聊。
+        chat_type: 'private' | 'group'
+        file: 本地路径、file:// URL、base64:// 内容，或 NapCat 支持的其他文件标识
+        name: 可选，对方看到的文件名；不传则在路径模式下取路径末尾文件名
+        """
+        import os as _os
+        if name:
+            display_name = name
+        elif '://' in str(file):
+            display_name = 'file.bin'
+        else:
+            display_name = _os.path.basename(file)
+        if chat_type == 'group':
+            return self.post('upload_group_file', {
+                'group_id': target_id,
+                'file': file,
+                'name': display_name,
+            })
+        else:
+            return self.post('upload_private_file', {
+                'user_id': target_id,
+                'file': file,
+                'name': display_name,
+            })
+
+
+    def get_group_member_info(self, group_id: int, user_id: int, no_cache: bool = False) -> dict:
+        """获取群成员信息（含角色：owner/admin/member）。"""
+        response = self.post('get_group_member_info', {
+            'group_id': group_id,
+            'user_id': user_id,
+            'no_cache': no_cache,
+        })
+        return response.get('data') or {}
+
+    def set_group_ban(self, group_id: int, user_id: int, duration: int) -> dict:
+        """禁言群成员。duration 单位秒，0 表示解除禁言。"""
+        response = self.post('set_group_ban', {
+            'group_id': group_id,
+            'user_id': user_id,
+            'duration': duration,
+        })
+        return response.get('data') or {}
+
+    def set_group_whole_ban(self, group_id: int, enable: bool) -> dict:
+        """全员禁言开关。"""
+        response = self.post('set_group_whole_ban', {
+            'group_id': group_id,
+            'enable': enable,
+        })
+        return response.get('data') or {}
     @staticmethod
     def at(user_id: int) -> str:
         return f'[CQ:at,qq={user_id}]'
@@ -355,4 +714,12 @@ class NapcatBot:
             on_close=self._on_close,
             on_open=self._on_open,
         )
-        self.ws.run_forever()
+        try:
+            self.ws.run_forever()
+        finally:
+            for callback in reversed(self._shutdown_callbacks):
+                try:
+                    callback()
+                except Exception as exc:
+                    log_error(f'Napcat 退出清理失败: {exc}')
+            self._dispatch_executor.shutdown(wait=False, cancel_futures=True)

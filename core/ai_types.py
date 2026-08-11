@@ -12,11 +12,12 @@ class AgentProfile:
     role: str
     persona: str = field(default_factory=default_char_prompt)
     trigger_words: list[str] = field(default_factory=lambda: ['ai', '机器人', '冰糖', '砂糖'])
-    trigger_rate: float = 0.08
+    trigger_rate: float = 0.0
     notes: list[str] = field(default_factory=list)
     impression: str = ''
     impression_updated_at: float = 0.0
     display_name: str = ''
+    knowledge_mounts: list[str] = field(default_factory=list)
     message_count: int = 0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)

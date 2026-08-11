@@ -7,3 +7,7 @@ class TaskTool:
 
     def create_task(self, source_agent: str, kind: str, payload: dict):
         return self.repo.create_task(source_agent, kind, payload)
+
+    def create_tasker(self, source_agent: str, payload: dict):
+        """Create a one-shot tasker using the legacy persisted kind for compatibility."""
+        return self.repo.create_task(source_agent, 'dev_agent', payload)

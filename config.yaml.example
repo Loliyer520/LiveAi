@@ -20,46 +20,22 @@ ai:
   enabled: true
   admin_qq: 123456789
   master_qq: 123456789  # 主人QQ号，AI会识别为"主人"并给予最高信任
-  default_chat_profile: "claude"
+  global_trigger_rate: 0.08  # 全局群聊随机触发概率；管理员可用 /trigger 动态修改
 
-  # Flash model (default)
-  model_base_url: "https://api.deepseek.com/anthropic"
-  api_key: "sk-your-deepseek-key"
-  model_name: "deepseek-v4-flash"
-  model_messages_path: "/v1/messages"
-
-  # Pro model
-  pro_model_base_url: "https://api.deepseek.com/anthropic"
-  pro_api_key: "sk-your-deepseek-key"
-  pro_model_name: "deepseek-v4-pro"
-  pro_model_messages_path: "/v1/messages"
-
-  # Claude model
-  claude_model_base_url: "https://api.anthropic.com/v1"
-  claude_api_key: "sk-your-claude-key"
-  claude_model_name: "claude-sonnet-4"
-  claude_model_messages_path: "/messages"
-
-  # Claude Opus model
-  claude_opus_model_base_url: "https://api.anthropic.com/v1"
-  claude_opus_api_key: "sk-your-claude-key"
-  claude_opus_model_name: "claude-opus-4"
-  claude_opus_model_messages_path: "/messages"
-
-  # Vision model
-  vision_base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-  vision_api_key: "sk-your-vision-key"
-  vision_model_name: "qwen3.5-flash"
+  # 模型/渠道配置统一在 data/models_config.json 中管理
+  models_config_path: "data/models_config.json"
 
   # Storage and prompts
   storage_path: "data/msgs/ai_state.json"
   main_prompt_path: "data/prompt/main.txt"
   staff_prompt_path: "data/prompt/staff.txt"
   char_prompt_path: "data/prompt/char.txt"
-  dev_agent_prompt_path: "data/prompt/dev_agent.txt"
+  tasker_prompt_path: "data/prompt/dev_agent.txt"  # preferred name; legacy dev_agent_prompt_path is still accepted
 
   # Runtime
-  worker_count: 2
+  worker_count: 2  # 旧配置兼容回退，不再限制会话 actor 数量
+  chat_model_workers: 8  # 聊天模型专用线程，不与后台任务争用
+  background_workers: 2  # Agent/搜索/视觉等后台任务并发上限
   history_limit: 500
 
   # Search (火星引擎)
@@ -67,8 +43,32 @@ ai:
   search_base_url: "https://open.feedcoopapi.com/search_api/global_search"
   search_doc_count: 5
 
+  # TTS（默认供 send_voice 使用）
+  tts_provider: "fish_audio"
+  tts_api_key: ""
+  tts_reference_id: ""
+  tts_base_url: "https://api.fish.audio"
+  tts_model: "s2-pro"
+  # 本地满穗 BERT-VITS2 示例：
+  # tts_provider: "bert_vits2"
+  # tts_reference_id: "1"
+  # tts_base_url: "http://127.0.0.1:23456/voice/bert-vits2"
+  # tts_model: ""
+
   # GitHub
   github_api_token: "ghp_your_github_token"
+
+  # SSH agent（支持密钥登录或密码登录）
+  # target 可以直接写 user@host，也可以写 ~/.ssh/config 里的 Host 别名
+  ssh_profiles:
+    - id: "prod"
+      target: "root@example.com"
+      root_dir: "/srv/app"
+      port: 22
+      identity_file: ""
+      password: ""
+      shell: "bash"
+      strict_host_key_checking: true
 
   # Auto update
   update_repo_owner: "Loliyer520"

@@ -1,4 +1,4 @@
-from pack.napcat import NapcatBot
+from core.transport import NapcatActionTransport
 from core.ai_repository import AIRepository
 from tool.contact_tool import ContactTool
 from tool.memory_tool import MemoryTool
@@ -6,7 +6,7 @@ from tool.task_tool import TaskTool
 
 
 class AIToolbox:
-    def __init__(self, bot: NapcatBot, repo: AIRepository):
+    def __init__(self, bot: NapcatActionTransport, repo: AIRepository):
         self.contact = ContactTool(bot)
         self.memory = MemoryTool(repo)
         self.task = TaskTool(repo)
@@ -55,8 +55,51 @@ class AIToolbox:
     def create_task(self, source_agent: str, kind: str, payload: dict):
         return self.task.create_task(source_agent, kind, payload)
 
+    def create_tasker(self, source_agent: str, payload: dict):
+        return self.task.create_tasker(source_agent, payload)
+
     def send_private_message(self, user_id: int, content: str):
         return self.contact.send_private_message(user_id, content)
 
+    # ── 好友与群请求管理 ──
+
+    def request_friend_add(self, user_id: int, comment: str = '') -> dict:
+        return self.contact.request_friend_add(user_id, comment)
+
+    def get_friend_requests(self, count: int = 50) -> dict:
+        return self.contact.get_friend_requests(count)
+
+    def set_friend_add_request(self, flag: str, approve: bool, remark: str = '') -> dict:
+        return self.contact.set_friend_add_request(flag, approve, remark)
+
+    def request_group_join(self, group_id: int, comment: str = '') -> dict:
+        return self.contact.request_group_join(group_id, comment)
+
+    def get_group_requests(self, count: int = 50) -> dict:
+        return self.contact.get_group_requests(count)
+
+    def set_group_add_request(self, flag: str, sub_type: str, approve: bool, reason: str = '') -> dict:
+        return self.contact.set_group_add_request(flag, sub_type, approve, reason)
+
     def send_chat_message(self, chat_type: str, target_id: int, content: str):
         return self.contact.send_chat_message(chat_type, target_id, content)
+
+    def send_chat_image(self, chat_type: str, target_id: int, file: str, text: str | None = None):
+        return self.contact.send_chat_image(chat_type, target_id, file, text)
+
+    def send_chat_record(self, chat_type: str, target_id: int, file: str):
+        return self.contact.send_chat_record(chat_type, target_id, file)
+
+    def send_chat_file(self, chat_type: str, target_id: int, file: str, name: str | None = None):
+        return self.contact.send_chat_file(chat_type, target_id, file, name)
+
+    # ── 群管理 ──
+
+    def get_member_role(self, group_id: int, user_id: int) -> str:
+        return self.contact.get_member_role(group_id, user_id)
+
+    def set_group_ban(self, group_id: int, user_id: int, duration: int) -> dict:
+        return self.contact.set_group_ban(group_id, user_id, duration)
+
+    def set_group_whole_ban(self, group_id: int, enable: bool) -> dict:
+        return self.contact.set_group_whole_ban(group_id, enable)
