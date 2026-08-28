@@ -17,10 +17,12 @@ class SatangyunModule:
         welcome_model: OpenAICompatibleChatModel | None = None,
         notice_image_url: str | None = None,
         welcome_model_name: str | None = None,
+        whitelist_group_ids: list[int] | None = None,
     ):
         self.bot = bot
         self.event_source = event_source
         self.group_id = group_id
+        self.whitelist_group_ids = whitelist_group_ids or []
         self.api = api
         self.draw_service = draw_service
         self.welcome_model = welcome_model
@@ -32,16 +34,19 @@ class SatangyunModule:
         self.event_source.on_group_message(self.handle_group_message)
 
     def _in_scope(self, message: ChatMessage) -> bool:
-        return message.chat_type == 'group' and message.chat_id == self.group_id
+        return message.chat_type == 'group' and message.chat_id in self._group_ids()
+
+    def _group_ids(self) -> set[int]:
+        return {self.group_id, *self.whitelist_group_ids}
 
     def handle_group_increase(self, event: GroupIncreaseEvent):
-        if event.group_id != self.group_id:
+        if event.group_id not in self._group_ids():
             return
         if not self.notice_image_url:
             return
         self.bot.send_image(
             'group',
-            self.group_id,
+            event.group_id,
             self.notice_image_url,
             text='欢迎！入群请读~\n（为保证社区安全，请勿谈论无关内容）\n（新版词典笔没有固定密码！请不要到处问密码！）',
         )
@@ -52,7 +57,7 @@ class SatangyunModule:
 
         text = message.text.strip()
         if text == '#':
-            self.bot.send_group_text(self.group_id, self.api.get_user_summary(message.user_id))
+            self.bot.send_group_text(message.chat_id, self.api.get_user_summary(message.user_id))
             return
 
         if text.startswith('#bind:'):
@@ -65,15 +70,15 @@ class SatangyunModule:
     def _handle_bind(self, message: ChatMessage, code: str):
         result = self.api.bind_account(message.user_id, code)
         if result == -1:
-            self.bot.send_group_text(self.group_id, '绑定失败惹~ 要不再试试？')
+            self.bot.send_group_text(message.chat_id, '绑定失败惹~ 要不再试试？')
             return
         if result == 0:
-            self.bot.send_group_text(self.group_id, '绑定失败啦~ 是不是时间太久啦？')
+            self.bot.send_group_text(message.chat_id, '绑定失败啦~ 是不是时间太久啦？')
             return
 
-        self.bot.send_group_text(self.group_id, '绑定成功~ 欢迎加入砂糖云！\n绑定完成后即可直接用QQ号+密码登录哦！')
+        self.bot.send_group_text(message.chat_id, '绑定成功~ 欢迎加入砂糖云！\n绑定完成后即可直接用QQ号+密码登录哦！')
         welcome = self._build_welcome_text(message)
-        self.bot.send_group_text(self.group_id, f'{self.bot.at(message.user_id)} {welcome}')
+        self.bot.send_group_text(message.chat_id, f'{self.bot.at(message.user_id)} {welcome}')
 
     def _build_welcome_text(self, message: ChatMessage) -> str:
         if not self.welcome_model:
@@ -102,12 +107,12 @@ class SatangyunModule:
 
     def _handle_draw(self, message: ChatMessage, prompt: str):
         if not prompt:
-            self.bot.send_group_text(self.group_id, '要告诉我画什么呀~')
+            self.bot.send_group_text(message.chat_id, '要告诉我画什么呀~')
             return
 
-        self.bot.send_group_text(self.group_id, '正在为主人画画喵~')
+        self.bot.send_group_text(message.chat_id, '正在为主人画画喵~')
         try:
             image_path = self.draw_service.generate(prompt)
-            self.bot.send_image('group', self.group_id, file_to_base64_uri(str(image_path)))
+            self.bot.send_image('group', message.chat_id, file_to_base64_uri(str(image_path)))
         except Exception as exc:
-            self.bot.send_group_text(self.group_id, f'呜啊坏掉惹~ {exc}')
+            self.bot.send_group_text(message.chat_id, f'呜啊坏掉惹~ {exc}')

@@ -42,13 +42,17 @@ class AgentReportDeliveryService:
             scope_key = f'{scope_type}:{scope_id}'
             urgent_items = [item for item in items if item.get('urgent')]
             normal_items = [item for item in items if not item.get('urgent')]
-            if urgent_items:
-                deliver(scope_type, scope_id, urgent_items)
-            if normal_items:
-                if only_if_idle and is_scope_active(scope_key):
-                    deferred.extend(normal_items)
-                else:
-                    deliver(scope_type, scope_id, normal_items)
+            try:
+                if urgent_items:
+                    deliver(scope_type, scope_id, urgent_items)
+                if normal_items:
+                    if only_if_idle and is_scope_active(scope_key):
+                        deferred.extend(normal_items)
+                    else:
+                        deliver(scope_type, scope_id, normal_items)
+            except Exception:
+                deferred.extend(urgent_items)
+                deferred.extend(normal_items)
 
         if deferred:
             manager.requeue_pending_reports(deferred)

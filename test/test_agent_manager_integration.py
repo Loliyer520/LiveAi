@@ -79,7 +79,7 @@ class AgentManagerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             record = manager.get_agent(agent_id)
 
         self.assertTrue(ok)
-        self.assertEqual(record['cwd'], '/test')
+        self.assertEqual(record['cwd'], '~/test')
         self.assertTrue(record['read_only'])
 
     def test_create_ssh_agent_persists_target_info(self):

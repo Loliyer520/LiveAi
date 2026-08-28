@@ -46,6 +46,9 @@ HISTORY_SUMMARY_KEEP_RECENT_MESSAGES = 60
 HISTORY_SUMMARY_KEEP_HEAD_MESSAGES = 1
 HISTORY_SUMMARY_MAX_ENTRIES = 8
 TOOL_RESULT_TRIM_KEEP_RECENT_ROUNDS = 10
+# 每 N 轮强制要求 report_progress 同步进展；连续 N 轮无实质进展触发熔断（强制 ask_supervisor）
+PROGRESS_REPORT_INTERVAL = 5
+STAGNANT_ROUND_LIMIT = 4
 AGENT_TODO_ITEM_LIMIT = 64
 AGENT_NOTE_ITEM_LIMIT = 64
 AGENT_STATE_RENDER_LIMIT = 12
@@ -504,6 +507,31 @@ def _render_messages_for_summary(messages: list[dict], limit: int = MAX_CONTEXT_
     return f'{head}\n\n……（中间上下文过长已省略）……\n\n{tail}'
 
 
+def _tool_calls_signature(calls) -> str:
+    """工具调用签名：用于检测连续多轮原地打转（完全相同工具+参数）。"""
+    parts: list[str] = []
+    for call in calls or []:
+        try:
+            inp = json.dumps(call.input or {}, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            inp = str(getattr(call, 'input', None))
+        parts.append(f'{call.name}:{inp}')
+    return '|'.join(sorted(parts))
+
+
+_STAGNANT_FAILURE_HINTS = (
+    '工具执行出错', '执行失败', '报错', 'traceback', 'exception',
+    'no such file', 'permission denied', 'command not found',
+    '操作已被拒绝', '只读模式禁止',
+)
+
+
+def _looks_like_failure(text: str) -> bool:
+    """粗略判断工具结果是否失败，供熔断用。配合连续多轮判定，误报只会触发一次汇报，无害。"""
+    lowered = str(text or '').lower()
+    return any(hint in lowered for hint in _STAGNANT_FAILURE_HINTS)
+
+
 def _plan_history_compaction(
     messages: list[dict],
     trigger_messages: int = HISTORY_SUMMARY_TRIGGER_MESSAGES,
@@ -568,12 +596,18 @@ async def _summarize_history_chunk(model, removed_messages: list[dict]) -> str:
         return _build_history_summary_fallback(removed_messages)
     rendered = _render_messages_for_summary(removed_messages, limit=MAX_CONTEXT_CHARS)
     prompt = (
-        '下面是一段即将从 agent 实时上下文中移除的较早历史，请把它压缩成一段后续可继续工作的摘要。\n'
+        '下面是一段即将从 agent 实时上下文中移除的较早历史，请压缩成一段后续可继续工作的结构化摘要。\n'
+        '按以下六项输出，每项都要有，没有对应内容就写"无"：\n'
+        '1. 已完成事实：做过的检查、改过的文件、运行过的命令及结果。\n'
+        '2. 当前进度：任务进行到哪一步。\n'
+        '3. 关键文件与路径：涉及的文件路径、函数/行号，便于后续直接定位。\n'
+        '4. 发现的问题：报错、失败、受阻点。\n'
+        '5. 未完成事项与下一步：剩余步骤、下一步打算。\n'
+        '6. 风险与待验证点。\n'
         '要求：\n'
         '1. 不要总结 system prompt，也不要改写或覆盖原始任务指令。\n'
-        '2. 只总结这段历史里已经发生的事实：做过的检查、改过的文件、运行过的命令、发现的问题、未完成事项、风险、待验证点。\n'
-        '3. 不要编造成果，不要输出新的行动指令。\n'
-        '4. 用中文，简洁但保留工程关键信息。\n\n'
+        '2. 只总结这段历史里已经发生的事实，不编造成果，不输出新的行动指令。\n'
+        '3. 用中文，简洁但保留工程关键信息（文件路径、命令、报错要点）。\n\n'
         f'历史内容：\n------8<------\n{rendered}\n------8<------'
     )
     try:
@@ -837,6 +871,39 @@ def _project_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _resolve_agent_workspace_root(workspace_root: str) -> str | None:
+    """验证并规范化本地常驻 agent 的绝对工作区根目录。"""
+    workspace_root = str(workspace_root or '').strip()
+    if not workspace_root or not os.path.isabs(workspace_root):
+        return None
+    # Reject filesystem roots, mount roots, and Windows drive roots generically.
+    raw_normalized = os.path.normpath(workspace_root)
+    if raw_normalized == os.path.dirname(raw_normalized):
+        return None
+    resolved = os.path.realpath(workspace_root)
+    if not os.path.isdir(resolved):
+        return None
+
+    # 文件系统根、挂载点和驱动器根的范围过宽，不能作为 agent 工作区。
+    if resolved in {os.path.sep, '/mnt', '/mnt/c', '/tmp'}:
+        return None
+
+    parent = os.path.dirname(resolved)
+    if os.path.ismount(resolved) and parent != resolved:
+        return None
+
+    # Do not allow
+    project_root = os.path.realpath(_project_root())
+    for relative in DENYLIST_PREFIXES:
+        sensitive_root = os.path.realpath(os.path.join(project_root, relative))
+        try:
+            if os.path.commonpath([resolved, sensitive_root]) == sensitive_root:
+                return None
+        except ValueError:
+            return None
+    return resolved
+
+
 def _resolve_safe_path(project_root: str, relative_path: str) -> str | None:
     relative_path = (relative_path or '').strip()
     if not relative_path or os.path.isabs(relative_path):
@@ -861,29 +928,24 @@ def _resolve_safe_path(project_root: str, relative_path: str) -> str | None:
 
 def _normalize_agent_cwd_spec(cwd: str) -> str | None:
     cwd = str(cwd or '').strip()
-    if not cwd or cwd == '.':
+    if not cwd or cwd in {'.', '/', '~'}:
         return '/'
-    if cwd in {'/', '~'}:
-        return cwd
 
     if cwd.startswith('~/'):
-        prefix = '~/'
         tail = cwd[2:]
-    elif cwd.startswith('/'):
-        prefix = '/'
+    elif os.path.isabs(cwd):
+        # Preserve the legacy /subdir syntax: it is always relative to the
+        # agent root, never a host-absolute path supplied to an individual tool.
         tail = cwd[1:]
     else:
-        prefix = '~/'
         tail = cwd
 
     normalized = os.path.normpath(str(tail or '').strip())
     if normalized in {'', '.'}:
-        return prefix[:-1] if prefix.endswith('/') else prefix
-    if normalized.startswith('..') or os.path.isabs(normalized):
+        return '/'
+    if normalized == '..' or normalized.startswith('..' + os.sep) or os.path.isabs(normalized):
         return None
-    return prefix + normalized.replace('\\', '/')
-
-
+    return '~/' + normalized.replace('\\', '/')
 def _normalize_repo_relative_path(path: str) -> str | None:
     text = str(path or '').strip()
     if not text:
@@ -898,7 +960,6 @@ def _normalize_repo_relative_path(path: str) -> str | None:
         if normalized_slashes == prefix or normalized_slashes.startswith(prefix + '/'):
             return None
     return normalized_slashes
-
 
 def _inject_backup_text(result_text: str, backup_path: str) -> str:
     result_text = str(result_text or '')
@@ -4361,9 +4422,9 @@ def _resolve_shell_cwd(project_root: str, cwd: str, default_cwd: str = '/') -> t
     normalized = _normalize_agent_cwd_spec(effective)
     if normalized is None:
         return None, effective
-    if normalized in {'/', '~'}:
+    if normalized == '/':
         return project_root, normalized
-    relative = normalized[2:] if normalized.startswith('~/') else normalized[1:] if normalized.startswith('/') else normalized
+    relative = normalized[2:] if normalized.startswith('~/') else normalized
     resolved = _resolve_safe_path(project_root, relative)
     if resolved is None:
         return None, normalized
@@ -5554,10 +5615,13 @@ async def run_dev_agent(
     github_repo: str = '',
     prompt_path: str = 'data/prompt/dev_agent.txt',
     project_root: str | None = None,
+    workspace_root: str | None = None,
     on_finished: Callable[[dict], Awaitable[None] | None] | None = None,
     token_usage_store=None,
 ) -> str:
     project_root = project_root or _project_root()
+    if workspace_root:
+        os.makedirs(workspace_root, exist_ok=True)
     shell_manager = DevAgentShellManager(project_root)
     try:
         with open(prompt_path, 'r', encoding='utf-8') as f:
@@ -5567,6 +5631,8 @@ async def run_dev_agent(
 
     # 将原始任务描述固定注入 system_prompt，防止长轮次下被稀释
     system_prompt += f'\n\n本次任务原始描述：\n{task_desc}'
+    if workspace_root:
+        system_prompt += f'\n\n你的专属工作区目录：{workspace_root}\n请把临时文件、草稿、中间产物等写到这个目录，不要直接写到项目根目录。'
 
     tools = _build_tools_schema()
     task_text = task_desc
@@ -5580,6 +5646,9 @@ async def run_dev_agent(
     }
     final_result = ''
     final_status = 'failed'
+    _round_tool_names: set[str] = set()
+    _last_tool_signature: str | None = None
+    _stagnant_rounds = 0
 
     try:
         def _execute_runtime_tool(
@@ -5607,7 +5676,16 @@ async def run_dev_agent(
                 ssh_profile,
             )
 
-        for _ in range(MAX_ITERATIONS):
+        for iteration in range(1, MAX_ITERATIONS + 1):
+            # B：每 N 轮且上一轮没调 report_progress 时，强制要求同步进展（不依赖 agent 自觉）
+            if iteration % PROGRESS_REPORT_INTERVAL == 0 and 'report_progress' not in _round_tool_names:
+                messages.append({
+                    'role': 'user',
+                    'content': (
+                        f'你已进行 {iteration} 轮工具调用。请先调用 report_progress 工具，'
+                        '用一两句话向用户同步当前进展，然后再继续。不要用普通文本表达。'
+                    ),
+                })
             _trim_old_tool_results(messages, keep_recent_rounds=TOOL_RESULT_TRIM_KEEP_RECENT_ROUNDS)
             messages, runtime_state['history_summaries'], _ = await _maybe_compact_agent_messages(
                 model,
@@ -5664,6 +5742,28 @@ async def run_dev_agent(
                 for call, result_text in zip(reply.tool_calls, ordered_results)
             ]
             messages.append({'role': 'user', 'content': result_blocks})
+
+            # A：无进展熔断 —— 连续多轮原地打转（相同工具+参数）或持续报错时，
+            # 强制 ask_supervisor 向用户说明卡点，而不是闷头跑满 MAX_ITERATIONS。
+            current_signature = _tool_calls_signature(reply.tool_calls)
+            any_failure = any(_looks_like_failure(text) for text in ordered_results)
+            if (current_signature and current_signature == _last_tool_signature) or any_failure:
+                _stagnant_rounds += 1
+            else:
+                _stagnant_rounds = 0
+            _last_tool_signature = current_signature
+            _round_tool_names = {call.name for call in reply.tool_calls}
+            if _stagnant_rounds >= STAGNANT_ROUND_LIMIT:
+                messages.append({
+                    'role': 'user',
+                    'content': (
+                        f'系统检测到你已连续 {_stagnant_rounds} 轮没有实质进展'
+                        '（重复调用相同工具或持续报错）。请立即调用 ask_supervisor 工具，'
+                        '向用户说明当前卡点、已尝试过的方案、以及你需要用户拍板的决定，'
+                        '等待答复后再继续。不要硬闯。'
+                    ),
+                })
+                _stagnant_rounds = 0  # 重置，避免下轮再次重复触发刷屏
         final_result = '已达到最大工具调用轮数上限，任务可能未完全完成，建议拆分成更小的任务重新委托。'
         return final_result
     except Exception as exc:

@@ -9,6 +9,7 @@ napcat:
 
 satangyun:
   target_group_id: 750742812
+  whitelist_group_ids: [1104899457]
   auth_api_base: "https://auth.example.com"
   admin_token: "your_admin_token"
   notice_image_url: "https://example.com/notice.jpg"
@@ -69,6 +70,16 @@ ai:
       password: ""
       shell: "bash"
       strict_host_key_checking: true
+
+    # WSL 本地 Linux 环境示例（密码登录，关闭 host key 检查避免 localhost 误拒）
+    - id: "wsl"
+      target: "loliyc@localhost"
+      root_dir: "~"
+      port: 22
+      identity_file: ""
+      password: "your_wsl_password"
+      shell: "bash"
+      strict_host_key_checking: false
 
   # Auto update
   update_repo_owner: "Loliyer520"

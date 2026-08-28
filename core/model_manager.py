@@ -366,6 +366,9 @@ class ModelManager:
         ch_name = self._resolve_role_channel_name(role)
         channel = self._find_channel(ch_name) if ch_name else None
         if not channel:
+            configured = self.config.get('roles') or {}
+            if ch_name or role in configured:
+                return None
             channels = self.config.get('channels') or []
             if channels:
                 channel = channels[0]
@@ -649,6 +652,20 @@ class ModelManager:
                 result.append({'upstream': upstream, 'model_id': model_id})
         return result
 
+    def _validate_channel_models(self, models) -> tuple[bool, str]:
+        if not isinstance(models, list):
+            return False, 'models 必须是列表。'
+        for item in models:
+            if not isinstance(item, dict):
+                return False, '渠道模型条目格式无效。'
+            upstream = str(item.get('upstream') or '').strip()
+            model_id = str(item.get('model_id') or '').strip()
+            if not upstream or not model_id:
+                return False, '渠道模型必须同时包含 upstream 和 model_id。'
+            if not self._find_upstream(upstream):
+                return False, f'上游不存在: {upstream}'
+        return True, ''
+
     def add_channel(self, *, name: str, strategy: str = 'fallback', models=None, **_) -> tuple[bool, str]:
         name = str(name or '').strip()
         if not name:
@@ -659,6 +676,9 @@ class ModelManager:
         strategy = self._normalize_strategy(strategy)
         if isinstance(models, str):
             models = self._parse_channel_models(models)
+        valid, error_msg = self._validate_channel_models(models or [])
+        if not valid:
+            return False, error_msg
         channels.append({'name': name, 'strategy': strategy, 'models': models or []})
         ok, msg = self._save()
         if not ok:
@@ -687,7 +707,10 @@ class ModelManager:
             m = fields['models']
             if isinstance(m, str):
                 m = self._parse_channel_models(m)
-            ch['models'] = m if isinstance(m, list) else []
+            valid, error_msg = self._validate_channel_models(m)
+            if not valid:
+                return False, error_msg
+            ch['models'] = m
         ok, msg = self._save()
         if not ok:
             return False, msg
@@ -713,7 +736,12 @@ class ModelManager:
         if idx < 0:
             return False, f'未找到渠道: {channel}'
         ch = self.config['channels'][idx]
-        entry = {'upstream': upstream.strip(), 'model_id': model_id.strip()}
+        upstream = str(upstream or '').strip()
+        model_id = str(model_id or '').strip()
+        valid, error_msg = self._validate_channel_models([{'upstream': upstream, 'model_id': model_id}])
+        if not valid:
+            return False, error_msg
+        entry = {'upstream': upstream, 'model_id': model_id}
         ch.setdefault('models', []).append(entry)
         ok, msg = self._save()
         if not ok:
@@ -756,3 +784,24 @@ class ModelManager:
             return False, msg
         label = ROLE_LABELS.get(role, role)
         return True, f'{label} 角色已绑定渠道: {channel or "(已清除)"}。'
+
+    def set_all_roles(self, channel: str) -> tuple[bool, str]:
+        channel = str(channel or '').strip()
+        if not channel:
+            return False, '渠道名称不能为空。'
+        if not self._find_channel(channel):
+            return False, f'渠道不存在: {channel}'
+        roles = self.config.setdefault('roles', {})
+        role_names = tuple(ROLE_LABELS.keys())
+        old_values = {role: roles.get(role) for role in role_names}
+        for role in role_names:
+            roles[role] = channel
+        ok, msg = self._save()
+        if not ok:
+            for role in role_names:
+                if old_values[role] is None:
+                    roles.pop(role, None)
+                else:
+                    roles[role] = old_values[role]
+            return False, msg
+        return True, f'全部 {len(role_names)} 个角色已绑定渠道: {channel}。'

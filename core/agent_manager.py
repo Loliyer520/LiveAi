@@ -31,6 +31,7 @@ from core.dev_agent import (
     DevAgentShellManager,
     SSHAgentShellManager,
     _normalize_agent_cwd_spec,
+    _resolve_agent_workspace_root,
     _build_tools_schema,
     _call_with_retry,
     _complete_with_valid_response,
@@ -46,6 +47,9 @@ from core.dev_agent import (
     _summarize_history_chunk,
     _trim_old_tool_results,
     RESIDENT_AGENT_COMM_TOOL_NAMES,
+    STAGNANT_ROUND_LIMIT,
+    _looks_like_failure,
+    _tool_calls_signature,
 )
 from core.config import SSHProfileConfig
 from pack.console_logger import error, warn
@@ -426,6 +430,7 @@ class AgentManager:
         read_only: bool = False,
         target_kind: str = 'local',
         ssh_profile_id: str | None = None,
+        workspace_root: str | None = None,
     ) -> str:
         """创建一条常驻 agent 记录，返回 agent_id。
 
@@ -447,6 +452,13 @@ class AgentManager:
             raise ValueError(f'无效的 agent 目标类型: {target_kind!r}')
         if target_kind == 'ssh' and not ssh_profile_id:
             raise ValueError('创建 ssh agent 时必须提供 ssh_profile_id。')
+        if target_kind == 'ssh' and workspace_root is not None:
+            raise ValueError('SSH agent 不支持本地 workspace_root。')
+        normalized_workspace_root = None
+        if workspace_root is not None:
+            normalized_workspace_root = _resolve_agent_workspace_root(workspace_root)
+            if normalized_workspace_root is None:
+                raise ValueError(f'无效的本地 agent workspace_root: {workspace_root!r}')
         agent_id = self._new_agent_id()
 
         def mutator(payload: dict):
@@ -469,6 +481,8 @@ class AgentManager:
             }
             if ssh_profile_id:
                 record['ssh_profile_id'] = ssh_profile_id
+            if normalized_workspace_root:
+                record['workspace_root'] = normalized_workspace_root
             if origin_scope:
                 record['origin_scope'] = origin_scope
             payload.setdefault('agents', {})[agent_id] = record
@@ -650,7 +664,6 @@ class AgentManager:
             return dict(data)
 
         return self.store.update(mutator)
-
     def _update_runtime_fields(self, agent_id: str, **fields) -> dict | None:
         """精确更新 agent 的持久运行字段，不改消息与上下文。"""
         agent_id = str(agent_id or '')
@@ -671,8 +684,9 @@ class AgentManager:
         agent_id: str,
         cwd: str | None = None,
         read_only: bool | None = None,
+        workspace_root: str | None = None,
     ) -> dict | None:
-        """更新 agent 的默认派发配置（工作目录 / 只读模式）。"""
+        """更新 agent 的默认派发配置（工作目录 / 工作区 / 只读模式）。"""
         updates: dict[str, object] = {}
         if cwd is not None:
             normalized_cwd = _normalize_agent_cwd_spec(cwd)
@@ -681,6 +695,16 @@ class AgentManager:
             updates['cwd'] = normalized_cwd
         if read_only is not None:
             updates['read_only'] = bool(read_only)
+        if workspace_root is not None:
+            record = self.get_agent(agent_id)
+            if not record:
+                return None
+            if str(record.get('target_kind') or 'local').strip().lower() == 'ssh':
+                raise ValueError('SSH agent 不支持本地 workspace_root。')
+            normalized_workspace_root = _resolve_agent_workspace_root(workspace_root)
+            if normalized_workspace_root is None:
+                raise ValueError(f'无效的本地 agent workspace_root: {workspace_root!r}')
+            updates['workspace_root'] = normalized_workspace_root
         if not updates:
             return self.get_agent(agent_id)
         return self._update_runtime_fields(str(agent_id or ''), **updates)
@@ -750,6 +774,7 @@ class AgentManager:
         message: dict,
         cwd: str | None = None,
         read_only: bool | None = None,
+        workspace_root: str | None = None,
     ) -> bool:
         """向指定 agent 的注入队列投递一条消息，唤醒挂起的常驻循环。
 
@@ -776,8 +801,13 @@ class AgentManager:
         record = self.get_agent(agent_id)
         if not record:
             return False
-        if cwd is not None or read_only is not None:
-            updated = self.update_agent_dispatch_config(agent_id, cwd=cwd, read_only=read_only)
+        if cwd is not None or read_only is not None or workspace_root is not None:
+            updated = self.update_agent_dispatch_config(
+                agent_id,
+                cwd=cwd,
+                read_only=read_only,
+                workspace_root=workspace_root,
+            )
             if not updated:
                 return False
             record = updated
@@ -932,7 +962,11 @@ class AgentManager:
                 on_transfer_report=lambda text: self.on_agent_message(agent_id, text),
             )
         else:
-            shell_manager = DevAgentShellManager(project_root)
+            workspace_root = _resolve_agent_workspace_root(record.get('workspace_root'))
+            if record.get('workspace_root') and workspace_root is None:
+                raise ValueError('持久化的本地 workspace_root 已不存在或不再允许。')
+            workspace_root = workspace_root or project_root
+            shell_manager = DevAgentShellManager(workspace_root)
 
         try:
             with open(prompt_path, 'r', encoding='utf-8') as f:
@@ -1021,6 +1055,8 @@ class AgentManager:
                 # ---- 内层连续工具轮：一直执行工具直到模型给出纯文本 ----
                 produced_text = None
                 explicit_status = ''
+                _stagnant_rounds = 0
+                _last_tool_signature = None
                 for stage_iteration in range(1, MAX_ITERATIONS + 1):
                     # running 态注入：在连续工具轮里，把 send_to_agent 注入的新消息
                     # 取出、append 到当前上下文（追加在上一轮工具结果之后），
@@ -1041,6 +1077,16 @@ class AgentManager:
                         _trim_old_tool_results(messages, keep_recent_rounds=TOOL_RESULT_TRIM_KEEP_RECENT_ROUNDS)
                         self._replace_messages(agent_id, messages)
                     runtime_record = self.get_agent(agent_id) or {}
+                    stored_workspace_root = runtime_record.get('workspace_root')
+                    workspace_root = (
+                        _resolve_agent_workspace_root(stored_workspace_root)
+                        if ssh_profile is None else project_root
+                    )
+                    if ssh_profile is None and stored_workspace_root and workspace_root is None:
+                        raise ValueError('持久化的本地 workspace_root 已不存在或不再允许。')
+                    workspace_root = workspace_root or project_root
+                    if ssh_profile is None:
+                        shell_manager.project_root = workspace_root
                     default_cwd = _normalize_agent_cwd_spec(str(runtime_record.get('cwd') or '/')) or '/'
                     read_only = bool(runtime_record.get('read_only', False))
                     tools = _build_tools_schema(read_only=read_only, ssh_enabled=ssh_profile is not None, resident=True)
@@ -1151,7 +1197,7 @@ class AgentManager:
 
                     ordered_results = await _execute_tool_calls_ordered(
                         reply.tool_calls,
-                        project_root,
+                        workspace_root if ssh_profile is None else project_root,
                         github_token,
                         shell_manager,
                         default_cwd=default_cwd,
@@ -1162,6 +1208,16 @@ class AgentManager:
                     progress_text = self._build_tool_progress_report(reply.tool_calls)
                     if progress_text:
                         self.emit_progress_report(agent_id, progress_text)
+
+                    # 无进展熔断（A）：重复相同工具或持续报错视为停滞，强制 ask_supervisor 暂停，
+                    # 避免在同一个死胡同里打转烧 token。
+                    current_signature = _tool_calls_signature(reply.tool_calls)
+                    any_failure = any(_looks_like_failure(text) for text in ordered_results)
+                    if (current_signature and current_signature == _last_tool_signature) or any_failure:
+                        _stagnant_rounds += 1
+                    else:
+                        _stagnant_rounds = 0
+                    _last_tool_signature = current_signature
                     result_blocks = [
                         {
                             'type': 'tool_result',
@@ -1173,6 +1229,18 @@ class AgentManager:
                     tool_result_msg = {'role': 'user', 'content': result_blocks}
                     messages.append(tool_result_msg)
                     self.append_message(agent_id, tool_result_msg)
+                    if _stagnant_rounds >= STAGNANT_ROUND_LIMIT:
+                        messages.append({
+                            'role': 'user',
+                            'content': (
+                                f'系统检测到你已连续 {_stagnant_rounds} 轮没有实质进展'
+                                '（重复调用相同工具或持续报错）。请立即调用 ask_supervisor 工具，'
+                                '向用户说明当前卡点、已尝试过的方案、以及你需要用户拍板的决定，'
+                                '等待答复后再继续。不要硬闯。'
+                            ),
+                        })
+                        self.append_message(agent_id, messages[-1])
+                        _stagnant_rounds = 0
                     if exit_intent.get('kind'):
                         # ask_supervisor / finish_task：本轮工具跑完就挂起，状态由意图决定，
                         # 不再靠纯文本和 [[AGENT_DONE]] 猜。

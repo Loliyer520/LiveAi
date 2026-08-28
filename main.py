@@ -93,6 +93,7 @@ def build_app() -> NapcatBot:
         welcome_model=shared_model,
         notice_image_url=config.satangyun.notice_image_url,
         welcome_model_name=config.satangyun.welcome_model,
+        whitelist_group_ids=config.satangyun.whitelist_group_ids,
     )
     satangyun_module.register()
 
@@ -126,24 +127,25 @@ if __name__ == "__main__":
 
     # ── 启动版本检查 ──
     version_line = ''
-    try:
-        from pack.update_service import UpdateService
-        us = UpdateService(
-            github_token=config.ai.github_api_token,
-            repo_owner=config.ai.update_repo_owner,
-            repo_name=config.ai.update_repo_name,
-        )
-        v = us.check_now_sync()
-        cur = v.get('current_version', '?')
-        if v.get('has_update'):
-            latest = v.get('latest_version', '?')
-            version_line = f"版本  {cur}  ·  {_s('GitHub 有新版本 !', 'yellow')}  →  {latest}"
-        elif v.get('latest_version') == '?':
-            version_line = f"版本  {cur}  ·  {_s('GitHub: 无法检查', 'gray')}"
-        else:
-            version_line = f"版本  {cur}  ·  {_s('GitHub 已是最新', 'gray')}"
-    except Exception:
-        pass
+    if bool(getattr(config.ai, 'auto_update_enabled', False)):
+        try:
+            from pack.update_service import UpdateService
+            us = UpdateService(
+                github_token=config.ai.github_api_token,
+                repo_owner=config.ai.update_repo_owner,
+                repo_name=config.ai.update_repo_name,
+            )
+            v = us.check_now_sync()
+            cur = v.get('current_version', '?')
+            if v.get('has_update'):
+                latest = v.get('latest_version', '?')
+                version_line = f"版本  {cur}  ·  {_s('GitHub 有新版本 !', 'yellow')}  →  {latest}"
+            elif v.get('latest_version') == '?':
+                version_line = f"版本  {cur}  ·  {_s('GitHub: 无法检查', 'gray')}"
+            else:
+                version_line = f"版本  {cur}  ·  {_s('GitHub 已是最新', 'gray')}"
+        except Exception:
+            pass
 
     # ── 构建面板 ──
     _mm = ModelManager(config.ai.models_config_path)

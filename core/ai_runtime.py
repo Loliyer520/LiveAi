@@ -32,7 +32,7 @@ except ImportError:
     _requests_mod = None
 from core.event_adapters import envelope_from_scope_turn_item
 from core.event_batch_coordinator import AtomicTurnBatchCoordinator, CompletedTurn
-from core.event_mailbox import InMemoryEventMailbox
+from core.event_mailbox import InMemoryEventMailbox, MailboxEntry
 from core.character_session import CharacterSessionRegistry
 from core.scope_actor_dispatcher import ScopeActorDispatcher
 from core.task_ingress_router import TaskIngressRouter
@@ -316,6 +316,9 @@ class AIOrchestrator:
         self._txt2wav_service = None
         self._message_epoch = 0
         self._stale_message_max_age: float = 120.0  # 超过此秒数的旧消息不再触发回复
+        self._scope_turn_retry_base_delay = 3.0
+        self._scope_turn_retry_long_term_min = 300.0  # 5 分钟
+        self._scope_turn_retry_max_delay = 3600.0  # 1 小时
         self._group_reply_windows: dict[str, dict] = {}
         # 本次触发消息里的图片引用，按 scope_key 暂存，供 view_image 工具按需解析。
         # 每个 scope 同一时刻只有一个 turn 在跑（scope 锁保证），故直接覆盖即可。
@@ -691,6 +694,11 @@ class AIOrchestrator:
         result = str(result or '').strip()
         if not result or not self.loop or not self.queue:
             return
+        try:
+            chat_id = 0 if scope_type == 'master' else int(scope_id)
+        except (TypeError, ValueError):
+            warn(f'[AI] _deliver_task_report_message invalid scope={scope_type}:{scope_id} task={task_id}')
+            return
         wrapped = (
             '【内部系统通知：以下是一次性后台 tasker 执行完成后的原始技术汇报，不是任何人直接对你说的话，仅供你参考决策。'
             '请结合当前语境和你的人设自主判断：要不要把这件事告诉对方、怎么措辞（可以完全不提技术细节甚至简化成一句话），'
@@ -699,7 +707,7 @@ class AIOrchestrator:
         )
         report_message = ChatMessage(
             chat_type=scope_type,
-            chat_id=0 if scope_type == 'master' else int(scope_id),
+            chat_id=chat_id,
             user_id=0,
             text=wrapped,
             raw_message=wrapped,
@@ -1931,11 +1939,21 @@ class AIOrchestrator:
                 self.reload_models_config()
             self.bot.send_text(message.chat_type, message.chat_id, msg)
             return
+        if sub == 'setall':
+            if len(parts) != 3:
+                self.bot.send_text(message.chat_type, message.chat_id, '用法: /role setall <渠道名>')
+                return
+            ok, msg = self.model_manager.set_all_roles(parts[2])
+            if ok:
+                self.reload_models_config()
+            self.bot.send_text(message.chat_type, message.chat_id, msg)
+            return
 
         help_text = (
             '角色管理指令:\n'
             '/role list\n'
             '/role set <角色> <渠道名>\n'
+            '/role setall <渠道名>（将全部角色绑定到同一渠道）\n'
             '角色: main / tiered / tiered_chat(聊天) / tiered_exec(执行) / tiered_decision(决策) / agent / tasker / vision（旧 dev_agent 输入仍兼容）'
         )
         self.bot.send_text(message.chat_type, message.chat_id, help_text)
@@ -2822,6 +2840,7 @@ class AIOrchestrator:
 
     async def _consume_scope_item(self, scope_key: str, item: dict) -> None:
         kind = item.get('kind')
+        original_entry = item.get('_mailbox_entry')
         try:
             if kind == 'message':
                 followup = item
@@ -2836,13 +2855,75 @@ class AIOrchestrator:
             elif kind == 'task':
                 await self._process_task(item)
         except Exception as exc:
-            error(f'[AI][scope_actor] scope={scope_key} kind={kind} error={exc}')
+            if kind == 'message' and isinstance(original_entry, MailboxEntry):
+                attempt = original_entry.attempt
+                if self._should_retry_scope_turn(exc, attempt):
+                    delay = self._compute_retry_delay(attempt)
+                    self._requeue_failed_scope_turn(scope_key, original_entry, delay)
+                    warn(
+                        f'[AI][scope_actor] scope={scope_key} 上游不稳定，'
+                        f'attempt={attempt + 1} 将在 {delay:.1f}s 后重试'
+                    )
+                    return
+                error(
+                    f'[AI][scope_actor] scope={scope_key} 硬错误，放弃: {exc}'
+                )
+            else:
+                error(f'[AI][scope_actor] scope={scope_key} kind={kind} error={exc}')
 
     def _on_scope_idle(self, _scope_key: str) -> None:
         try:
             self._flush_agent_reports(only_if_idle=True)
         except Exception as exc:
             error(f'[AI] scope idle flush agent reports failed: {exc}')
+
+    def _should_retry_scope_turn(self, exc: Exception, attempt: int) -> bool:
+        """判断异常是否为可重试的上游不稳定错误（软错误）。
+
+        永不放弃：attempt 无上限，只要是软错误就一直重试。
+        """
+        exc_str = str(exc).lower()
+        exc_name = type(exc).__name__
+        return (
+            (exc_name == 'RuntimeError' and '空内容' in exc_str)
+            or 'timeout' in exc_str
+            or 'timed out' in exc_str
+            or 'status=5' in exc_str
+            or 'connection' in exc_str
+            or 'overloaded' in exc_str
+            or 'rate limit' in exc_str
+            or '429' in exc_str
+            or '502' in exc_str
+            or '503' in exc_str
+            or '504' in exc_str
+        )
+
+    def _compute_retry_delay(self, attempt: int) -> float:
+        """指数退避，后期切换到长期重试间隔。
+
+        0-2: 3s → 6s → 12s（快速重试阶段）
+        3-5: 24s → 48s → 96s
+        6-8: 5min → 10min → 20min（长期重试阶段）
+        9+: 1 小时（最终稳态）
+        """
+        if attempt < 6:
+            delay = self._scope_turn_retry_base_delay * (2 ** attempt)
+            return min(delay, self._scope_turn_retry_long_term_min)
+        elif attempt < 9:
+            delay = self._scope_turn_retry_long_term_min * (2 ** (attempt - 6))
+            return min(delay, self._scope_turn_retry_max_delay)
+        else:
+            return self._scope_turn_retry_max_delay
+
+    def _requeue_failed_scope_turn(
+        self, scope_key: str, entry: MailboxEntry, delay: float
+    ) -> None:
+        """将失败的 scope turn 重新放回 mailbox 头部，延后 delay 秒重试。"""
+        self._event_mailbox.requeue_front(
+            entry.envelope, entry.transient, attempt=entry.attempt + 1, delay=delay
+        )
+        loop = self.loop or asyncio.get_running_loop()
+        loop.call_later(delay, self._scope_dispatcher.wake, scope_key)
 
     def _send_chat_reply(self, message: ChatMessage, text: str):
         self.bot.send_text(message.chat_type, message.chat_id, text)
@@ -3206,6 +3287,73 @@ class AIOrchestrator:
         if len(text) <= limit:
             return text
         return text[: max(0, limit - 3)] + '...'
+
+    def _note_dir(self, scope_type: str, scope_id: str, note_scope: str) -> Path:
+        proj = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if note_scope == 'global':
+            return proj / 'data' / 'notes' / 'global'
+        return proj / 'data' / 'notes' / scope_type / scope_id
+
+    def _handle_note_list(self, scope_type: str, scope_id: str, agent_id: str, note_scope: str) -> str:
+        d = self._note_dir(scope_type, scope_id, note_scope)
+        if not d.exists():
+            return f'暂无{note_scope}笔记。'
+        files = sorted(d.glob('*.md'))
+        if not files:
+            return f'暂无{note_scope}笔记。'
+        lines = [f'共 {len(files)} 篇{"全局公有" if note_scope == "global" else "会话私有"}笔记：']
+        for f in files:
+            try:
+                first_line = f.read_text(encoding='utf-8').splitlines()[0].lstrip('# ').strip()
+            except Exception:
+                first_line = f.stem
+            lines.append(f'- {f.stem} | {first_line}')
+        return '\n'.join(lines)
+
+    def _handle_note_read(self, scope_type: str, scope_id: str, note_id: str, note_scope: str) -> str:
+        if not note_id:
+            return 'note_id 不能为空。'
+        d = self._note_dir(scope_type, scope_id, note_scope)
+        p = d / f'{note_id}.md'
+        if not p.exists():
+            return f'笔记 {note_id} 不存在。'
+        try:
+            return p.read_text(encoding='utf-8')
+        except Exception as e:
+            return f'读取失败: {e}'
+
+    def _handle_note_write(self, scope_type: str, scope_id: str, agent_id: str, title: str, content: str, note_scope: str, note_id: str) -> str:
+        if not title or not content:
+            return 'title 和 content 不能为空。'
+        import re as _re
+        safe_title = _re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:80] or 'note'
+        d = self._note_dir(scope_type, scope_id, note_scope)
+        d.mkdir(parents=True, exist_ok=True)
+        fid = note_id if note_id else safe_title
+        p = d / f'{fid}.md'
+        if note_scope == 'global':
+            header = f'<!-- 最后修改：{agent_id} -->\n'
+        else:
+            header = ''
+        try:
+            p.write_text(header + content, encoding='utf-8')
+            action = '更新' if note_id else '新建'
+            return f'已{action}{"全局" if note_scope == "global" else "会话"}笔记 {fid}。'
+        except Exception as e:
+            return f'写入失败: {e}'
+
+    def _handle_note_delete(self, scope_type: str, scope_id: str, note_id: str, note_scope: str) -> str:
+        if not note_id:
+            return 'note_id 不能为空。'
+        d = self._note_dir(scope_type, scope_id, note_scope)
+        p = d / f'{note_id}.md'
+        if not p.exists():
+            return f'笔记 {note_id} 不存在。'
+        try:
+            p.unlink()
+            return f'已删除笔记 {note_id}。'
+        except Exception as e:
+            return f'删除失败: {e}'
 
     def _format_ts_text(self, value) -> str:
         try:
@@ -4540,6 +4688,23 @@ class AIOrchestrator:
                 result = 'AI 工具备忘新增失败：内容为空。'
             else:
                 result = f"已新增 AI 工具备忘 {note.get('note_id')}: {note.get('content') or ''}"
+        elif name == 'note_list':
+            note_scope = str(tool_input.get('scope') or 'session').strip()
+            result = self._handle_note_list(scope_type, scope_id, agent_id, note_scope)
+        elif name == 'note_read':
+            note_id = str(tool_input.get('note_id') or '').strip()
+            note_scope = str(tool_input.get('scope') or 'session').strip()
+            result = self._handle_note_read(scope_type, scope_id, note_id, note_scope)
+        elif name == 'note_write':
+            title = str(tool_input.get('title') or '').strip()
+            content = str(tool_input.get('content') or '').strip()
+            note_scope = str(tool_input.get('scope') or 'session').strip()
+            note_id = str(tool_input.get('note_id') or '').strip()
+            result = self._handle_note_write(scope_type, scope_id, agent_id, title, content, note_scope, note_id)
+        elif name == 'note_delete':
+            note_id = str(tool_input.get('note_id') or '').strip()
+            note_scope = str(tool_input.get('scope') or 'session').strip()
+            result = self._handle_note_delete(scope_type, scope_id, note_id, note_scope)
         elif name == 'memory_update':
             note = self.tools.rewrite_memory(
                 scope_type,
@@ -4890,57 +5055,50 @@ class AIOrchestrator:
                 result = 'error: file_id 为空，无法下载文件。'
             else:
                 try:
-                    file_info = self.bot.get_file(file_id)
+                    file_info = await asyncio.to_thread(self.bot.get_file, file_id)
                 except Exception as e:
                     file_info = None
                     result = f'获取文件信息失败: {e}'
                 if file_info is not None:
-                    size = file_info.get('size') or 0
-                    MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
-                    if size > MAX_FILE_SIZE:
-                        result = f'文件过大（{size // 1024 // 1024}MB），超过 20MB 限制，已跳过下载。'
-                    else:
-                        import pathlib
-                        import shutil
-                        proj_root = pathlib.Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-                        dest_dir = proj_root / 'data' / 'file' / str(scope_id)
-                        dest_dir.mkdir(parents=True, exist_ok=True)
-                        # 只用 basename 再清洗非法字符，防路径穿越；限制长度防超长文件名。
-                        safe_name = os.path.basename(file_name)
-                        safe_name = re.sub(r'[\\/:*?"<>|]', '_', safe_name).strip().rstrip('.')
-                        if not safe_name:
-                            safe_name = 'file'
-                        if len(safe_name) > 120:
-                            stem, ext = os.path.splitext(safe_name)
-                            safe_name = stem[: 120 - len(ext)] + ext
-                        dest_path = dest_dir / safe_name
-                        src_path = file_info.get('file') or ''
-                        try:
-                            if src_path and pathlib.Path(src_path).exists():
-                                shutil.copy2(src_path, dest_path)
+                    import pathlib
+                    import shutil
+                    proj_root = pathlib.Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                    dest_dir = proj_root / 'data' / 'file' / str(scope_id)
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    # 只用 basename 再清洗非法字符，防路径穿越；限制长度防超长文件名。
+                    safe_name = os.path.basename(file_name)
+                    safe_name = re.sub(r'[\\/:*?"<>|]', '_', safe_name).strip().rstrip('.')
+                    if not safe_name:
+                        safe_name = 'file'
+                    if len(safe_name) > 120:
+                        stem, ext = os.path.splitext(safe_name)
+                        safe_name = stem[: 120 - len(ext)] + ext
+                    dest_path = dest_dir / safe_name
+                    src_path = file_info.get('file') or ''
+                    try:
+                        if src_path and pathlib.Path(src_path).exists():
+                            shutil.copy2(src_path, dest_path)
+                        else:
+                            direct_url = await asyncio.to_thread(
+                                self._try_file_direct_url, scope_type, scope_id, file_id
+                            )
+                            if direct_url:
+                                await asyncio.to_thread(self.bot.download_file_to, direct_url, str(dest_path))
                             elif file_info.get('url'):
                                 await asyncio.to_thread(self.bot.download_file_to, file_info['url'], str(dest_path))
                             else:
-                                result = '无法获取文件内容：既无本地路径也无下载 URL。'
+                                result = '无法获取文件内容：既无本地路径，直链接口也拿不到可下载 URL。'
                                 dest_path = None
-                            # 下载完成后二次校验实际大小：NapCat 的 size 字段可能缺失/为 0，
-                            # 仅靠下载前检查不可靠，超限必须清掉已落盘文件（落盘即清）。
-                            if dest_path is not None and dest_path.exists():
-                                actual_size = dest_path.stat().st_size
-                                if actual_size > MAX_FILE_SIZE:
-                                    dest_path.unlink(missing_ok=True)
-                                    result = f'文件实际大小（{actual_size // 1024 // 1024}MB）超过 20MB 限制，已删除并跳过。'
-                                    dest_path = None
-                        except Exception as e:
-                            # 落盘即清：保存/下载失败时清理半成品，避免残留垃圾文件。
-                            if dest_path is not None:
-                                try:
-                                    dest_path.unlink(missing_ok=True)
-                                except OSError:
-                                    pass
-                            result = f'文件保存失败: {e}'
-                            dest_path = None
+                    except Exception as e:
+                        # 落盘即清：保存/下载失败时清理半成品，避免残留垃圾文件。
                         if dest_path is not None:
+                            try:
+                                dest_path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                        result = f'文件保存失败: {e}'
+                        dest_path = None
+                    if dest_path is not None:
                             rel_path = str(dest_path).replace('\\', '/')
                             saved_size = dest_path.stat().st_size
                             if saved_size >= 1024 * 1024:
@@ -5030,6 +5188,7 @@ class AIOrchestrator:
         elif name == 'create_agent':
             instruction = str(tool_input.get('instruction') or '').strip()
             cwd = tool_input.get('cwd', '/')
+            workspace_root = tool_input.get('workspace_root')
             read_only = bool(tool_input.get('read_only', False))
             if not instruction:
                 result = 'error: instruction 为空，未创建 agent。'
@@ -5042,6 +5201,7 @@ class AIOrchestrator:
                         origin_scope=origin_scope,
                         cwd=cwd,
                         read_only=read_only,
+                        workspace_root=workspace_root,
                     )
                     # 启动常驻循环：使用 roles.agent 独立模型配置
                     role_model_config = self.model_manager.get_role_model('agent')
@@ -5074,7 +5234,7 @@ class AIOrchestrator:
                     self.agent_manager.register_agent_task(new_agent_id, agent_task)
                     mode_text = '只读' if read_only else '可写'
                     watch_note = self._ensure_agent_watch_timer(scope_type, scope_id)
-                    result = f'已创建常驻 agent，agent_id: {new_agent_id}，默认目录: {cwd or "/"}，模式: {mode_text}，已开始执行任务。'
+                    result = f'已创建常驻 agent，agent_id: {new_agent_id}，工作区: {workspace_root or "LiveAi 项目根"}，默认目录: {cwd or "/"}，模式: {mode_text}，已开始执行任务。'
                     if watch_note:
                         result = f'{result}\n{watch_note}'
                 except ValueError as exc:
@@ -5153,6 +5313,7 @@ class AIOrchestrator:
             target_agent_id = str(tool_input.get('agent_id') or '').strip()
             message = str(tool_input.get('message') or '').strip()
             cwd = tool_input.get('cwd') if 'cwd' in tool_input else None
+            workspace_root = tool_input.get('workspace_root') if 'workspace_root' in tool_input else None
             read_only = bool(tool_input.get('read_only')) if 'read_only' in tool_input else None
             if not target_agent_id:
                 result = 'error: agent_id 为空，未发送。'
@@ -5166,6 +5327,7 @@ class AIOrchestrator:
                         {'role': 'user', 'content': message},
                         cwd=cwd,
                         read_only=read_only,
+                        workspace_root=workspace_root,
                     )
                 except ValueError as exc:
                     result = f'向 agent {target_agent_id} 发送失败: {exc}'
@@ -5190,6 +5352,8 @@ class AIOrchestrator:
                             config_changes.append(f'默认目录={cwd or "/"}')
                         if read_only is not None:
                             config_changes.append('模式=只读' if read_only else '模式=可写')
+                        if workspace_root is not None:
+                            config_changes.append(f'工作区={workspace_root}')
                         if restart_result.get('ok'):
                             config_suffix = f' 已更新{"，".join(config_changes)}。' if config_changes else ''
                             result = f'已向 agent {target_agent_id} 发送消息{suffix}{config_suffix}'
@@ -7848,6 +8012,25 @@ class AIOrchestrator:
                 })
         return refs
 
+    def _try_file_direct_url(self, scope_type: str, scope_id: str, file_id: str) -> str:
+        """尝试通过 NapCat 直链接口获取可下载的文件直链；失败返回空字符串。
+
+        get_file 返回的 url 字段可能是 NapCat 容器内的本地路径（如 /app/.config/...），
+        被直接下载会打到 HTTP 协议端返回 JSON。因此优先用官方直链接口换取真实 URL：
+        群文件走 get_group_file_url，私聊文件走 get_private_file_url。
+        """
+        try:
+            if scope_type == 'group':
+                url = self.bot.get_group_file_url(file_id, scope_id)
+            else:
+                url = self.bot.get_private_file_url(file_id)
+        except Exception:
+            return ''
+        text = str(url or '').strip()
+        if text.startswith('http://') or text.startswith('https://'):
+            return text
+        return ''
+
     def _normalize_message_ref(self, value) -> str:
         text = ''.join(ch for ch in str(value or '').upper() if ch in string.digits + string.ascii_uppercase)
         return text[:4]
@@ -8857,6 +9040,7 @@ class AIOrchestrator:
                     task_desc,
                     github_repo=github_repo,
                     prompt_path=self.config.tasker_prompt_path,
+                    workspace_root=str(Path(_project_root()) / 'workspace' / task_id),
                     on_finished=finish_trigger,
                     token_usage_store=self.token_usage_store,
                 )

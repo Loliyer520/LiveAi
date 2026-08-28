@@ -5,20 +5,57 @@
 
 ---
 
-## 目录
+## 🚀 5 分钟快速开始
 
-1. [运行方式](#1-运行方式)
-2. [整体架构](#2-整体架构)
-3. [分级 AI 逻辑](#3-分级-ai-逻辑)
-4. [消息接收 / 触发](#4-消息接收--触发)
-5. [Turn 串行与 Mailbox](#5-turn-串行与-mailbox)
-6. [工具调用协议](#6-工具调用协议)
-7. [跨级 AI 协作](#7-跨级-ai-协作)
-8. [工具循环并流（Live Drain）](#8-工具循环并流live-drain)
-9. [消息回执与 Short ID](#9-消息回执与-short-id)
-10. [TTS 引擎切换](#10-tts-引擎切换)
-11. [SSH / 远程执行](#11-ssh--远程执行)
-12. [已知 Bug / 性能问题](#12-已知-bug--性能问题)
+### 1. 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. 配置 NapCat
+
+下载并启动 [NapCat](https://napcat.napneko.icu/)，获得 WebSocket 地址和 HTTP token。
+
+### 3. 配置 AI 模型
+
+```bash
+# 复制最小配置模板
+cp config.minimal.yaml config.yaml
+
+# 编辑 config.yaml，填入以下必填项：
+# - napcat.ws_url (NapCat WebSocket 地址)
+# - napcat.http_access_token (NapCat 鉴权 token)
+# - napcat.self_id (你的机器人 QQ 号)
+# - ai.admin_qq (管理员 QQ)
+# - data/models_config.json 里配置至少一个 AI 模型上游
+```
+
+### 4. 启动
+
+```bash
+python main.py
+```
+
+看到启动面板即成功。群聊 @机器人 或私聊即可触发 AI 回复。
+
+---
+
+## 📚 目录
+
+1. [快速开始](#-5-分钟快速开始) ⬆️
+2. [运行方式](#1-运行方式)
+3. [整体架构](#2-整体架构)
+4. [分级 AI 逻辑](#3-分级-ai-逻辑)
+5. [消息接收 / 触发](#4-消息接收--触发)
+6. [Turn 串行与 Mailbox](#5-turn-串行与-mailbox)
+7. [工具调用协议](#6-工具调用协议)
+8. [跨级 AI 协作](#7-跨级-ai-协作)
+9. [工具循环并流（Live Drain）](#8-工具循环并流live-drain)
+10. [消息回执与 Short ID](#9-消息回执与-short-id)
+11. [TTS 引擎切换](#10-tts-引擎切换)
+12. [SSH / 远程执行](#11-ssh--远程执行)
+13. [已知 Bug / 性能问题](#12-已知-bug--性能问题)
 
 ---
 
@@ -26,8 +63,6 @@
 
 ```bash
 python main.py
-# 或
-/my/bot.sh start
 ```
 
 - `main.py` 是唯一生产入口
@@ -233,18 +268,27 @@ AI 在多轮工具调用期间可能继续收到新事件（用户消息、agent
 
 ## 10. TTS 引擎切换
 
-### 当前默认
-
-`config.yaml` 里 `tts_provider: "cosyvoice"`（满穗 TTS 统一网关，默认 speaker `Sui_Full`）。
-
 ### 可用引擎
 
 | provider | 后端 | 用途 |
 |---|---|---|
-| `cosyvoice` / `mansui_unified` | [MansuiUnifiedTxt2WavProvider](pack/txt2wav.py) | **默认**走 23458 网关 |
-| `bert_vits2` / `vits_api` / `mansui_vits` | [BertVits2Txt2WavProvider](pack/txt2wav.py) | 老 vits-api 23456 |
-| `fish_audio` | [FishAudioTxt2WavProvider](pack/txt2wav.py) | 鱼音云 |
+| `fish_audio` | [FishAudioTxt2WavProvider](pack/txt2wav.py) | 鱼音云（在线） |
+| `cosyvoice` / `mansui_unified` | [MansuiUnifiedTxt2WavProvider](pack/txt2wav.py) | 满穗 TTS 统一网关（本地 23458） |
+| `bert_vits2` / `vits_api` / `mansui_vits` | [BertVits2Txt2WavProvider](pack/txt2wav.py) | 老 vits-api（本地 23456） |
 | `tiax` | [TiaxTxt2WavProvider](pack/txt2wav.py) | tiax 在线 |
+
+### 配置方法
+
+在 `config.yaml` 中配置（不需要 TTS 可留空）：
+
+```yaml
+ai:
+  tts_provider: "fish_audio"              # 引擎名称
+  tts_api_key: "your-api-key"             # API key（在线服务需要）
+  tts_reference_id: "speaker-id"          # speaker ID 或角色 ID
+  tts_base_url: "https://api.fish.audio"  # API 地址
+  tts_model: "s2-pro"                     # 模型名称
+```
 
 ### 高级用法
 
@@ -257,17 +301,6 @@ provider_options={'ref_audio_path': 'D:/ref.wav', 'ref_text': '参考文本'}
 
 # 临时切回老引擎
 provider_options={'engine': 'bert-vits2', 'id': 0, 'lang': 'zh'}
-```
-
-### 切换方法
-
-只改 [config.yaml](config.yaml)：
-
-```yaml
-tts_provider: "cosyvoice"   # ← 改这一行
-tts_reference_id: "Sui_Full"
-tts_base_url: "http://127.0.0.1:23458/tts"
-tts_model: "cosyvoice"
 ```
 
 ---

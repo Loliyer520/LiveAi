@@ -17,6 +17,11 @@ from pack.console_logger import ok, warn, error as log_error
 
 
 class NapcatBot:
+    # NapCat 取大文件信息时可能需要先在服务端落盘/拷贝，耗时随文件体积增长。
+    FILE_ACTION_TIMEOUT = (10, 300)
+    # 流式下载按“单次读取间隔”计时，而非整体传输预算，所以大文件也无需按体积放大。
+    DOWNLOAD_TIMEOUT = (10, 300)
+
     def __init__(self, ws_url: str, http_url: str, self_id: int, http_access_token: str = ''):
         self.ws_url = ws_url
         self.http_url = http_url.rstrip('/')
@@ -308,13 +313,13 @@ class NapcatBot:
             elif request_type == 'group':
                 self._dispatch(self._event_handlers['group_request'], cached)
 
-    def post(self, action: str, params: dict) -> dict:
+    def post(self, action: str, params: dict, timeout: float | tuple[float, float] = 30) -> dict:
         headers = self._build_http_headers(include_json=True)
         response = requests.post(
             f'{self.http_url}/{action}',
             json=params,
             headers=headers,
-            timeout=30,
+            timeout=timeout,
         )
         response.raise_for_status()
         return response.json()
@@ -455,7 +460,35 @@ class NapcatBot:
             return ''
         if text.startswith('http://') or text.startswith('https://'):
             return text
+        # Windows 本地路径（盘符 / UNC）不是 HTTP URL，不能拼到 HTTP 服务地址上，
+        # 否则会把本地路径误当直链请求，打到协议端返回 JSON 而非文件。
+        if re.match(r'^[a-zA-Z]:[\\/]', text) or text.startswith('\\\\'):
+            return ''
         return urljoin(f'{self.http_url}/', text.lstrip('/'))
+
+    def get_group_file_url(self, file_id: str, group_id) -> str:
+        """获取群文件直链（NapCat 官方推荐下载通道）。返回可直接下载的 http(s) URL。"""
+        response = self.post(
+            'get_group_file_url',
+            {'file_id': str(file_id), 'group': str(group_id)},
+            timeout=self.FILE_ACTION_TIMEOUT,
+        )
+        response = self._require_action_success('get_group_file_url', response)
+        data = response.get('data') or {}
+        raw = data.get('url') if isinstance(data, dict) else data
+        return self._resolve_download_url(str(raw or '').strip())
+
+    def get_private_file_url(self, file_id: str) -> str:
+        """获取私聊文件直链（NapCat 官方推荐下载通道）。返回可直接下载的 http(s) URL。"""
+        response = self.post(
+            'get_private_file_url',
+            {'file_id': str(file_id)},
+            timeout=self.FILE_ACTION_TIMEOUT,
+        )
+        response = self._require_action_success('get_private_file_url', response)
+        data = response.get('data') or {}
+        raw = data.get('url') if isinstance(data, dict) else data
+        return self._resolve_download_url(str(raw or '').strip())
 
     def get_file(self, file_id: str) -> dict:
         """获取文件信息。返回 {file: '/本地路径', url: '...', name: '...', size: int}
@@ -463,12 +496,12 @@ class NapcatBot:
         严格校验协议端 status：返回 failed 时抛 RuntimeError，避免上层把错误当空结果。
         若当前 NapCat 不支持 get_file action（如 "不支持的Api"），自动回退 get_file_v2。
         """
-        response = self.post('get_file', {'file_id': file_id})
+        response = self.post('get_file', {'file_id': file_id}, timeout=self.FILE_ACTION_TIMEOUT)
         action_used = 'get_file'
         if not (isinstance(response, dict) and str(response.get('status') or '').lower() == 'ok'):
             message = str(response.get('message') or response.get('wording') or '')
             if any(token in message for token in ('不支持', 'not support', 'not_support')):
-                response = self.post('get_file_v2', {'file_id': file_id})
+                response = self.post('get_file_v2', {'file_id': file_id}, timeout=self.FILE_ACTION_TIMEOUT)
                 action_used = 'get_file_v2'
         response = self._require_action_success(action_used, response)
         data = response.get('data') or {}
@@ -512,12 +545,19 @@ class NapcatBot:
         if not resolved_url:
             raise ValueError('download url is empty')
         headers = self._build_http_headers(target_url=resolved_url)
-        with requests.get(resolved_url, headers=headers, timeout=60, stream=True) as response:
+        with requests.get(
+            resolved_url,
+            headers=headers,
+            timeout=self.DOWNLOAD_TIMEOUT,
+            stream=True,
+        ) as response:
             response.raise_for_status()
             resp_headers = getattr(response, 'headers', None) or {}
             content_type = str(resp_headers.get('Content-Type') or '').lower()
             if content_type.startswith('application/json'):
-                raise RuntimeError(f'下载端点返回 JSON 响应（{content_type}），疑似协议错误而非文件')
+                raise RuntimeError(
+                    f'下载端点返回 JSON 响应（{content_type}），疑似协议错误而非文件。URL: {resolved_url}'
+                )
             with open(dest_path, 'wb') as fh:
                 for chunk in response.iter_content(chunk_size=64 * 1024):
                     if chunk:

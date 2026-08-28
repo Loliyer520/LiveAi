@@ -103,5 +103,7 @@ class ScopeActorDispatcher:
         if entry is not None:
             if not isinstance(entry.transient, dict):
                 raise RuntimeError(f'mailbox transient must be a dict: {scope_key}')
-            return entry.transient
+            item = entry.transient
+            item['_mailbox_entry'] = entry
+            return item
         return self.sessions.promote_pending_task_if_mailbox_empty(scope_key)

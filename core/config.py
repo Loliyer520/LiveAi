@@ -38,6 +38,19 @@ def _get_int(section: str, key: str, env_key: str, default: int) -> int:
     return int(os.getenv(env_key, str(default)))
 
 
+def _get_int_list(section: str, key: str, env_key: str, default: list[int]) -> list[int]:
+    """Get integer list config value: YAML > ENV(comma separated) > default"""
+    yaml_value = _yaml_config.get(section, {}).get(key)
+    if yaml_value is not None:
+        if isinstance(yaml_value, list):
+            return [int(item) for item in yaml_value]
+        return [int(item) for item in str(yaml_value).split(',') if item.strip()]
+    env_value = os.getenv(env_key)
+    if env_value:
+        return [int(item) for item in env_value.split(',') if item.strip()]
+    return list(default)
+
+
 def _get_float(section: str, key: str, env_key: str, default: float) -> float:
     """Get float config value: YAML > ENV > default"""
     yaml_value = _yaml_config.get(section, {}).get(key)
@@ -72,6 +85,11 @@ class NapcatConfig:
 @dataclass
 class SatangyunConfig:
     target_group_id: int = _get_int('satangyun', 'target_group_id', 'SATANGYUN_GROUP_ID', 0)
+    whitelist_group_ids: list[int] = field(
+        default_factory=lambda: _get_int_list(
+            'satangyun', 'whitelist_group_ids', 'SATANGYUN_WHITELIST_GROUP_IDS', []
+        )
+    )
     auth_api_base: str = _get('satangyun', 'auth_api_base', 'SATANGYUN_AUTH_BASE', 'https://auth.example.com')
     admin_token: str = _get('satangyun', 'admin_token', 'SATANGYUN_ADMIN_TOKEN', 'your_admin_token')
     notice_image_url: str = _get('satangyun', 'notice_image_url', 'SATANGYUN_NOTICE_IMAGE', 'https://example.com/notice.jpg')
@@ -111,7 +129,7 @@ class AIConfig:
     github_api_token: str = _get('ai', 'github_api_token', 'AI_GITHUB_API_TOKEN', 'ghp_your_github_token')
     update_repo_owner: str = _get('ai', 'update_repo_owner', 'AI_UPDATE_REPO_OWNER', 'Loliyer520')
     update_repo_name: str = _get('ai', 'update_repo_name', 'AI_UPDATE_REPO_NAME', 'LiveAi')
-    auto_update_enabled: bool = _get_bool('ai', 'auto_update_enabled', 'AI_AUTO_UPDATE_ENABLED', True)
+    auto_update_enabled: bool = _get_bool('ai', 'auto_update_enabled', 'AI_AUTO_UPDATE_ENABLED', False)
     auto_update_check_hour: int = _get_int('ai', 'auto_update_check_hour', 'AI_AUTO_UPDATE_CHECK_HOUR', 4)
     tasker_prompt_path: str = _get('ai', 'tasker_prompt_path', 'AI_TASKER_PROMPT_PATH', _get('ai', 'dev_agent_prompt_path', 'AI_DEV_AGENT_PROMPT_PATH', 'data/prompt/dev_agent.txt'))
     # Legacy attribute kept for old runtime/extensions.

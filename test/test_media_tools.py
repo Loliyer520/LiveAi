@@ -509,6 +509,80 @@ class MediaToolTests(unittest.IsolatedAsyncioTestCase):
                 bot.download_file_to('/files/x.bin', str(dest))
             self.assertFalse(dest.exists(), '占位文件必须被删除（落盘即清）')
 
+    def test_napcat_get_group_file_url_returns_direct_link(self):
+        bot = NapcatBot('ws://invalid', 'http://napcat:3000', 1)
+        calls = []
+
+        def fake_post(action, params):
+            calls.append((action, params))
+            return {
+                'status': 'ok',
+                'retcode': 0,
+                'data': {'url': 'https://cdn.example.com/files/demo.jar'},
+            }
+
+        bot.post = fake_post
+        result = bot.get_group_file_url('file-1', '12345')
+        self.assertEqual(calls, [('get_group_file_url', {'file_id': 'file-1', 'group': '12345'})])
+        self.assertEqual(result, 'https://cdn.example.com/files/demo.jar')
+
+    def test_napcat_get_private_file_url_returns_direct_link(self):
+        bot = NapcatBot('ws://invalid', 'http://napcat:3000', 1)
+        bot.post = lambda *_a, **_k: {
+            'status': 'ok',
+            'retcode': 0,
+            'data': {'url': 'https://cdn.example.com/files/private.jar'},
+        }
+        result = bot.get_private_file_url('file-9')
+        self.assertEqual(result, 'https://cdn.example.com/files/private.jar')
+
+    def test_napcat_resolve_download_url_rejects_windows_local_paths(self):
+        bot = NapcatBot('ws://invalid', 'http://napcat:3000', 1)
+        self.assertEqual(bot._resolve_download_url(r'C:\Users\foo\x.jar'), '')
+        self.assertEqual(bot._resolve_download_url(r'D:/data/x.png'), '')
+        self.assertEqual(bot._resolve_download_url('\\\\server\\share\\x.jar'), '')
+        self.assertEqual(bot._resolve_download_url('https://cdn.example.com/x.jar'), 'https://cdn.example.com/x.jar')
+        self.assertEqual(bot._resolve_download_url('/dl/x.bin'), 'http://napcat:3000/dl/x.bin')
+
+    async def test_download_file_tool_prefers_direct_url_channel(self):
+        runtime = object.__new__(AIOrchestrator)
+        runtime.config = SimpleNamespace(history_limit=20)
+        runtime._short_text = lambda text, _limit=0: str(text or '')
+        runtime.bot = SimpleNamespace(
+            get_file=Mock(return_value={
+                'file': '/app/napcat/tmp/demo.txt',
+                'url': '/app/napcat/tmp/demo.txt',
+                'size': 5,
+            }),
+            get_group_file_url=Mock(return_value='https://cdn.example.com/files/demo.txt'),
+            download_file_to=Mock(side_effect=lambda _url, dest: Path(dest).write_bytes(b'hello')),
+        )
+        runtime.tools = SimpleNamespace(record_tool_use=Mock())
+        saved_path = Path('c:/Users/loliyc/Documents/Code/LiveAi/data/file/7/demo.txt')
+        try:
+            if saved_path.exists():
+                saved_path.unlink()
+            result = await AIOrchestrator._run_ai_tool_call(
+                runtime,
+                'group',
+                '7',
+                'agent-1',
+                'download_file',
+                {'file_id': 'file-1', 'file_name': 'demo.txt'},
+            )
+            runtime.bot.get_group_file_url.assert_called_once_with('file-1', '7')
+            args = runtime.bot.download_file_to.call_args.args
+            self.assertEqual(args[0], 'https://cdn.example.com/files/demo.txt')
+            self.assertEqual(Path(args[1]), saved_path)
+            self.assertTrue(saved_path.exists())
+            self.assertEqual(saved_path.read_bytes(), b'hello')
+            self.assertIn('文件已保存', result)
+        finally:
+            try:
+                saved_path.unlink()
+            except FileNotFoundError:
+                pass
+
 
 if __name__ == '__main__':
     unittest.main()

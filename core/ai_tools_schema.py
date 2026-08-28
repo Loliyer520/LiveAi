@@ -1,7 +1,7 @@
 import copy
 
 # 循环型工具：执行后把 tool_result 回填给模型继续本回合
-LOOP_TOOL_NAMES = {'memory_list', 'memory_get', 'memory_add', 'memory_update', 'web_search', 'find_in_project', 'list_local_files', 'read_local_file', 'list_tasks', 'get_task', 'download_file', 'check_github_version', 'execute_update', 'create_agent', 'create_ssh_agent', 'list_ssh_profiles', 'manage_ssh_profile', 'validate_ssh_profile', 'send_to_agent', 'peek_agent', 'list_agents', 'destroy_agent', 'create_recurring_task', 'list_recurring_tasks', 'update_recurring_task', 'delete_recurring_task', 'view_image', 'list_stickers', 'annotate_sticker', 'send_sticker', 'view_sticker', 'send_local_image', 'send_voice', 'send_file', 'manage_upstream', 'manage_channel', 'manage_role', 'query_logs', 'manage_mute', 'qq_add_friend', 'qq_list_friend_requests', 'qq_approve_friend_request', 'qq_reject_friend_request', 'qq_join_group', 'qq_list_group_requests', 'qq_approve_group_request', 'qq_reject_group_request', 'qq_sync_contacts', 'validate_model_config', 'switch_agent_channel', 'relation_lookup', 'relation_list', 'relation_update_user', 'relation_add_fact', 'manage_knowledge_base', 'request_knowledge_base_update', 'set_thinking_level', 'set_session_mode', 'set_trigger_rate'}
+LOOP_TOOL_NAMES = {'memory_list', 'memory_get', 'memory_add', 'memory_update', 'note_list', 'note_read', 'note_write', 'note_delete', 'web_search', 'find_in_project', 'list_local_files', 'read_local_file', 'list_tasks', 'get_task', 'download_file', 'check_github_version', 'execute_update', 'create_agent', 'create_ssh_agent', 'list_ssh_profiles', 'manage_ssh_profile', 'validate_ssh_profile', 'send_to_agent', 'peek_agent', 'list_agents', 'destroy_agent', 'create_recurring_task', 'list_recurring_tasks', 'update_recurring_task', 'delete_recurring_task', 'view_image', 'list_stickers', 'annotate_sticker', 'send_sticker', 'view_sticker', 'send_local_image', 'send_voice', 'send_file', 'manage_upstream', 'manage_channel', 'manage_role', 'query_logs', 'manage_mute', 'qq_add_friend', 'qq_list_friend_requests', 'qq_approve_friend_request', 'qq_reject_friend_request', 'qq_join_group', 'qq_list_group_requests', 'qq_approve_group_request', 'qq_reject_group_request', 'qq_sync_contacts', 'validate_model_config', 'switch_agent_channel', 'relation_lookup', 'relation_list', 'relation_update_user', 'relation_add_fact', 'manage_knowledge_base', 'request_knowledge_base_update', 'set_thinking_level', 'set_session_mode', 'set_trigger_rate'}
 
 # 指令型工具：终结本回合，由运行时按结构化入参执行
 DIRECTIVE_TOOL_NAMES = {'send_message', 'remember', 'notify_master', 'create_task', 'create_tasker', 'recall_message', 'stay_silent'}
@@ -637,7 +637,8 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
             '创建后系统会自动开启巡检定时器，每 5 分钟把本会话所有 agent 的进度合并推给你一次；'
             '同一会话的多个 agent 共用这一个定时器，全部结束后自动清理，你不需要自己 create_recurring_task。'
             'instruction 必须提供全量情报：任务目标、背景、相关文件路径、已知约束、已尝试过或已排除的方案、期望产出与验收标准、需要的环境与权限，一次性写全，不要让 agent 靠猜补信息；涉及仓库时带上 owner/repo。'
-            '可选 cwd 指定工作目录：/ 表示仓库根目录，~ 表示项目目录，也可写成 /core 或 ~/pack 这种项目内路径。'
+            '可选 cwd 指定相对工作目录：/ 表示工作区根目录，~ 语义相同，也可写成 /core 或 ~/pack 这种工作区内路径。'
+            '可选 workspace_root 仅可在号主明确授权时传入已存在的主机绝对目录；该目录会持久化为本地 agent 的唯一根，shell 和所有本地文件工具均不可越出。'
             '可选 read_only=true 表示只读模式：禁止修改本地文件、禁止写 GitHub、禁止执行可能改动环境的 shell。'
             '简单、一次性的活优先用 create_tasker；只有需要长期跟进或中途持续补充要求时再用它。'
             '注意：这是高权限工具，只有当前请求者是号主本人时才应创建。'
@@ -646,7 +647,8 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
             'type': 'object',
             'properties': {
                 'instruction': {'type': 'string', 'description': '交给该 agent 的任务描述，必须包含全量情报（目标/背景/相关文件/约束/已尝试/期望产出/验收标准），宁可多写不可少写；agent 凭它开工，缺信息会主动来问'},
-                'cwd': {'type': 'string', 'description': '可选工作目录。/ 为仓库根目录，~ 为项目目录，也可写 /subdir 或 ~/subdir'},
+                'cwd': {'type': 'string', 'description': '可选工作目录，始终相对 agent 工作区。/ 为工作区根目录，~ 语义相同，也可写 /subdir 或 ~/subdir'},
+                'workspace_root': {'type': 'string', 'description': '可选且仅号主明确授权时传入的主机绝对工作区目录。必须真实存在，/、/mnt/c 等过宽根会拒绝；设置后 shell 与全部本地文件工具均限制在此根。'},
                 'read_only': {'type': 'boolean', 'description': '是否启用只读模式。true 时仅允许只读查阅，不允许写文件/写 GitHub/执行可能修改环境的 shell'},
             },
             'required': ['instruction'],
@@ -693,7 +695,7 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
             '用于在 agent 挂起待命、运行中或 review_required 阶段复核态补充要求、回答提问、调整方向。'
             '若处于 review_required，发送“继续”或纠偏指令都会保留现有上下文并重置本阶段轮次，不会重开 agent。'
             'agent_id 来自 create_agent 的返回或 list_agents。'
-            '如有需要，也可同时更新该 agent 的工作目录 cwd 或只读开关 read_only。'
+            '如有需要，也可同时更新该 agent 的相对工作目录 cwd、已授权本地工作区 workspace_root 或只读开关 read_only。'
             '当 agent 通过内部系统通知来问你问题、要你拍板或汇报阶段进度时，必须用这个工具回它；你在普通文字里直接说，agent 是收不到的。'
             '回答 agent 的提问要完整、正面、直接拍板：缺什么补什么、纠偏说清楚改哪，不要只回半句话让它继续猜。'
         ),
@@ -702,7 +704,8 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
             'properties': {
                 'agent_id': {'type': 'string', 'description': '目标 agent 的 ID'},
                 'message': {'type': 'string', 'description': '要发给该 agent 的消息或指令内容；回答其提问时务必完整正面，一次性把信息补齐、把决定拍板，不要让它靠猜继续'},
-                'cwd': {'type': 'string', 'description': '可选，顺便更新 agent 工作目录。/ 为仓库根目录，~ 为项目目录，也可写 /subdir 或 ~/subdir'},
+                'cwd': {'type': 'string', 'description': '可选，顺便更新 agent 相对工作区的工作目录。/ 为工作区根目录，~ 语义相同，也可写 /subdir 或 ~/subdir'},
+                'workspace_root': {'type': 'string', 'description': '可选，仅号主明确授权时更新本地 agent 的主机绝对工作区目录；必须真实存在且不能是 /、/mnt/c 等过宽根'},
                 'read_only': {'type': 'boolean', 'description': '可选，顺便更新 agent 是否只读。true=只读，false=可写'},
             },
             'required': ['agent_id', 'message'],
@@ -1028,6 +1031,65 @@ _TOOL_DEFINITIONS: dict[str, dict] = {
             'required': ['suggestion'],
         },
     },
+    'note_list': {
+        'name': 'note_list',
+        'description': (
+            '列出笔记。scope="session" 列当前会话私有笔记（仅自己可见）；'
+            'scope="global" 列全局公有笔记（所有 AI 都能看到，写入时会附带作者信息）。'
+            '默认 session。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'scope': {'type': 'string', 'enum': ['session', 'global'], 'description': '笔记范围'},
+            },
+            'required': [],
+        },
+    },
+    'note_read': {
+        'name': 'note_read',
+        'description': '读取一篇笔记的完整内容。需要提供 note_id（来自 note_list）和 scope。',
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'note_id': {'type': 'string', 'description': '笔记 ID'},
+                'scope': {'type': 'string', 'enum': ['session', 'global'], 'description': '笔记范围'},
+            },
+            'required': ['note_id'],
+        },
+    },
+    'note_write': {
+        'name': 'note_write',
+        'description': (
+            '写入或更新一篇 Markdown 笔记。'
+            'scope="session" 为当前会话私有，适合记录只对本会话有意义的信息；'
+            'scope="global" 为全局公有，适合记录跨会话有价值的知识、约定、经验，写入时会自动加上作者标注。'
+            '提供 note_id 则覆盖更新已有笔记，不提供则新建。'
+            'title 作为文件名和标题，content 为 Markdown 正文。'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'title': {'type': 'string', 'description': '笔记标题（同时用作文件名）'},
+                'content': {'type': 'string', 'description': 'Markdown 格式的笔记正文'},
+                'scope': {'type': 'string', 'enum': ['session', 'global'], 'description': '笔记范围，默认 session'},
+                'note_id': {'type': 'string', 'description': '要覆盖的已有笔记 ID，不填则新建'},
+            },
+            'required': ['title', 'content'],
+        },
+    },
+    'note_delete': {
+        'name': 'note_delete',
+        'description': '删除一篇笔记。需要提供 note_id 和 scope。',
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'note_id': {'type': 'string', 'description': '笔记 ID'},
+                'scope': {'type': 'string', 'enum': ['session', 'global'], 'description': '笔记范围'},
+            },
+            'required': ['note_id'],
+        },
+    },
 
 }
 def build_tools(
@@ -1062,6 +1124,7 @@ def build_tools(
         # 号主私聊默认也是 chat 模式，配置/更新类工具保留，否则改配置得先切模式。
     if include_memory:
         names.extend(['memory_list', 'memory_get', 'memory_add', 'memory_update'])
+        names.extend(['note_list', 'note_read', 'note_write', 'note_delete'])
     if allow_search:
         names.append('web_search')
     names.append('set_thinking_level')

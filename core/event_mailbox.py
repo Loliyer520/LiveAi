@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, replace
 import threading
+import time
 from typing import Any, Iterable
 
 from core.event_envelope import EventEnvelope
@@ -18,10 +19,17 @@ class MailboxEntry:
 
     envelope: EventEnvelope
     transient: Any = None
+    attempt: int = 0
+    not_before: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.envelope, EventEnvelope):
             raise TypeError('envelope must be an EventEnvelope')
+
+    def is_ready(self, now: float | None = None) -> bool:
+        if self.not_before <= 0:
+            return True
+        return (time.time() if now is None else now) >= self.not_before
 
 
 @dataclass(frozen=True)
@@ -121,7 +129,11 @@ class InMemoryEventMailbox:
         return None if entry is None else entry.envelope
 
     def pop_scope_entry(self, scope_key: str) -> MailboxEntry | None:
-        """Atomically remove one FIFO entry, including its transient object."""
+        """Atomically remove one FIFO entry, including its transient object.
+
+        An entry whose retry backoff has not elapsed keeps the whole scope
+        parked: returning later events ahead of it would break FIFO ordering.
+        """
         scope_key = str(scope_key or '').strip()
         if not scope_key:
             raise ValueError('scope_key must be non-empty')
@@ -130,9 +142,38 @@ class InMemoryEventMailbox:
             if not queue:
                 self._scope_queues.pop(scope_key, None)
                 return None
+            if not queue[0].is_ready():
+                return None
             entry = queue.popleft()
             if not queue:
                 self._scope_queues.pop(scope_key, None)
+            return entry
+
+    def requeue_front(
+        self,
+        event: EventEnvelope,
+        transient: Any = None,
+        *,
+        attempt: int = 1,
+        delay: float = 0.0,
+    ) -> MailboxEntry:
+        """Re-admit a failed event at the head of its scope, deferred by ``delay``.
+
+        Head placement keeps the retried event ahead of anything that arrived
+        while it was being processed, so FIFO order survives a failed turn.
+        """
+        if not isinstance(event, EventEnvelope):
+            raise TypeError('event must be an EventEnvelope')
+        with self._lock:
+            queued = replace(event, mailbox_sequence=self._next_sequence)
+            self._next_sequence += 1
+            entry = MailboxEntry(
+                envelope=queued,
+                transient=transient,
+                attempt=max(1, int(attempt)),
+                not_before=time.time() + max(0.0, float(delay)),
+            )
+            self._scope_queues.setdefault(queued.scope_key, deque()).appendleft(entry)
             return entry
 
     def drain_scope(self, scope_key: str) -> EventBatch | None:
@@ -140,9 +181,13 @@ class InMemoryEventMailbox:
         if not scope_key:
             raise ValueError('scope_key must be non-empty')
         with self._lock:
-            queue = self._scope_queues.pop(scope_key, None)
+            queue = self._scope_queues.get(scope_key)
             if not queue:
+                self._scope_queues.pop(scope_key, None)
                 return None
+            if not queue[0].is_ready():
+                return None
+            self._scope_queues.pop(scope_key, None)
             entries = tuple(queue)
         return EventBatch(
             scope_key=scope_key,
