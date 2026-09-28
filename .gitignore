@@ -5,3 +5,9 @@ dist/
 !.env.example
 *.log
 coverage/
+
+# 运行数据：密钥/聊天归档/人设，永不入库（插件清单除外）
+data/*
+!data/plugins/
+data/plugins/secrets.json
+data/plugins/_state.json
