@@ -8,7 +8,7 @@
 
 LiveAI 希望把 AI 从一个需要被反复打开的聊天窗口，变成真正生活在社交账户上的数字代理。它负责接收消息、理解上下文、调用模型、管理账户，并在明确的权限边界内替你处理重复而繁琐的事情。
 
-> 当前已完成 Phase 0：Node.js/TypeScript 宿主骨架、配置加载、结构化日志、进程内事件总线、生命周期管理和健康检查。业务模块仍在逐步接入。
+> 当前已完成：Phase 0 宿主骨架，以及从旧版 Python 架构移植的完整聊天运行时（NapCat/OneBot 适配、作用域串行管线、插队合并、提示词分层、模型渠道、JSON 持久化、聊天工具集）。WebUI 与提示词评估仍在路线图上。
 
 ## 项目目标
 
@@ -363,19 +363,109 @@ conversationKey = accountId + ":" + conversationId
 - 建立人格、场景和行为回归样例
 - 增加运行状态、会话和调度观测界面
 
-## Phase 0 宿主骨架
+## 当前实现：聊天运行时（Phase 1–3 核心）
 
-当前仓库已经具备一个最小可运行的 Node.js 宿主：
+在 Phase 0 宿主之上，已经移植了旧版架构验证过的完整聊天链路。
 
-- `Host` 按顺序启动模块，并在关闭时逆序释放资源
-- 任一模块启动失败时，自动回滚已经启动的模块
-- `Config` 集中读取和校验监听地址、端口和日志级别
-- `EventBus` 提供进程内异步事件发布订阅，并隔离监听器异常
-- `Logger` 输出结构化 JSON 日志
-- `HealthServer` 提供 `/health` 和 `/ready` 健康检查
-- 所有服务器和后台资源都由宿主生命周期管理
+### 作用域串行管线（`src/scope/`）
 
-这一阶段故意不包含模型供应商、OneBot、WebUI、数据库和真实账户连接。它们将在宿主接口稳定后逐步接入。
+- `EventEnvelope` / `InMemoryEventMailbox`：按 `group:<id>` / `private:<id>` 分队列的 FIFO 邮箱；失败重试的条目回到队头且退避期间整个作用域停车，顺序永不乱
+- `CharacterSession` + `ScopeActorDispatcher`：每个会话一个单消费者 actor，同会话严格串行、跨会话并发
+- `AtomicTurnBatchCoordinator` + `turnItemFromBatch`：一轮结束后原子排空邮箱，把积压消息合并成一个续跑回合（突发 N 条 → 只触发 1 次补充模型调用）
+
+### 聊天插队语义（`src/chat/orchestrator.ts`）
+
+从旧版 `_run_message_turn` / `_merge_followup_after_turn` 移植的核心行为：
+
+1. 作用域忙时新消息只入队，绝不打断进行中的模型调用
+2. 工具循环的每轮之间排空邮箱：新消息折叠成下一轮触发消息，`deferredCount` 上升触发「补审提醒」，旧草稿作废、已发消息进入历史续接
+3. 回合结束后再排空一次：合并成一个后续回合；全是静默事件则跳过
+4. `messageEpoch` 全局失效与按时间戳的 stale 丢弃在所有边界生效
+5. 异常时把「已执行完并生效的工具清单」写进历史中断备注，下一轮不会误以为没发生过
+
+### 触发判定（`src/chat/trigger.ts`）
+
+私聊必回 → @必回 → 触发词 → 概率（默认 0.01）。群聊防抖：未触发消息开启 60s 倾听窗口，静默 5s 且作用域空闲时合成续聊触发——旧版「像真人一样在群里自然接话」的机制。触发配置由模型自己用 `trigger_config` 工具调整（set_rate 设 0~1 接话率、add_word/remove_word 增删触发词），按会话持久化；群聊背景块会带上当前设置和「还没融入就尽量少说话」的提醒。
+
+### 提示词系统（`data/prompt/` + `src/prompt/`）
+
+- 分层文件：`char.txt` 人设、`char_prefill` 人设确认、`staff/10-50` 逐层拼接、`child_rules.txt` 25 条会话规则、`chat_focus` / `chat_style`
+- system 块顺序与旧版一致：`[staff+身份基线+规则（可缓存）] → [动态背景（时间/会话/印象/摘要/补审提醒）] → [人设尾巴放最后避免稀释]`
+- 消息协议：`<user_msg>` / `<user_invisible><tool_report>` / 短ID `[#A1B2]`；Anthropic 提示缓存断点在 system[0]、prefill 末尾与历史尾部前 4 条
+- 发言必须走 `send_message` 工具，`stay_silent` 显式沉默，`<thinking>` 标签自动过滤
+
+### 模型层（`src/models/`）
+
+`models_config.json` 的 upstreams / channels / roles；策略 fallback / random / roundrobin / fallback_reset；tiered 角色回退；协议 anthropic / completions / responses；瞬时错误重试 3 次、400/422 单次丢弃 stream_options / reasoning、空内容抛错、thinking 强制 temperature=1.0。
+
+### 持久化与记忆系统（`src/store/`）
+
+模仿 openclaw 的记忆模型，「总结概括」和「精准检索」双轨并行：
+
+**原始存档（`archive.ts`）**：每条消息（收到/发出/内部报告）同步追加进 per-scope 的 append-only JSONL（`data/state/archive/`），永不改写——这是精准检索的地基，即使活跃窗口滚动、摘要压缩，原话永远可查。
+
+**分层总结（`repository.ts` + `summarizer.ts`）**：
+
+- 50 条/段的日记分段 → 后台摘要任务浓缩成 150~300 字客观摘要（保留事件、约定、关系变化和可检索锚点）
+- 每 3 个新分段 → 把旧「会话整体梗概」+ 新分段摘要合并重生成一份滚动 primer（openclaw compaction 的对应物），直接进背景提示词
+- 摘要任务失败时原始分段留在队列里等重试；积压超过 10 段触发机械兜底摘要，绝不无限膨胀也绝不静默丢失；重启时自动扫描补跑
+
+**背景提示词里的呈现**：整体梗概置顶 → 最近 3 段摘要 → 一句「更早细节用 memory_search 查，不要凭印象编造」。
+
+**精准检索（`memory_search` 工具）**：
+
+- `query` 空格分词 = AND 条件，`"引号"` = 精确短语；可按 `user_id`、`days`、`scope`（当前会话/全部会话）过滤，上限 50 条
+- 命中带上下各一条上下文、时间戳、发言人、`[#短ID]`（可直接用于引用回复）
+- 子串精确匹配不模糊、零运行时依赖（文件扫描，openclaw grep 后端同思路）
+
+每会话状态文件（tmp+rename 原子写）：500 条活跃窗口、分段摘要（保留 20 段）、AI 备忘、跨重启的 4 位消息短ID映射。摘要走 `roles.summary` 渠道（未配置时自动回退 main），`ai.summary_enabled: false` 可整体关闭。
+
+### 关系网络（`src/relations/`）
+
+所有会话/群的子 AI 共享一张全局关系图谱（`data/state/relations.json`，原子写、串行落盘）：某人（QQ 号）在哪个群叫什么、出现在哪些会话、以及关于他的结构化情报。**在 A 群了解到的事，会出现在 B 群/私聊里这个人的档案上**——知识共享，但提示词带保密规则（不要说出"我在别的群看到你…"）。
+
+**图谱（`graph.ts`）**：
+
+- 人物：canonicalName（最新昵称）+ 各会话别名 + 出现的会话列表 + **整体印象** + 情报列表
+- 情报：`subject + category(identity/preference/event/relationship/emotion/other) + text + confidence + 来源(会话/工具)`；同文去重只刷新置信度；**supersede/retract 代替删除**（审计轨迹保留）；每人上限 60 条 active，超出退役最旧的
+- 会话：**印象（用途/氛围/关键人物，原 per-scope 印象已并入此处，启动时自动迁移旧值）** + 成员采样（≤40）+ 话题标签（≤12）
+- 印象双写入口：子AI `impression_write`（当前会话印象）、主AI `relation_write`（人物/会话印象皆可）、自动抽取顺带刷新会话印象
+
+**双通道采集**：
+
+- **自动（`collector.ts`）**：每个会话每 20 条真实用户消息，后台把最近 24 条记录过一遍 `roles.summary` 渠道（temp 0.2，严格 JSON），抽取 ≤8 条情报 + 话题标签写进图谱。子 AI 完全不等待；失败提前重试（再攒 10 条就重跑），窗口更大成功率更高
+- **手动（`intel_report` 工具）**：子 AI 在对话中主动上报确认过的事实；`relation_query` 反向查档案/搜情报/列成员——想不起来某人是谁时先查再答
+
+**注入提示词**：发送者的人物卡（跨会话观察 + 置信度标注 + 保密规则）和本会话概况（印象 + 常聊话题 + 已知成员）进背景块；`ai.intel_enabled: false` 可关闭自动采集。
+
+### 主AI协调层（master scope）
+
+号主私聊作用域（`master_qq`）运行主AI：用 `main.txt` 职责定位而非聊天人设（无人设 prefill、规则不过滤、无聊天风格块），唤醒时自带**全局关系网络概览**（情报最多的人物 + 最活跃的会话）。
+
+**工具集按作用域切换**（`chatToolSchemas(isMaster)`）：子AI 拿 `notify_master` / `intel_report` / `impression_write`；主AI 换成——
+
+- `relation_write`：直接写关系网（人物印象/追加情报/取代/撤回/会话印象），录入置信度默认 1.0
+- `delegate_to_child`：把指令注入目标会话的子AI（跨会话联系/转达一律走这里，子AI 自然与用户交流，完成后 notify_master 回报）
+- `message_scope`：绕过子AI 直接向目标会话用户发消息（仅系统通知/紧急干预）
+- 主AI 没有 `notify_master`（中继给自己会形成自环）
+
+**闭环**：子AI `notify_master` → 中继进主AI作用域（`[子AI上报 from scope]`）→ 主AI归档/协调 → 主AI的纯文本结论自动**回传**来源会话（`[主AI回传]`，仅内部中继触发的回合，回主人的话绝不外漏）→ 委派任务的子AI回报再走 notify_master 回到主AI。工具结果门禁：子AI调到主AI专属工具会被拒绝并指回 notify_master。
+
+### 聊天工具（`src/chat/tools.ts`）
+
+`send_message`（唯一发言途径）、`stay_silent`、`recall_message`、`memory_list/write`、`notify_master`（中继到号主私聊作用域，号主作用域用 main.txt 主AI提示词）、`memory_search`（见记忆系统）、`intel_report` / `relation_query` / `impression_write`（见关系网络）、`trigger_config`（自调群聊触发率/触发词，见触发判定）。主AI作用域另有 `relation_write` / `delegate_to_child` / `message_scope`（见主AI协调层）。
+
+### 任务调度（`src/chat/scheduler.ts`）
+
+闹钟和周期任务**持久化**在 `data/state/tasks.json`（原子写），重启不丢：启动时恢复所有未触发任务，过期的立即补发。触发时回调编排器，往任务来源作用域注入内部消息（`[闹钟触发]` / `[周期任务触发]`）唤醒该会话的 AI 自主处理。
+
+- `create_task`：`kind=set_alarm`（`at` 传 Unix 秒或 `+90s/+5m/+2h/+1d`）；`kind=recurring_task`（`every` 传间隔、最短 1 分钟，`note` 写每次要执行的完整指令）
+- `list_tasks` / `cancel_task`：子AI只见本会话任务（取消他域任务会被拒并指回 notify_master）；主AI跨会话可见可管
+- 长延迟定时器自动分段重武装（setTimeout 24.8 天上限）；已完成/取消任务保留审计（上限 200 条）
+
+### 图片收发（`src/chat/images.ts` + `view_image`/`send_image` 工具）
+
+**收**：入站消息从 OneBot 数组段和 `[CQ:image,...]` 码里解析图片 URL（`url=` 优先，http 的 `file=` 兜底，CQ 转义还原），存进历史/触发条目的 `image_refs`；文本位置留 `[图片×N]` 标记。背景块注入「本次消息包含 N 张图片」提示，模型按需调 `view_image`（默认看本轮第 index 张，或传 `message_ref` 看历史某条的图，`question` 指定关注点）——视觉走 `roles.vision` 渠道（未配置自动回退 main），三种协议都支持图片块（anthropic `image/url`、completions `image_url`、responses `input_image`）。**发**：`send_image` 传 http(s) 链接 / `base64://` / 本地绝对路径，走 NapCat 图片段，发出后落一条 `[图片]` 历史（带短ID可引用）。
 
 ## 本地开发
 
@@ -398,15 +488,23 @@ pnpm build
 生产模式启动：
 
 ```bash
+cp data/config.example.json data/config.json
+cp data/models_config.example.json data/models_config.json
+# 填入 NapCat 地址/token 与模型渠道后：
 pnpm start
 ```
 
-默认监听 `127.0.0.1:3000`，可以通过进程环境变量调整：
+默认监听 `127.0.0.1:3000`，可以通过进程环境变量调整（env 优先于 data/config.json）：
 
 ```bash
 LIVEAI_HOST=127.0.0.1
 LIVEAI_PORT=3000
 LIVEAI_LOG_LEVEL=info
+LIVEAI_NAPCAT_WS_URL=ws://127.0.0.1:7821/openclaw-bind
+LIVEAI_NAPCAT_HTTP_URL=http://127.0.0.1:7822
+LIVEAI_NAPCAT_SELF_ID=0        # 0 = 从首个事件自动学习
+LIVEAI_NAPCAT_TOKEN=...
+LIVEAI_MASTER_QQ=241898129
 ```
 
 健康检查：
@@ -416,4 +514,6 @@ curl http://127.0.0.1:3000/health
 curl http://127.0.0.1:3000/ready
 ```
 
-当前实现不读取模型密钥、Bot 凭据或其他外部服务配置。接入真实账户前，应先使用测试账户、最小权限和明确的测试群聊验证消息路由与能力策略。
+测试覆盖：作用域管线（FIFO/停车/顺序/并行）、提示词渲染与组装、触发判定与防抖（含 trigger_config 自调）、关系网络与主AI协调闭环、任务调度（持久化/补发/周期/取消）、图片解析与收发工具，以及端到端编排流（插队合并、回合后续合并、中断备注、闹钟回注、图片提示、群聊触发提示），共 94 例。
+
+接入真实账户前，应先使用测试账户、最小权限和明确的测试群聊验证消息路由与能力策略。

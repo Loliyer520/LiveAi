@@ -2,6 +2,7 @@ import { fileURLToPath } from 'node:url';
 import { Host } from './host/host.js';
 import { loadConfig } from './config/config.js';
 import { HealthServer } from './api/health-server.js';
+import { ChatModule } from './app/chat-module.js';
 import { createLogger, errorContext } from './observability/logger.js';
 
 export async function createApplication(env: NodeJS.ProcessEnv = process.env): Promise<Host> {
@@ -9,10 +10,11 @@ export async function createApplication(env: NodeJS.ProcessEnv = process.env): P
   const logger = createLogger(config.logLevel);
   let host: Host;
 
+  const chat = new ChatModule(config);
   const healthServer = new HealthServer(config, {
     isReady: () => host?.snapshot().status === 'ready',
   });
-  host = new Host([healthServer]);
+  host = new Host([chat, healthServer]);
   logger.debug('Application created');
 
   return host;
