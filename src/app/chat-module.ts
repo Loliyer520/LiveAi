@@ -5,9 +5,11 @@
  */
 
 import { join } from 'node:path';
+import { exec } from 'node:child_process';
 import type { LiveAiModule } from '../host/types.js';
 import type { LiveAiConfig } from '../config/config.js';
 import { NapcatBot } from '../bot/napcat.js';
+import { BridgeWatchdog } from '../bot/bridge-watchdog.js';
 import { ScopeRepository } from '../store/repository.js';
 import { MessageArchive } from '../store/archive.js';
 import { DiarySummarizer } from '../store/summarizer.js';
@@ -16,7 +18,9 @@ import { IntelCollector } from '../relations/collector.js';
 import { PromptStore } from '../prompt/store.js';
 import { ModelManager } from '../models/manager.js';
 import { AiOrchestrator } from '../chat/orchestrator.js';
+import { NovelCommandHandler } from '../chat/novel-cmd.js';
 import { initPluginRegistry } from '../chat/plugins.js';
+import { configureStickers, configureTts } from '../chat/tools.js';
 
 export class ChatModule implements LiveAiModule {
   readonly name = 'chat';
@@ -30,6 +34,18 @@ export class ChatModule implements LiveAiModule {
   readonly prompts: PromptStore;
   readonly models: ModelManager;
   readonly orchestrator: AiOrchestrator;
+  private stickerRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly watchdogTimers = new Set<ReturnType<typeof setTimeout>>();
+  private readonly watchdogEnabled = process.env.LIVEAI_BRIDGE_WATCHDOG !== '0';
+  private readonly bridgeWatchdog: BridgeWatchdog | null;
+  private bridgeProbeTimer: ReturnType<typeof setInterval> | null = null;
+  private bridgeProbeFailures = 0;
+  /** 重启后验证仍不在线 → 登录态失效，需要人工扫码，停止自动重启。 */
+  private bridgeNeedsHuman = false;
+  private lastHumanWarnAt = 0;
+  private readonly masterQq: number;
+  private readonly napcatHttpUrl: string;
+  private readonly napcatToken: string;
 
   constructor(config: LiveAiConfig) {
     this.archive = new MessageArchive(join(config.storage.stateDir, 'archive'));
@@ -47,17 +63,25 @@ export class ChatModule implements LiveAiModule {
     );
     // Bot first: its handlers only fire on WebSocket events after start(),
     // by which time the orchestrator below exists.
+    this.masterQq = config.ai.masterQq;
+    this.napcatHttpUrl = config.napcat.httpUrl;
+    this.napcatToken = config.napcat.accessToken ?? '';
+    this.bridgeWatchdog = this.watchdogEnabled
+      ? new BridgeWatchdog({ onRestartNeeded: (n) => this.onBridgeZombie(n) })
+      : null;
     this.bot = new NapcatBot({
       wsUrl: config.napcat.wsUrl,
       httpUrl: config.napcat.httpUrl,
       selfId: config.napcat.selfId,
+      legacySelfIds: config.napcat.legacySelfIds,
       accessToken: config.napcat.accessToken,
       reconnectBaseMs: config.napcat.reconnectBaseMs,
       reconnectMaxMs: config.napcat.reconnectMaxMs,
-      handlers: {
+      watchdog: this.bridgeWatchdog ?? undefined,      handlers: {
         onGroupMessage: (message) => this.orchestrator.handleMessage(message),
         onPrivateMessage: (message) => this.orchestrator.handleMessage(message),
         onSelfMessage: (message) => this.orchestrator.handleSelfMessage(message),
+        onDatalineMessage: (message) => this.orchestrator.handleDatalineMessage(message),
         onConnected: () => console.info(`[napcat] websocket connected (${this.bot.selfId || 'self_id 待学习'})`),
         onDisconnected: (reason) => console.info(`[napcat] websocket disconnected: ${reason}, reconnecting…`),
       },
@@ -73,8 +97,20 @@ export class ChatModule implements LiveAiModule {
       relations: this.relations,
       intel: this.intel,
       tasksPath: join(config.storage.stateDir, 'tasks.json'),
+      novelCmd: config.novelCmd.scopes.length > 0
+        ? new NovelCommandHandler({
+          scopes: config.novelCmd.scopes,
+          baseUrl: config.novelCmd.baseUrl,
+          fallbackBaseUrls: config.novelCmd.fallbackBaseUrls,
+          statePath: join(config.storage.stateDir, 'novel-cmd.json'),
+          bot: this.bot,
+          repo: this.repo,
+        })
+        : null,
     });
     initPluginRegistry(process.env.LIVEAI_PLUGIN_DIR ?? join(config.storage.stateDir, '..', 'plugins'));
+    configureTts(config.tts.baseUrl, config.tts.timeoutMs);
+    configureStickers(join(config.storage.stateDir, '..', 'stickers', 'index.json'));
   }
 
   async start(): Promise<void> {
@@ -83,13 +119,122 @@ export class ChatModule implements LiveAiModule {
     await this.recoverPendingSummaries();
     this.orchestrator.start();
     this.bot.start();
+    this.scheduleStickerRefresh();
+    this.startBridgeProbe();
   }
 
   async stop(): Promise<void> {
+    if (this.stickerRefreshTimer !== null) {
+      clearTimeout(this.stickerRefreshTimer);
+      this.stickerRefreshTimer = null;
+    }
+    for (const timer of this.watchdogTimers) clearTimeout(timer);
+    this.watchdogTimers.clear();
+    if (this.bridgeProbeTimer !== null) {
+      clearInterval(this.bridgeProbeTimer);
+      this.bridgeProbeTimer = null;
+    }
     await this.orchestrator.stop();
     await this.summarizer.drainKnownScopes();
     await this.relations.flush();
     this.bot.stop();
+  }
+
+  /**
+   * QQ 宿主僵尸离线处置（2026-10-02 / 10-13 两次实发病灶）：
+   * 连续 BRIDGE_NOT_READY → 自动重启 napcat-qq-host（重登录自愈），
+   * 25s 后验证 online，恢复则私聊通知主人。
+   */
+  private onBridgeZombie(consecutiveFailures: number): void {
+    console.warn(`[bridge-watchdog] 连续 ${consecutiveFailures} 次 BRIDGE_NOT_READY，自动重启 napcat-qq-host`);
+    exec('systemctl restart napcat-qq-host', (error) => {
+      if (error) console.error('[bridge-watchdog] restart failed:', error.message);
+    });
+    const verify = setTimeout(() => {
+      this.watchdogTimers.delete(verify);
+      void this.verifyBridgeRecovered(consecutiveFailures);
+    }, 25_000);
+    verify.unref();
+    this.watchdogTimers.add(verify);
+  }
+
+  private async verifyBridgeRecovered(consecutiveFailures: number): Promise<void> {
+    try {
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if (this.napcatToken) headers.authorization = `Bearer ${this.napcatToken}`;
+      const response = await fetch(`${this.napcatHttpUrl}/get_status`, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(10_000) });
+      const payload = (await response.json()) as { data?: { online?: boolean; stat?: { bridge?: { phase?: string } } } };
+      if (payload.data?.online !== true) {
+        this.bridgeNeedsHuman = true;
+        console.warn(`[bridge-watchdog] 重启后 25s 仍未 online（phase=${payload.data?.stat?.bridge?.phase ?? '?'}）——登录态失效，自动重启无效，需人工扫码（NapCat WebUI :7630 取 txz 二维码）`);
+        return;
+      }
+      this.bridgeNeedsHuman = false;
+      console.info('[bridge-watchdog] QQ 已恢复在线');
+      await this.bot.sendText(
+        'private',
+        this.masterQq,
+        `[系统] 检测到 QQ 宿主僵尸离线（连续 ${consecutiveFailures} 次发送 BRIDGE_NOT_READY），已自动重启 napcat-qq-host，现已恢复在线。`,
+      );
+    } catch (error) {
+      console.warn('[bridge-watchdog] verify/notify failed:', error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  /**
+   * 主动探针（每 60s）：被动计数有盲区——号被腾讯「登录已失效」整体踢下线时
+   * 没有任何发送动作（2026-10-13 22:48 实发，静默到次日才发现），只能靠探针。
+   * 连续 2 次 online:false 走与被动相同的冷却门控重启；重启验证失败置
+   * needsHuman 后停止自动重启（登录态失效重启无用），每 30 分钟吼一次日志。
+   */
+  private startBridgeProbe(): void {
+    if (!this.watchdogEnabled || this.bridgeWatchdog === null) return;
+    this.bridgeProbeTimer = setInterval(() => void this.probeBridge(), 60_000);
+    this.bridgeProbeTimer.unref();
+  }
+
+  private async probeBridge(): Promise<void> {
+    try {
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if (this.napcatToken) headers.authorization = `Bearer ${this.napcatToken}`;
+      const response = await fetch(`${this.napcatHttpUrl}/get_status`, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(10_000) });
+      const payload = (await response.json()) as { data?: { online?: boolean; stat?: { bridge?: { phase?: string } } } };
+      if (payload.data?.online === true) {
+        this.bridgeProbeFailures = 0;
+        this.bridgeNeedsHuman = false;
+        return;
+      }
+      this.bridgeProbeFailures += 1;
+      const phase = payload.data?.stat?.bridge?.phase ?? '?';
+      console.warn(`[bridge-watchdog] 探针发现 QQ 不在线（连续 ${this.bridgeProbeFailures} 次，phase=${phase}）`);
+      if (this.bridgeNeedsHuman) {
+        if (Date.now() - this.lastHumanWarnAt > 30 * 60_000) {
+          this.lastHumanWarnAt = Date.now();
+          console.warn('[bridge-watchdog] QQ 登录态已失效，自动重启无法恢复，需人工扫码重新登录（NapCat WebUI :7630 → GetQQLoginQrcode）');
+        }
+        return;
+      }
+      if (this.bridgeProbeFailures >= 2) this.bridgeWatchdog?.tryRestart();
+    } catch {
+      // 探针自身失败 = napcat backend 都没响应，WS 重连逻辑会管，不计数
+    }
+  }
+
+  /**
+   * 启动后延时同步一次表情包库（fetch_custom_face → 按 MD5 增量 → 新表情
+   * 视觉打标）。延时是等 NapCat 连接/登录就绪；无新表情时只花一次清单拉取。
+   */
+  private scheduleStickerRefresh(): void {
+    this.stickerRefreshTimer = setTimeout(() => {
+      this.stickerRefreshTimer = null;
+      this.orchestrator
+        .refreshStickerLibrary()
+        .then((result) => console.info(`[chat-module] sticker refresh: ${result.message}`))
+        .catch((error) =>
+          console.warn('[chat-module] sticker refresh failed:', error instanceof Error ? error.message : String(error))
+        );
+    }, 45_000);
+    this.stickerRefreshTimer.unref();
   }
 
   /** Restart recovery: scopes with unsummarized diary segments re-enqueue. */
