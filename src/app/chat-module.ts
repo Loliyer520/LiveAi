@@ -22,6 +22,7 @@ import { ModelManager } from '../models/manager.js';
 import { AiOrchestrator } from '../chat/orchestrator.js';
 import { NovelCommandHandler } from '../chat/novel-cmd.js';
 import { initPluginRegistry } from '../chat/plugins.js';
+import { loadDomains } from '../chat/domains.js';
 import { configureMcBot, configureStickers, configureTts } from '../chat/tools.js';
 import { configureMediaSpool } from '../chat/media-spool.js';
 import { configureMc2d, mc2dClient } from '../chat/mc2d.js';
@@ -128,6 +129,7 @@ export class ChatModule implements LiveAiModule {
         : null,
     });
     initPluginRegistry(process.env.LIVEAI_PLUGIN_DIR ?? join(config.storage.stateDir, '..', 'plugins'));
+    loadDomains(process.env.LIVEAI_DOMAIN_DIR ?? join(config.storage.stateDir, '..', 'domains'));
     configureTts(config.tts.baseUrl, config.tts.timeoutMs);
     configureStickers(join(config.storage.stateDir, '..', 'stickers', 'index.json'));
     // 反向 WS 模式下 NapCat 在号主本地：视频/语音文件经 /media/ 外吐给它拉取。

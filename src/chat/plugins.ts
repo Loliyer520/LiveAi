@@ -25,6 +25,7 @@ import type { ToolSchema } from '../models/types.js';
 import type { ToolContext, ToolResult } from './tools.js';
 import { webFetch } from './net.js';
 import { spendNetworkBudget, sendLinesVerbatim, SEND_FILE_MAX_LINES } from './actions.js';
+import { probeRecord } from '../observability/probe.js';
 
 export interface PluginToolRequest {
   method?: string;
@@ -94,10 +95,28 @@ export interface PluginToolDef {
   response?: PluginToolResponse;
 }
 
+/**
+ * 面板可编辑的配置项声明（manifest v2）。值存
+ * data/plugins/_config.json（{插件名: {KEY: 值}}），请求模板用
+ * {{config.KEY}} 引用——密钥仍走 secrets.json，config 放非敏感设置。
+ */
+export interface PluginConfigField {
+  title: string;
+  description?: string;
+  type: 'string' | 'number' | 'boolean';
+  default?: string | number | boolean;
+}
+
 export interface PluginManifest {
   name: string;
   description?: string;
   enabled?: boolean;
+  /** manifest v2：插件版本（面板展示/市场对版本用）。 */
+  version?: string;
+  /** manifest v2：要求的最小核心版本（semver 字符串，可缺省）。 */
+  minCore?: string;
+  /** manifest v2：面板自动生成配置表单。 */
+  config?: Record<string, PluginConfigField>;
   tools: PluginToolDef[];
 }
 
@@ -106,6 +125,30 @@ export interface PluginInfo {
   description: string;
   enabled: boolean;
   tools: string[];
+  error?: string;
+}
+
+/** Panel-facing tool spec (see PluginRegistry.toolDetails); no URLs/secrets. */
+export interface PluginToolDetail {
+  name: string;
+  description: string;
+  method: string;
+  params: { key: string; type: string; description: string; required: boolean }[];
+  allowInternal: boolean;
+  usesSecrets: boolean;
+  /** URL/头/体里引用了 {{config.*}}（manifest v2）。 */
+  usesConfig: boolean;
+  /** 引用了 {{config.*}} 但对应配置项还没有值 → 面板提示先保存配置。 */
+  configMissing: boolean;
+  /** GET + 无密钥 + 无副作用 → 面板可直接试玩。 */
+  tryable: boolean;
+}
+
+export interface PluginTryResult {
+  ok: boolean;
+  status?: number;
+  ms?: number;
+  body?: string;
   error?: string;
 }
 
@@ -136,6 +179,8 @@ export class PluginRegistry {
   private errors = new Map<string, string>();
   private enabledOverrides: Record<string, boolean> = {};
   private secrets: Record<string, string> = {};
+  /** manifest v2 配置值：{插件名: {KEY: 值}}（_config.json，含默认值回填）。 */
+  private configValues: Record<string, Record<string, string | number | boolean>> = {};
 
   constructor(readonly dir: string) {}
 
@@ -145,10 +190,19 @@ export class PluginRegistry {
     this.errors.clear();
     this.enabledOverrides = this.readJsonFile<Record<string, boolean>>(join(this.dir, '_state.json')) ?? {};
     this.secrets = this.readJsonFile<Record<string, string>>(join(this.dir, 'secrets.json')) ?? {};
+    this.configValues = this.readJsonFile<Record<string, Record<string, string | number | boolean>>>(join(this.dir, '_config.json')) ?? {};
     if (!existsSync(this.dir)) return;
     for (const entry of readdirSync(this.dir, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name.startsWith('_') || entry.name.startsWith('.')) continue;
       this.loadOne(entry.name);
+    }
+    // v2 配置项缺省值回填（只回填内存，不动磁盘——首次保存才落盘）。
+    for (const manifest of this.manifests.values()) {
+      for (const [key, field] of Object.entries(manifest.config ?? {})) {
+        if (this.configValues[manifest.name]?.[key] === undefined && field.default !== undefined) {
+          (this.configValues[manifest.name] ??= {})[key] = field.default;
+        }
+      }
     }
   }
 
@@ -202,6 +256,41 @@ export class PluginRegistry {
     writeFileSync(join(this.dir, '_state.json'), JSON.stringify(this.enabledOverrides, null, 2), 'utf-8');
   }
 
+  /** manifest v2 配置：声明 + 生效值（面板表单用）。 */
+  getConfig(name: string): { spec: Record<string, PluginConfigField>; values: Record<string, string | number | boolean> } | null {
+    const manifest = this.manifests.get(name);
+    if (!manifest) return null;
+    return { spec: manifest.config ?? {}, values: { ...(this.configValues[name] ?? {}) } };
+  }
+
+  /** manifest v2 配置保存：只收声明过的 KEY，按声明类型强转后落 _config.json。 */
+  setConfig(name: string, values: Record<string, unknown>): Record<string, string | number | boolean> {
+    const manifest = this.manifests.get(name);
+    if (!manifest) throw new Error(`没有插件 ${name}`);
+    const spec = manifest.config ?? {};
+    const next: Record<string, string | number | boolean> = {};
+    for (const [key, field] of Object.entries(spec)) {
+      const incoming = values[key];
+      if (incoming === undefined || incoming === null || String(incoming).trim() === '') {
+        if (field.default !== undefined) next[key] = field.default;
+        continue;
+      }
+      if (field.type === 'number') {
+        const num = Number(incoming);
+        if (!Number.isFinite(num)) throw new Error(`配置项 ${key} 须是数字`);
+        next[key] = num;
+      } else if (field.type === 'boolean') {
+        next[key] = incoming === true || /^(1|true|yes|on)$/i.test(String(incoming));
+      } else {
+        next[key] = String(incoming);
+      }
+    }
+    this.configValues[name] = next;
+    mkdirSync(this.dir, { recursive: true });
+    writeFileSync(join(this.dir, '_config.json'), JSON.stringify(this.configValues, null, 2), 'utf-8');
+    return next;
+  }
+
   listInfo(): PluginInfo[] {
     const infos: PluginInfo[] = [];
     for (const manifest of [...this.manifests.values()].sort((a, b) => a.name.localeCompare(b.name))) {
@@ -216,6 +305,130 @@ export class PluginRegistry {
       infos.push({ name: folder, description: '', enabled: false, tools: [], error });
     }
     return infos;
+  }
+
+  /**
+   * Panel detail: per-tool specs for the webui plugin page (params, method,
+   * tryable flag). Request URLs and secrets never leave the process — the
+   * panel only learns whether a tool uses secrets, never the values.
+   */
+  toolDetails(name: string): { info: PluginInfo; tools: PluginToolDetail[]; version?: string; minCore?: string } | null {
+    const manifest = this.manifests.get(name);
+    if (!manifest) return null;
+    const tools = manifest.tools.map((tool) => {
+      const props = (tool.parameters as { properties?: Record<string, { type?: string; description?: string; default?: unknown }> }).properties ?? {};
+      const required = new Set((tool.parameters as { required?: string[] }).required ?? []);
+      const templates = [tool.request.url, ...Object.values(tool.request.headers ?? {}), tool.request.body ?? ''].join('\n');
+      const usesSecrets = /\{\{\s*secrets\./.test(templates);
+      const hasSideEffects = tool.response?.save !== undefined || tool.response?.save_each !== undefined;
+      const method = (tool.request.method ?? 'GET').toUpperCase();
+      const usesConfig = /\{\{\s*config\./.test(templates);
+      const configValues = this.configValues[name] ?? {};
+      // 把已解析的 config 占位替换成空后再测——仍剩 {{config.}} = 有配置项缺值。
+      const unresolved = /\{\{\s*config\./.test(
+        templates.replace(/\{\{\s*config\.([\w.]+)\s*\}\}/g, (whole, key: string) => (configValues[key] !== undefined ? '' : whole)),
+      );
+      const configMissing = usesConfig && unresolved;
+      return {
+        name: tool.name,
+        description: tool.description,
+        method,
+        params: Object.entries(props).map(([key, spec]) => ({
+          key,
+          type: typeof spec?.type === 'string' ? spec.type : 'string',
+          description: spec?.description ?? '',
+          required: required.has(key),
+        })),
+        allowInternal: tool.allow_internal === true,
+        usesSecrets,
+        usesConfig,
+        configMissing,
+        tryable: method === 'GET' && !usesSecrets && !hasSideEffects,
+      };
+    });
+    return {
+      info: {
+        name: manifest.name,
+        description: manifest.description ?? '',
+        enabled: this.isEnabled(manifest),
+        tools: manifest.tools.map((tool) => tool.name),
+      },
+      version: manifest.version,
+      minCore: manifest.minCore,
+      tools,
+    };
+  }
+
+  /** Origin of the first GET/secrets-free tool — the panel health-probe target. */
+  serviceOrigin(name: string): { url: string; allowInternal: boolean } | null {
+    const manifest = this.manifests.get(name);
+    if (!manifest) return null;
+    for (const tool of manifest.tools) {
+      if ((tool.request.method ?? 'GET').toUpperCase() !== 'GET') continue;
+      if (/\{\{\s*secrets\./.test(tool.request.url)) continue;
+      try {
+        return { url: new URL(tool.request.url).origin, allowInternal: tool.allow_internal === true };
+      } catch {
+        // unparsable template → try the next tool
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Panel "试玩": run a GET, secrets-free, side-effect-free tool with plain
+   * args — no model context, no scope checks, no workspace writes. Output is
+   * secret-scrubbed and capped for display.
+   */
+  async tryTool(pluginName: string, toolName: string, args: Record<string, unknown>): Promise<PluginTryResult> {
+    const manifest = this.manifests.get(pluginName);
+    if (!manifest) return { ok: false, error: `没有插件 ${pluginName}` };
+    if (!this.isEnabled(manifest)) return { ok: false, error: `插件 ${pluginName} 已停用` };
+    const tool = manifest.tools.find((entry) => entry.name === toolName);
+    if (!tool) return { ok: false, error: `插件 ${pluginName} 没有工具 ${toolName}` };
+    if ((tool.request.method ?? 'GET').toUpperCase() !== 'GET') return { ok: false, error: '试玩只支持 GET 工具' };
+    if (/\{\{\s*secrets\./.test(tool.request.url)) return { ok: false, error: '带密钥的工具不支持试玩' };
+    if (tool.response?.save !== undefined || tool.response?.save_each !== undefined) {
+      return { ok: false, error: '会写工作区/发文件的工具不支持试玩' };
+    }
+    const required = (tool.parameters as { required?: string[] }).required ?? [];
+    const missing = required.filter((key) => args[key] === undefined || args[key] === null || String(args[key]).trim() === '');
+    if (missing.length > 0) return { ok: false, error: `缺少必填参数 ${missing.join('、')}` };
+    let url: string;
+    try {
+      const configValues = this.configValues[pluginName] ?? {};
+      url = interpolate(tool.request.url, (key) => {
+        if (key.startsWith('config.')) {
+          const value = configValues[key.slice('config.'.length)];
+          if (value === undefined) throw new Error(`配置项 ${key} 没有值（先在面板保存插件配置）`);
+          return String(value); // 结构性值（如基址），不编码
+        }
+        const value = args[key];
+        if (value === undefined || value === null) throw new Error(`参数 ${key} 缺失`);
+        return encodeURIComponent(typeof value === 'object' ? JSON.stringify(value) : String(value));
+      });
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    const started = Date.now();
+    try {
+      const result = await webFetch(url, {
+        method: 'GET',
+        maxBytes: 256 * 1024,
+        displayLimit: 8000,
+        allowInternal: tool.allow_internal === true,
+      });
+      probeRecord('plugin.try', Date.now() - started, { tool: toolName, ok: result.status < 400 ? 1 : 0 });
+      return {
+        ok: result.status < 400,
+        status: result.status,
+        ms: Date.now() - started,
+        body: this.scrub(result.body, this.secretValuesForScrub()).slice(0, 8000),
+      };
+    } catch (error) {
+      probeRecord('plugin.try', Date.now() - started, { tool: toolName, ok: 0 });
+      return { ok: false, ms: Date.now() - started, error: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   /** Tool schemas exposed to the model; reservedNames (builtin) win collisions. */
@@ -245,7 +458,20 @@ export class PluginRegistry {
   }
 
   /** Execute a plugin tool; null when no enabled plugin owns the name. */
+  /** 探针包装：插件工具调用的耗时/失败率进面板性能页。 */
   async execute(toolName: string, args: Record<string, unknown>, context: ToolContext): Promise<ToolResult | null> {
+    const started = Date.now();
+    try {
+      const result = await this.executeInner(toolName, args, context);
+      probeRecord('plugin.call', Date.now() - started, { tool: toolName, ok: result?.ok === true ? 1 : 0 });
+      return result;
+    } catch (error) {
+      probeRecord('plugin.call', Date.now() - started, { tool: toolName, ok: 0 });
+      throw error;
+    }
+  }
+
+  private async executeInner(toolName: string, args: Record<string, unknown>, context: ToolContext): Promise<ToolResult | null> {
     let owner: PluginManifest | null = null;
     let def: PluginToolDef | null = null;
     for (const manifest of this.manifests.values()) {
@@ -285,14 +511,14 @@ export class PluginRegistry {
       }
 
       const secretValues = this.secretValuesForScrub();
-      const url = interpolate(def.request.url, (key) => this.resolveValue(key, args, context, true));
+      const url = interpolate(def.request.url, (key) => this.resolveValue(key, owner.name, args, context, true));
       const headers: Record<string, string> = {};
       for (const [key, template] of Object.entries(def.request.headers ?? {})) {
-        headers[key] = interpolate(template, (key2) => this.resolveValue(key2, args, context, false));
+        headers[key] = interpolate(template, (key2) => this.resolveValue(key2, owner.name, args, context, false));
       }
       const body = def.request.body === undefined
         ? undefined
-        : interpolate(def.request.body, (key) => this.resolveValue(key, args, context, false));
+        : interpolate(def.request.body, (key) => this.resolveValue(key, owner.name, args, context, false));
 
       // displayLimit ≥ maxBytes: plugins must parse the FULL JSON body;
       // the model-facing truncation happens after extract/template below.
@@ -332,12 +558,12 @@ export class PluginRegistry {
           }
         }
         if (response.save_each) {
-          const batched = await this.saveEachToWorkspace(response.save_each, parsed, args, context);
+          const batched = await this.saveEachToWorkspace(response.save_each, owner.name, parsed, args, context);
           saveNote = batched.note;
           savedAndSent = batched.sentToUser;
         }
         if (response.save) {
-          const saved = await this.saveToWorkspace(response.save, parsed, args, context);
+          const saved = await this.saveToWorkspace(response.save, owner.name, parsed, args, context);
           saveNote = saved.note;
           savedAndSent = saved.sentToUser;
         }
@@ -346,7 +572,7 @@ export class PluginRegistry {
             output = interpolate(response.template, (key) => {
               const fromBody = extractPath(parsed, key);
               if (fromBody !== undefined) return typeof fromBody === 'object' ? JSON.stringify(fromBody, null, 0) : String(fromBody);
-              return this.resolveValue(key, args, context, false);
+              return this.resolveValue(key, owner.name, args, context, false);
             });
           } catch (error) {
             // 模板字段在响应里不存在（如上游抖动时 200 + 缺 data.title 的残缺体）。
@@ -368,7 +594,7 @@ export class PluginRegistry {
             };
           }
         } else if (response.list) {
-          output = this.renderList(response.list, parsed, args, context);
+          output = this.renderList(response.list, owner.name, parsed, args, context);
         } else {
           const extracted = response.extract ? extractPath(parsed, response.extract) : parsed;
           if (response.extract && extracted === undefined) {
@@ -399,10 +625,15 @@ export class PluginRegistry {
       .flatMap((value) => [value, encodeURIComponent(value)]);
   }
 
-  /** Resolve a {{placeholder}}: secrets.*, scope.*, then tool params. */
-  private resolveValue(key: string, args: Record<string, unknown>, context: ToolContext, encode: boolean): string {
+  /** Resolve a {{placeholder}}: secrets.*, config.*, scope.*, then tool params. */
+  private resolveValue(key: string, pluginName: string, args: Record<string, unknown>, context: ToolContext, encode: boolean): string {
     let raw: string | undefined;
-    if (key.startsWith('secrets.')) {
+    if (key.startsWith('config.')) {
+      const value = this.configValues[pluginName]?.[key.slice('config.'.length)];
+      if (value === undefined) throw new Error(`配置项 ${key} 没有值（可在面板插件页设置）`);
+      // config 值是面板设置的结构性值（如服务基址），不做 URL 编码。
+      return String(value);
+    } else if (key.startsWith('secrets.')) {
       raw = this.secrets[key.slice('secrets.'.length)];
       if (raw === undefined) throw new Error(`secrets.json 里没有 ${key}`);
     } else if (key === 'scope.type') {
@@ -420,6 +651,7 @@ export class PluginRegistry {
   /** Render response.list: flatten `from` (supports `a.b[].c`), template each item, cap at max. */
   private renderList(
     list: NonNullable<PluginToolResponse['list']>,
+    pluginName: string,
     parsed: unknown,
     args: Record<string, unknown>,
     context: ToolContext,
@@ -430,7 +662,7 @@ export class PluginRegistry {
     if (typeof list.max === 'number') max = list.max;
     else if (typeof list.max === 'string') {
       try {
-        const interpolated = Number(interpolate(list.max, (key) => this.resolveValue(key, args, context, false)));
+        const interpolated = Number(interpolate(list.max, (key) => this.resolveValue(key, pluginName, args, context, false)));
         if (Number.isFinite(interpolated)) max = interpolated;
       } catch {
         // max placeholder unresolvable (param omitted) → keep default
@@ -442,7 +674,7 @@ export class PluginRegistry {
         const fromItem = extractPath(item, key);
         if (fromItem !== undefined) return typeof fromItem === 'object' ? JSON.stringify(fromItem, null, 0) : String(fromItem);
         try {
-          return this.resolveValue(key, args, context, false);
+          return this.resolveValue(key, pluginName, args, context, false);
         } catch {
           return ''; // field missing on both item and params — render blank, don't fail the call
         }
@@ -459,6 +691,7 @@ export class PluginRegistry {
    */
   private async saveEachToWorkspace(
     batch: NonNullable<PluginToolResponse['save_each']>,
+    pluginName: string,
     parsed: unknown,
     args: Record<string, unknown>,
     context: ToolContext,
@@ -474,7 +707,7 @@ export class PluginRegistry {
     let flag = '';
     if (batch.send !== undefined) {
       try {
-        flag = interpolate(batch.send, (key) => this.resolveValue(key, args, context, false));
+        flag = interpolate(batch.send, (key) => this.resolveValue(key, pluginName, args, context, false));
       } catch {
         flag = batch.send;
       }
@@ -497,7 +730,7 @@ export class PluginRegistry {
       let text = batch.html_to_text ? htmlToText(rawText) : rawText;
       if (text.length > MAX_SAVE_CHARS) text = `${text.slice(0, MAX_SAVE_CHARS)}\n…（超长已截断）`;
       try {
-        const rel = interpolate(batch.path, (k) => this.resolveValue(k, { ...args, __key: key }, context, false));
+        const rel = interpolate(batch.path, (k) => this.resolveValue(k, pluginName, { ...args, __key: key }, context, false));
         const abs = context.workspace.resolvePath(rel);
         mkdirSync(dirname(abs), { recursive: true });
         writeFileSync(abs, text, 'utf-8');
@@ -532,6 +765,7 @@ export class PluginRegistry {
   /** Persist a body subtree into the scope workspace; returns a note for the tool output. */
   private async saveToWorkspace(
     save: NonNullable<PluginToolResponse['save']>,
+    pluginName: string,
     parsed: unknown,
     args: Record<string, unknown>,
     context: ToolContext,
@@ -544,7 +778,7 @@ export class PluginRegistry {
     if (text.length > MAX_SAVE_CHARS) text = `${text.slice(0, MAX_SAVE_CHARS)}\n…（超长已截断）`;
     let rel: string;
     try {
-      rel = interpolate(save.path, (key) => this.resolveValue(key, args, context, false));
+      rel = interpolate(save.path, (key) => this.resolveValue(key, pluginName, args, context, false));
       const abs = context.workspace.resolvePath(rel);
       mkdirSync(dirname(abs), { recursive: true });
       writeFileSync(abs, text, 'utf-8');
@@ -558,7 +792,7 @@ export class PluginRegistry {
     if (save.send !== undefined) {
       let flag = '';
       try {
-        flag = interpolate(save.send, (key) => this.resolveValue(key, args, context, false));
+        flag = interpolate(save.send, (key) => this.resolveValue(key, pluginName, args, context, false));
       } catch {
         flag = save.send; // literal string like "true"
       }

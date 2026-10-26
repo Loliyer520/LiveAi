@@ -21,7 +21,9 @@ import type { AgentRecord } from '../store/repository.js';
 import type { UsageSnapshot } from '../models/usage.js';
 import type { KbEntry, KbMount, KbPendingItem, KbPermission } from '../knowledge/kb.js';
 import type { PersonRecord, ScopeRecord } from '../relations/graph.js';
-import type { PluginInfo } from '../chat/plugins.js';
+import type { PluginInfo, PluginToolDetail, PluginTryResult } from '../chat/plugins.js';
+import { webFetch } from '../chat/net.js';
+import { probeReset, probeSnapshot } from '../observability/probe.js';
 
 export interface WebuiDeps {
   /** 号主 QQ：主AI会话禁止被关（防失联），同 scope_manage 的护栏。 */
@@ -73,10 +75,15 @@ export interface WebuiDeps {
   /** 中枢 scope key（KB 复核者身份）。 */
   readonly kbMasterScope: string;
 
-  // ── 插件（插件导航 + 设置页插件配置） ───────────────────────────────────
+  // ── 插件（插件导航 + 设置页插件配置 + 插件子页面详情/试玩） ───────────────
   readonly plugins: {
     listInfo(): PluginInfo[];
     setEnabled(name: string, enabled: boolean): void;
+    toolDetails(name: string): { info: PluginInfo; tools: PluginToolDetail[]; version?: string; minCore?: string } | null;
+    serviceOrigin(name: string): { url: string; allowInternal: boolean } | null;
+    tryTool(pluginName: string, toolName: string, args: Record<string, unknown>): Promise<PluginTryResult>;
+    getConfig(name: string): { spec: Record<string, unknown>; values: Record<string, string | number | boolean> } | null;
+    setConfig(name: string, values: Record<string, unknown>): Record<string, string | number | boolean>;
   } | null;
 
   // ── 关系网（Onebot 桥 · 关系网选项卡） ─────────────────────────────────
@@ -505,6 +512,82 @@ export async function handleWebui(
       return;
     }
 
+    // ── 插件子页面：详情（工具规格 + 服务健康 + novel 指令机会话） ────────────
+    const pluginDetailMatch = url.pathname.match(/^\/api\/plugins\/([\w-]+)\/detail$/);
+    if (request.method === 'GET' && pluginDetailMatch) {
+      if (deps.plugins === null) {
+        sendJson(response, 500, { error: '插件注册表未初始化' });
+        return;
+      }
+      const name = pluginDetailMatch[1];
+      const detail = deps.plugins.toolDetails(name);
+      if (detail === null) {
+        sendJson(response, 404, { error: `没有插件 ${name}` });
+        return;
+      }
+      // 服务健康：探测第一个 GET/无密钥工具的源站（本地服务放行内网）。
+      let service: Record<string, unknown> | null = null;
+      const origin = deps.plugins.serviceOrigin(name);
+      if (origin !== null) {
+        const started = Date.now();
+        try {
+          const result = await webFetch(origin.url, {
+            method: 'GET',
+            maxBytes: 256 * 1024,
+            displayLimit: 200,
+            allowInternal: origin.allowInternal,
+          });
+          service = { url: origin.url, ok: true, status: result.status, ms: Date.now() - started };
+        } catch (error) {
+          service = { url: origin.url, ok: false, ms: Date.now() - started, error: error instanceof Error ? error.message : String(error) };
+        }
+      }
+      // novel 附加：指令模式会话（novel_command.scopes，已切流到 deeplive-novel 时为空）。
+      const extras: Record<string, unknown> = {};
+      if (name === 'novel') {
+        const config = await readConfigJson(deps.configPath);
+        const novelCmd = (config.novel_command ?? {}) as Record<string, unknown>;
+        extras.commandScopes = Array.isArray(novelCmd.scopes) ? novelCmd.scopes.map((value) => String(value)) : [];
+        extras.commandBaseUrl = typeof novelCmd.base_url === 'string' ? novelCmd.base_url : '';
+      }
+      // manifest v2 配置声明 + 生效值（面板自动表单）。
+      const pluginConfig = deps.plugins.getConfig(name);
+      sendJson(response, 200, { ...detail, service, extras, config: pluginConfig ?? { spec: {}, values: {} } });
+      return;
+    }
+
+    // ── 插件子页面：manifest v2 配置保存 ─────────────────────────────────────
+    const pluginConfigMatch = url.pathname.match(/^\/api\/plugins\/([\w-]+)\/config$/);
+    if (request.method === 'POST' && pluginConfigMatch) {
+      if (deps.plugins === null) {
+        sendJson(response, 500, { error: '插件注册表未初始化' });
+        return;
+      }
+      const body = (await readBody(request)) as Record<string, unknown>;
+      const values = (body.values !== null && typeof body.values === 'object' ? body.values : {}) as Record<string, unknown>;
+      try {
+        const saved = deps.plugins.setConfig(pluginConfigMatch[1], values);
+        sendJson(response, 200, { ok: true, values: saved });
+      } catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
+    // ── 插件子页面：试玩（仅 GET/无密钥/无副作用工具） ───────────────────────
+    const pluginTryMatch = url.pathname.match(/^\/api\/plugins\/([\w-]+)\/try$/);
+    if (request.method === 'POST' && pluginTryMatch) {
+      if (deps.plugins === null) {
+        sendJson(response, 500, { error: '插件注册表未初始化' });
+        return;
+      }
+      const body = (await readBody(request)) as Record<string, unknown>;
+      const args = (body.args !== null && typeof body.args === 'object' ? body.args : {}) as Record<string, unknown>;
+      const result = await deps.plugins.tryTool(pluginTryMatch[1], String(body.tool ?? ''), args);
+      sendJson(response, result.ok ? 200 : 400, result);
+      return;
+    }
+
     // ── Onebot 桥 · NapCat 连接配置 ─────────────────────────────────────────
     if (request.method === 'GET' && url.pathname === '/api/napcat/config') {
       const config = await readConfigJson(deps.configPath);
@@ -637,6 +720,17 @@ export async function handleWebui(
           summaryBuiltAt: a.overallSummaryBuiltAt,
         })),
       });
+      return;
+    }
+
+    // ── 探针（性能页）：统一计时打点的聚合与慢事件现场 ─────────────────────
+    if (request.method === 'GET' && url.pathname === '/api/probes') {
+      sendJson(response, 200, probeSnapshot());
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/probes/reset') {
+      probeReset();
+      sendJson(response, 200, { ok: true });
       return;
     }
 

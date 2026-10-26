@@ -119,6 +119,27 @@ aside .foot { padding: 10px 0 16px; border-top: 1px solid var(--line); }
 #menuBtn { display: none; }
 #scrim { display: none; }
 
+/* ── 新手向导 ── */
+#guide {
+  position: fixed; inset: 0; z-index: 80; display: none; place-items: center; padding: 18px;
+  background: rgba(35, 56, 86, .34); -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px);
+}
+#guide.show { display: grid; }
+.guide-card {
+  width: min(94vw, 430px); padding: 26px 24px 20px; border-radius: 22px; overflow: auto;
+  color: #3a587e; background: rgba(255, 255, 255, .96); border: 1px solid rgba(54, 96, 154, .16);
+  box-shadow: 0 24px 70px rgba(36, 76, 135, .3); animation: contentIn .4s cubic-bezier(.2,.8,.2,1) both;
+}
+.guide-card .eyebrow { margin-bottom: 5px; }
+.guide-card h2 { margin: 0 0 8px; font-size: 20px; color: #17345e; }
+.guide-card p { margin: 0 0 14px; font-size: 13px; line-height: 1.65; color: #55719a; }
+.guide-ok { color: #1d8a68; font-weight: 600; }
+.guide-steps { display: flex; gap: 6px; justify-content: center; margin: 4px 0 16px; }
+.guide-steps i { width: 22px; height: 5px; border-radius: 3px; background: #d7e3f2; transition: background .25s ease; }
+.guide-steps i.on { background: #2e65b9; }
+.guide-actions { display: flex; gap: 9px; justify-content: space-between; align-items: center; }
+.guide-actions .btn.primary { margin-left: auto; }
+
 /* ── 主区与页头 ── */
 main { flex: 1; width: 100%; max-width: 1420px; min-width: 0; margin: 0 auto; padding: 28px 34px 48px; }
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
@@ -320,7 +341,7 @@ label.field span { display: block; margin-bottom: 6px; color: var(--sub); font-s
 @media (max-width: 640px) {
   body::before { background-position: center, center, 64% 42%; }
   #menuBtn {
-    position: fixed; top: calc(12px + env(safe-area-inset-top, 0px)); left: 12px; z-index: 70;
+    position: fixed; top: calc(10px + min(env(safe-area-inset-top, 0px), 22px)); left: 12px; z-index: 70;
     display: grid; place-items: center; width: 46px; height: 46px; padding: 0; color: #2b5aa3;
     border: 1px solid rgba(54, 96, 154, .16); border-radius: 15px;
     background: rgba(255, 255, 255, .88); box-shadow: 0 10px 30px rgba(36, 76, 135, .16), inset 0 1px rgba(255,255,255,.8);
@@ -356,8 +377,8 @@ label.field span { display: block; margin-bottom: 6px; color: var(--sub); font-s
   .nav-icon .icon { width: 19px; height: 19px; }
   aside .foot { display: block; flex: 0 0 auto; padding: 10px 0 16px; border: 0; border-top: 1px solid var(--line); }
   aside .foot a { min-width: 0; }
-  main { padding: calc(74px + env(safe-area-inset-top, 0px)) 14px 30px; }
-  .manage-route { padding: calc(74px + env(safe-area-inset-top, 0px)) 14px 24px; }
+  main { padding: calc(66px + min(env(safe-area-inset-top, 0px), 22px)) 14px 30px; }
+  .manage-route { padding: calc(66px + min(env(safe-area-inset-top, 0px), 22px)) 14px 24px; }
   .manage-route .page-head { margin-bottom: 12px; }
   .chat-composer { gap: 7px; padding: 7px 7px 7px 13px; border-radius: 16px; }
   .chat-composer .btn { padding: 7px 12px; }
@@ -417,6 +438,7 @@ label.field span { display: block; margin-bottom: 6px; color: var(--sub); font-s
 </head>
 <body>
 <div id="toast" role="status" aria-live="polite"></div>
+<div id="guide"><div class="guide-card" id="guideCard"></div></div>
 <div id="login" class="card" style="display:none">
   <div class="login-logo" data-icon="spark"></div>
   <div class="eyebrow">安全管理面板</div>
@@ -462,6 +484,7 @@ var ICONS = {
   bot: '<rect x="4" y="7" width="16" height="13" rx="4"/><path d="M12 3v4M8 12h.01M16 12h.01M8 16c2.5 1.3 5.5 1.3 8 0M2 12v4M22 12v4"/>',
   game: '<path d="M8 6h8a6 6 0 0 1 5.7 7.8l-1.4 4.3a2.5 2.5 0 0 1-4.1.9L14 17h-4l-2.2 2a2.5 2.5 0 0 1-4.1-.9l-1.4-4.3A6 6 0 0 1 8 6Z"/><path d="M7 10v4M5 12h4M16 11h.01M18 13h.01"/>',
   tv: '<rect x="3" y="5" width="18" height="13" rx="3"/><path d="m8 2 4 3 4-3M8 22h8M10 9l4 2.5-4 2.5V9Z"/>',
+  cloud: '<path d="M17.5 18.5a4 4 0 0 0 .4-7.98 5.5 5.5 0 0 0-10.72 1.4A3.5 3.5 0 0 0 7.5 18.5h10Z"/>',
   puzzle: '<path d="M19 13h-2a2 2 0 1 0 0 4h2v4h-4v-2a2 2 0 1 0-4 0v2H7v-4H5a2 2 0 1 1 0-4h2V9H3V5h4V3a2 2 0 1 1 4 0v2h4v4h2a2 2 0 1 1 0 4"/>',
   settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/>',
   update: '<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 8a7 7 0 0 1 11.4-1L20 12M4 12l2.5 5a7 7 0 0 0 11.4-1"/>',
@@ -544,16 +567,21 @@ function showLogin() {
 }
 
 // ─── 路由 ────────────────────────────────────────────────────────────────────
+function renderToolPluginPage(main, name) { renderToolPlugin(main, name); }
 var PLUGIN_PAGES = {
   onebot: { title: "QQ 机器人", icon: "bot", render: renderOnebot },
   mc: { title: "Minecraft 陪玩", icon: "game", render: renderMc },
   bili: { title: "哔哩哔哩", icon: "tv", render: renderBili },
+  novel: { title: "小说工具", icon: "book", render: function (main) { renderToolPlugin(main, "novel"); } },
+  weather: { title: "天气工具", icon: "cloud", render: function (main) { renderToolPlugin(main, "weather"); } },
 };
+var PLUGIN_TITLES = { novel: "小说工具", weather: "天气工具", bili: "B 站视频工具", mc: "Minecraft 游戏工具" };
 var FIXED_NAV = [
   { route: "home", title: "首页", icon: "home", render: renderHome },
   { route: "kb", title: "知识库", icon: "book", render: renderKb },
   { route: "manage", title: "主 AI 对话", icon: "message", render: renderManage },
   { route: "napcat", title: "NapCat 配置", icon: "database", render: renderNapcat },
+  { route: "probes", title: "性能", icon: "activity", render: renderProbes },
 ];
 
 function toggleDrawer() {
@@ -592,9 +620,10 @@ function buildNav() {
       html += '<a href="#/plugin/' + p.name + '" data-route="plugin/' + p.name + '" title="' + page.title + '">' +
         '<span class="nav-icon">' + icon(page.icon) + '</span><span class="nav-label">' + page.title + '</span><span class="dot ' + dot + '"></span></a>';
     } else {
-      var pluginTitle = p.name === "novel" ? "小说工具" : p.name === "weather" ? "天气工具" : p.name;
-      html += '<a href="#/settings" title="在设置页管理"><span class="nav-icon">' + icon("puzzle") + '</span>' +
-        '<span class="nav-label">' + h(pluginTitle) + '</span><span class="dot ' + dot + '"></span></a>';
+      // 无专属页面的工具插件走通用插件页（renderToolPlugin）。
+      var pluginTitle = PLUGIN_TITLES[p.name] || p.name;
+      html += '<a href="#/plugin/' + p.name + '" data-route="plugin/' + p.name + '" title="' + h(pluginTitle) + '">' +
+        '<span class="nav-icon">' + icon("puzzle") + '</span><span class="nav-label">' + h(pluginTitle) + '</span><span class="dot ' + dot + '"></span></a>';
     }
   }
   nav.innerHTML = html;
@@ -621,6 +650,7 @@ function route() {
     var name = r.slice(7);
     var page = PLUGIN_PAGES[name];
     if (page) { page.render(main); return; }
+    if (/^[\w-]+$/.test(name)) { renderToolPlugin(main, name); return; }
   }
   if (r === "settings") { renderSettings(main); return; }
   if (r === "update") { renderUpdate(main); return; }
@@ -655,6 +685,10 @@ function renderHome(main) {
       '<div class="hero-visual"><span class="orbit"></span><span class="orbit two"></span><div class="core-mark">' + icon("spark") + "</div></div></div>" +
       (s.bot.connected ? "" : '<div class="card" style="border-left:3px solid #e8a33d"><div class="row" style="justify-content:space-between"><span>QQ 目前未连接。先确认 NapCat 已登录，再检查下面的连接参数。</span>' +
         '<a class="btn primary" href="#/napcat">' + icon("database") + 'NapCat 连接配置</a></div></div>') +
+      (s.bot.connected && s.scopes.enabled === 0 ? '<div class="card" style="border-left:3px solid #e8a33d"><div class="row" style="justify-content:space-between"><span>QQ 已连接，但还没有会话开启自动回复，AI 收到消息不会回应。</span>' +
+        '<a class="btn primary" href="#/settings">' + icon("activity") + '去设置开启</a></div></div>' : "") +
+      (s.bot.connected && s.scopes.enabled > 0 && !(total.requests || 0) ? '<div class="card" style="border-left:3px solid #6aa5e8"><div class="row" style="justify-content:space-between"><span>一切就绪。去 QQ 给 bot 发条消息试试，或让朋友 @它。</span>' +
+        '<a class="btn" href="#/manage">' + icon("message") + '先在面板和它聊聊</a></div></div>' : "") +
       '<div class="grid c3 metrics">' +
       '<div class="card metric-card"><div class="metric-top"><span>QQ 状态</span><span class="metric-icon">' + icon("bot") + '</span></div>' +
       '<div class="stat">' + (s.bot.connected ? '<span class="pill ok">在线</span>' : '<span class="pill bad">离线</span>') + '</div>' +
@@ -872,7 +906,7 @@ function renderNapcat(main) {
       '<div><div class=stat style="font-size:20px">' + (s.bot.connected ? '<span class="pill ok">QQ 已连接</span>' : '<span class="pill bad">QQ 未连接</span>') + '</div>' +
       '<p class=dim style="margin:6px 0 0">' + h(s.bot.nickname || "还没有获取到昵称") + " · " + h(s.bot.selfId || "未知 QQ") + '</p></div>' +
       '<div style="text-align:right"><p class=dim style="margin:0;font-size:12px">当前连接方式</p>' +
-      '<p style="margin:4px 0 0;font-weight:600;color:#21406a">' + (s.bot.mode === "server" ? "等待 NapCat 连接" : "主动连接 NapCat") + '</p></div></div></div>' +
+      '<p style="margin:4px 0 0;font-weight:600;color:#21406a">' + (s.bot.mode === "server" ? "NapCat 主动连入（server 模式）" : "主动连接 NapCat（client 模式）") + '</p></div></div></div>' +
       '<div class="card"><h2 style="margin-top:0">连接参数</h2><p class=help>按 NapCat 面板里的设置填写。保存前会自动备份，保存后需要重启 deeplive-bot 才会生效。</p>' +
       napcatFormHtml(n) + '</div>' +
       '<div class="card"><h2 style="margin-top:0">连接不上怎么办？</h2><p class=help style="margin-top:0">1. 确认 NapCat 已经启动并登录 QQ。<br>2. 确认 NapCat 的连接方式和这里一致，地址、端口也相同。<br>3. QQ 登录失效时，到 NapCat 面板重新扫码。</p>' +
@@ -901,7 +935,7 @@ function paintObTab(main) {
         '<div><div class=stat style="font-size:20px">' + (s.bot.connected ? '<span class="pill ok">QQ 已连接</span>' : '<span class="pill bad">QQ 未连接</span>') + '</div>' +
         '<p class=dim style="margin:6px 0 0">' + h(s.bot.nickname || "还没有获取到昵称") + " · " + h(s.bot.selfId || "未知 QQ") + '</p></div>' +
         '<div style="text-align:right"><p class=dim style="margin:0;font-size:12px">当前连接方式</p>' +
-        '<p style="margin:4px 0 0;font-weight:600;color:#21406a">' + (s.bot.mode === "server" ? "等待 NapCat 连接" : "主动连接 NapCat") + '</p></div></div>' +
+        '<p style="margin:4px 0 0;font-weight:600;color:#21406a">' + (s.bot.mode === "server" ? "NapCat 主动连入（server 模式）" : "主动连接 NapCat（client 模式）") + '</p></div></div>' +
         '<div class=row style="margin-top:16px"><a class="btn primary" href="#/napcat">' + icon("database") + '打开 NapCat 连接配置</a>' +
         '<span class=dim style="font-size:12px">修改地址、端口、Token 都在这里</span></div></div>' +
         '<div class="grid c2">' +
@@ -1109,6 +1143,173 @@ function renderBili(main) {
   }).catch(function (e) { main.innerHTML = pageHead("哔哩哔哩", "") + '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
 }
 
+// ─── 通用工具插件页（小说/天气等无专属页面的插件） ────────────────────────────
+var tryState = { plugin: "", tools: [] };
+
+function renderToolPlugin(main, name) {
+  var title = (PLUGIN_PAGES[name] && PLUGIN_PAGES[name].title) || PLUGIN_TITLES[name] || name;
+  main.innerHTML = pageHead(title, "工具插件详情、服务状态和试玩");
+  api("/api/plugins/" + name + "/detail").then(function (d) {
+    tryState = { plugin: name, tools: d.tools || [] };
+    var html = '<div class="card"><div class="row" style="justify-content:space-between">' +
+      '<div><div class=stat style="font-size:20px">' + (d.info.enabled ? '<span class="pill ok">已启用</span>' : '<span class="pill mute">已停用</span>') +
+      (d.version ? ' <span class="pill mute">v' + h(d.version) + '</span>' : '') + '</div>' +
+      '<p class=dim style="margin:6px 0 0">' + h(d.info.description || "这个插件没有描述") + '</p></div>' +
+      '<label class=switch title="启用/停用"><input type=checkbox ' + (d.info.enabled ? "checked" : "") + ' onchange="pluginToggle(\\'' + h(name) + '\\',this.checked)"><i></i></label></div>' +
+      '<p class=dim style="font-size:12px;margin:10px 0 0">停用后 AI 不再看到这个插件的工具，已有对话数据不受影响。</p></div>';
+
+    var configSpec = d.config && d.config.spec ? d.config.spec : {};
+    var configValues = d.config && d.config.values ? d.config.values : {};
+    var configKeys = Object.keys(configSpec);
+    if (configKeys.length > 0) {
+      html += '<div class="card"><h2 style="margin-top:0">插件配置</h2>' +
+        '<p class=help>manifest 声明的设置项，请求模板里用 {{config.键}} 引用。保存后立即生效。</p><div class=form-grid>';
+      for (var ci = 0; ci < configKeys.length; ci++) {
+        var ck = configKeys[ci];
+        var cf = configSpec[ck];
+        var cv = configValues[ck];
+        if (cf.type === "boolean") {
+          html += '<label class=field><span>' + h(cf.title || ck) + '</span><select data-config-key="' + h(ck) + '">' +
+            '<option value="1"' + (cv === true ? " selected" : "") + '>开启</option>' +
+            '<option value="0"' + (cv !== true ? " selected" : "") + '>关闭</option></select></label>';
+        } else {
+          html += '<label class=field><span>' + h(cf.title || ck) + (cf.description ? ' <span class=dim style="font-size:11px">' + h(cf.description) + '</span>' : '') + '</span>' +
+            '<input type=text data-config-key="' + h(ck) + '" value="' + h(cv === undefined ? (cf.default !== undefined ? String(cf.default) : "") : String(cv)) + '"></label>';
+        }
+      }
+      html += '</div><div class=row style="margin-top:10px"><button class="btn primary" onclick="pluginConfigSave(\\'' + h(name) + '\\')">' + icon("database") + '保存配置</button></div></div>';
+    }
+
+    if (d.service) {
+      html += '<div class="card"><h2 style="margin-top:0">服务状态</h2><table>' +
+        '<tr><th>服务地址</th><td class=mono>' + h(d.service.url) + '</td></tr>' +
+        '<tr><th>可达性</th><td>' + (d.service.ok
+          ? '<span class="pill ok">在线</span> <span class=dim style="font-size:12px">HTTP ' + h(d.service.status) + ' · ' + d.service.ms + 'ms</span>'
+          : '<span class="pill bad">不可达</span> <span class=dim style="font-size:12px">' + h(d.service.error || "") + '</span>') + '</td></tr></table></div>';
+    }
+
+    if (d.extras && d.extras.commandScopes) {
+      html += '<div class="card"><h2 style="margin-top:0">指令模式会话</h2>' +
+        '<p class=help>这些会话不经过模型，搜书/看章指令直接应答。独立小说 bot（deeplive-novel）接管后这里可以留空。</p>' +
+        (d.extras.commandScopes.length === 0
+          ? '<p class=dim>没有配置指令模式会话' + (d.extras.commandBaseUrl ? '，指令服务：' + h(d.extras.commandBaseUrl) : "") + '。</p>'
+          : '<table><tr><th>会话标识</th></tr>' + d.extras.commandScopes.map(function (s) { return '<tr><td class=mono>' + h(s) + '</td></tr>'; }).join("") + '</table>') +
+        '</div>';
+    }
+
+    html += '<div class="card"><h2 style="margin-top:0">工具清单（' + d.tools.length + '）</h2>' +
+      '<p class=help>启用时 AI 在对话中可以调用这些工具。</p><table><tr><th>工具</th><th>说明</th><th>参数</th></tr>';
+    for (var i = 0; i < d.tools.length; i++) {
+      var t = d.tools[i];
+      var params = t.params.map(function (p) { return p.key + (p.required ? "*" : ""); }).join("、");
+      html += '<tr><td class=mono style="font-size:12px">' + h(t.name) + '</td>' +
+        '<td style="font-size:13px">' + h(t.description) + '</td>' +
+        '<td class=dim style="font-size:12px">' + h(params || "无") + '</td></tr>';
+    }
+    html += '</table><p class=dim style="font-size:12px;margin:8px 0 0">* = 必填参数</p></div>';
+
+    var tryable = d.tools.filter(function (t) { return t.tryable; });
+    if (tryable.length > 0) {
+      html += '<div class="card"><h2 style="margin-top:0">试玩</h2>' +
+        '<p class=help>以真实请求直接调用工具，返回原始响应。带密钥或会写文件的工具不开放试玩。</p>' +
+        '<label class=field><span>选择工具</span><select id=tryToolSel onchange="tryPaintParams()">';
+      for (var k = 0; k < tryable.length; k++) html += '<option value="' + h(tryable[k].name) + '">' + h(tryable[k].name) + '</option>';
+      html += '</select></label><div id=tryParams class=form-grid></div>' +
+        '<div class=row style="margin-top:10px"><button class="btn primary" onclick="tryRun()">' + icon("send") + '运行</button></div>' +
+        '<pre id=tryResult class=mono style="display:none;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;background:rgba(20,40,70,.06);border-radius:10px;padding:12px;font-size:12px;margin:12px 0 0"></pre></div>';
+    }
+
+    main.innerHTML = pageHead(title, "工具插件详情、服务状态和试玩") + html;
+    tryPaintParams();
+  }).catch(function (e) { main.innerHTML = pageHead(title, "") + '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
+}
+
+function tryPaintParams() {
+  var sel = document.getElementById("tryToolSel");
+  var box = document.getElementById("tryParams");
+  if (!sel || !box) return;
+  var tool = null;
+  for (var i = 0; i < tryState.tools.length; i++) if (tryState.tools[i].name === sel.value) tool = tryState.tools[i];
+  if (!tool) { box.innerHTML = ""; return; }
+  if (tool.params.length === 0) { box.innerHTML = '<p class=dim style="font-size:13px">这个工具没有参数。</p>'; return; }
+  var html = "";
+  for (var j = 0; j < tool.params.length; j++) {
+    var p = tool.params[j];
+    html += '<label class=field><span>' + h(p.key) + (p.required ? "（必填）" : "（可选）") + '</span>' +
+      '<input type=text data-try-param="' + h(p.key) + '" placeholder="' + h(p.description || p.type) + '"></label>';
+  }
+  box.innerHTML = html;
+}
+
+function pluginConfigSave(name) {
+  var values = {};
+  var inputs = document.querySelectorAll("[data-config-key]");
+  for (var i = 0; i < inputs.length; i++) values[inputs[i].getAttribute("data-config-key")] = inputs[i].value;
+  api("/api/plugins/" + name + "/config", "POST", { values: values })
+    .then(function () { toast("配置已保存并生效"); })
+    .catch(function (e) { toast(e.message, true); });
+}
+
+function tryRun() {
+  var sel = document.getElementById("tryToolSel");
+  var out = document.getElementById("tryResult");
+  if (!sel || !out) return;
+  var args = {};
+  var inputs = document.querySelectorAll("[data-try-param]");
+  for (var i = 0; i < inputs.length; i++) {
+    var v = inputs[i].value.trim();
+    if (v) args[inputs[i].getAttribute("data-try-param")] = v;
+  }
+  out.style.display = "block";
+  out.textContent = "请求中…";
+  api("/api/plugins/" + tryState.plugin + "/try", "POST", { tool: sel.value, args: args }).then(function (r) {
+    out.textContent = "HTTP " + (r.status || "-") + " · " + (r.ms || 0) + "ms\\n\\n" + (r.body || r.error || "");
+  }).catch(function (e) {
+    out.textContent = "调用失败：" + e.message;
+  });
+}
+
+// ─── 性能探针页（统一计时打点：慢调用 TOP 榜 + 最近事件） ────────────────────
+function renderProbes(main) {
+  main.innerHTML = pageHead("性能", "框架探针：慢调用聚合与事件现场");
+  api("/api/probes").then(function (p) {
+    var agg = p.aggregates || [];
+    var html = '<div class="card"><h2 style="margin-top:0">慢调用 TOP（按最差一次排序）</h2>' +
+      '<p class=help>计时点由框架自动埋在关键路径（对话轮次、插件工具调用）。' + p.slowThresholdMs + 'ms 以上记为慢事件。</p>';
+    if (agg.length === 0) html += '<p class=dim>还没有打点数据——产生一次对话或插件调用后回来刷新。</p>';
+    else {
+      html += '<table><tr><th>计时点</th><th>次数</th><th>平均</th><th>最差</th><th>累计</th><th>最近</th></tr>';
+      for (var i = 0; i < agg.length; i++) {
+        var a = agg[i];
+        html += '<tr><td class=mono style="font-size:12px">' + h(a.name) + '</td><td>' + a.count + '</td>' +
+          '<td class=mono>' + a.avgMs + 'ms</td><td class=mono>' + (a.maxMs >= p.slowThresholdMs ? '<span style="color:var(--bad)">' + a.maxMs + 'ms</span>' : a.maxMs + 'ms') + '</td>' +
+          '<td class=mono>' + (a.totalMs / 1000).toFixed(1) + 's</td><td class=dim style="font-size:12px">' + fmtTime(Math.floor(a.lastAt / 1000)) + '</td></tr>';
+      }
+      html += '</table>';
+    }
+    html += '</div>';
+
+    html += '<div class="card"><h2 style="margin-top:0">慢事件现场（最近 ' + (p.slow || []).length + ' 条）</h2>';
+    if (!(p.slow || []).length) html += '<p class=dim>暂无慢事件。</p>';
+    else {
+      html += '<table><tr><th>时间</th><th>计时点</th><th>耗时</th><th>现场</th></tr>';
+      for (var j = 0; j < p.slow.length; j++) {
+        var s = p.slow[j];
+        var meta = "";
+        for (var k in (s.meta || {})) meta += h(k) + "=" + h(String(s.meta[k])) + " ";
+        html += '<tr><td class=dim style="font-size:12px">' + fmtTime(Math.floor(s.at / 1000)) + '</td><td class=mono style="font-size:12px">' + h(s.name) + '</td>' +
+          '<td class=mono>' + s.ms + 'ms</td><td class=dim style="font-size:12px">' + meta + '</td></tr>';
+      }
+      html += '</table>';
+    }
+    html += '</div><div class=row><button class="btn" onclick="probesReset()">' + icon("refresh") + '清空重计</button></div>';
+    main.innerHTML = pageHead("性能", "框架探针：慢调用聚合与事件现场") + html;
+  }).catch(function (e) { main.innerHTML = pageHead("性能", "") + '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
+}
+function probesReset() {
+  api("/api/probes/reset", "POST", {}).then(function () { renderProbes(document.getElementById("main")); toast("已清空"); });
+}
+
 // ─── 设置 ────────────────────────────────────────────────────────────────────
 var settingsData = null;
 
@@ -1129,7 +1330,9 @@ function renderSettings(main) {
       '<label class=switch><input type=checkbox id=swIntel ' + (llm.intelEnabled ? "checked" : "") + "><i></i></label></div>" +
       '<div class="row"><label style="font-size:13px"><input type=checkbox id=swPersist> 永久保存（重启后仍保留）</label>' +
       '<button class="btn primary" onclick="settingsApply()">' + icon("activity") + '应用设置</button></div>' +
-      '<p class=dim style="font-size:12px;margin:8px 0 0">主人的 QQ 私聊始终保持启用，避免无法联系主 AI。</p></div>';
+      '<p class=dim style="font-size:12px;margin:8px 0 0">主人的 QQ 私聊始终保持启用，避免无法联系主 AI。</p>' +
+      '<div class="row" style="margin-top:10px;border-top:1px solid var(--line);padding-top:12px"><button class="btn" onclick="guideReplay()">' + icon("spark") + '重看新手引导</button>' +
+      '<span class=dim style="font-size:12px">三步检查：QQ 连接、模型渠道、自动回复范围</span></div></div>';
 
     html += '<div class="card"><h2 style="margin-top:0">工具插件</h2><p class=help>插件为 AI 提供查天气、搜小说等额外能力，停用后不影响其他功能。</p>';
     if (s.plugins.length === 0) html += '<p class=dim>还没有安装工具插件。</p>';
@@ -1184,8 +1387,8 @@ function settingsApply() {
 }
 function pluginToggle(name, enabled) {
   api("/api/plugins/toggle", "POST", { name: name, enabled: enabled })
-    .then(function () { toast(name + (enabled ? " 已启用" : " 已停用")); loadPlugins(); })
-    .catch(function (e) { toast(e.message, true); renderSettings(document.getElementById("main")); });
+    .then(function () { toast(name + (enabled ? " 已启用" : " 已停用")); loadPlugins().then(route); })
+    .catch(function (e) { toast(e.message, true); route(); });
 }
 function modelsEdit() {
   api("/api/models/config").then(function (r) {
@@ -1256,6 +1459,67 @@ function loadPlugins() {
   }).catch(function () { /* 插件列表失败不阻塞导航 */ });
 }
 
+// ─── 新手向导 ────────────────────────────────────────────────────────────────
+var guideStep = 0;
+
+function guideStart() { guideStep = 0; document.getElementById("guide").classList.add("show"); guidePaint(); }
+function guideSkip() { document.getElementById("guide").classList.remove("show"); }
+function guideFinish() { localStorage.setItem("dl_guide_done", "1"); guideSkip(); toast("随时可以在「设置」里重看新手引导"); }
+function guideReplay() { localStorage.removeItem("dl_guide_done"); guideStart(); }
+function guideGo(route) { guideSkip(); location.hash = "#/" + route; }
+
+function guidePaint() {
+  var card = document.getElementById("guideCard");
+  var dots = '<div class="guide-steps">';
+  for (var d = 0; d < 3; d++) dots += "<i class=\\"" + (d === guideStep ? "on" : "") + "\\"></i>";
+  dots += "</div>";
+  var foot = '<div class="guide-actions"><button class="btn" onclick="guideFinish()">跳过向导</button>' +
+    '<button class="btn primary" id="guideNextBtn">' + (guideStep === 2 ? "完成" : "下一步") + " " + icon("arrow") + "</button></div>";
+  card.innerHTML = dots;
+  if (guideStep === 0) {
+    card.innerHTML = dots + '<div class="eyebrow">第 1 步 · 共 3 步</div><h2>连接 QQ</h2>' +
+      '<p>DeepLive 通过 NapCat 收发 QQ 消息。先在电脑或手机上启动 NapCat 并登录 QQ，再把它连接到本面板。</p><p id=guideInfo>正在检查连接状态…</p>' + foot;
+    api("/api/status").then(function (s) {
+      var el = document.getElementById("guideInfo");
+      if (!el) return;
+      if (s.bot.connected) {
+        el.innerHTML = '<span class="guide-ok">✓ QQ 已连接（' + h(s.bot.nickname || s.bot.selfId) + "）</span>，可以直接进入下一步。";
+      } else {
+        el.innerHTML = 'QQ 目前未连接。点击下方「去 NapCat 配置」查看连接地址，填进 NapCat 后再回来继续。';
+        var next = document.getElementById("guideNextBtn");
+        next.innerHTML = '去 NapCat 配置';
+        next.onclick = function () { guideGo("napcat"); };
+      }
+    }).catch(function () { var el = document.getElementById("guideInfo"); if (el) el.textContent = "状态获取失败，可先跳过，稍后在首页查看。"; });
+  } else if (guideStep === 1) {
+    card.innerHTML = dots + '<div class="eyebrow">第 2 步 · 共 3 步</div><h2>检查模型渠道</h2>' +
+      '<p>AI 回复依赖模型渠道。下方是当前配置，若为空或报错，请到「设置」页编辑模型配置。</p><p id=guideInfo>正在读取模型配置…</p>' + foot;
+    api("/api/models").then(function (m) {
+      var el = document.getElementById("guideInfo");
+      if (!el) return;
+      var firstLine = (m.text || "").split("\\n")[0] || "";
+      el.innerHTML = firstLine ? '当前渠道：<span class="guide-ok">' + h(firstLine) + "</span>" : '还没有可用渠道，请到「设置」页配置模型。';
+    }).catch(function () { var el = document.getElementById("guideInfo"); if (el) el.textContent = "模型配置读取失败，请到「设置」页检查。"; });
+  } else {
+    card.innerHTML = dots + '<div class="eyebrow">第 3 步 · 共 3 步</div><h2>选择自动回复范围</h2>' +
+      '<p id=guideInfo>正在统计会话…</p>' + foot;
+    api("/api/status").then(function (s) {
+      var el = document.getElementById("guideInfo");
+      if (!el) return;
+      if (s.scopes.enabled > 0) {
+        el.innerHTML = '已有 <span class="guide-ok">' + s.scopes.enabled + " 个会话</span>开启自动回复。可在「设置」或「QQ 机器人 → 自动回复」里随时调整。";
+      } else {
+        el.innerHTML = '目前没有会话开启自动回复。点击下方「去设置」批量开启，或在「QQ 机器人 → 自动回复」逐个选择。';
+        var next = document.getElementById("guideNextBtn");
+        next.innerHTML = '去设置';
+        next.onclick = function () { guideGo("settings"); };
+      }
+    }).catch(function () { var el = document.getElementById("guideInfo"); if (el) el.textContent = "会话统计获取失败，可稍后在设置页调整。"; });
+  }
+  var next = document.getElementById("guideNextBtn");
+  if (next && next.innerHTML.indexOf("去") !== 0) next.onclick = function () { if (guideStep >= 2) guideFinish(); else { guideStep += 1; guidePaint(); } };
+}
+
 function boot() {
   document.getElementById("app").style.display = "flex";
   hydrateIcons();
@@ -1264,6 +1528,7 @@ function boot() {
     if (e.target.closest("a")) closeDrawer();
   });
   loadPlugins().then(route);
+  if (!localStorage.getItem("dl_guide_done")) setTimeout(guideStart, 600);
 }
 
 window.addEventListener("hashchange", route);

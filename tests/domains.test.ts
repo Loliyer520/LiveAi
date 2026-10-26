@@ -7,15 +7,15 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { DOMAIN_DEFS, domainDefForScope, domainScopeHasBuiltin, hubForScope } from '../src/chat/domains.js';
+import { domainDefs, domainDefForScope, domainScopeHasBuiltin, hubForScope, loadDomains } from '../src/chat/domains.js';
 import { chatToolSchemas, executeChatTool, type ToolContext } from '../src/chat/tools.js';
 import { PluginRegistry } from '../src/chat/plugins.js';
 import type { NapcatBot } from '../src/bot/napcat.js';
 
 test('domain 注册表：domain:mc 已注册，查询与工具判定正确', () => {
-  assert.ok(DOMAIN_DEFS.some((def) => def.id === 'mc'));
-  assert.ok(DOMAIN_DEFS.some((def) => def.id === 'onebot'));
-  assert.ok(DOMAIN_DEFS.some((def) => def.id === 'bili'));
+  assert.ok(domainDefs().some((def) => def.id === 'mc'));
+  assert.ok(domainDefs().some((def) => def.id === 'onebot'));
+  assert.ok(domainDefs().some((def) => def.id === 'bili'));
   assert.equal(domainDefForScope('domain:mc')?.title, 'Minecraft 中枢');
   assert.equal(domainDefForScope('domain:onebot')?.title, 'Onebot 中枢');
   assert.equal(domainDefForScope('group:1'), null);

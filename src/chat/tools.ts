@@ -25,9 +25,9 @@ import { mc2dClient } from './mc2d.js';
 import type { GroupRolesInfo } from './group-roles.js';
 import type { Workspace } from './workspace.js';
 import type { KnowledgeBase, KbPermission } from '../knowledge/kb.js';
-import { DOMAIN_DEFS, domainDefForScope, domainScopeHasBuiltin } from './domains.js';
+import { domainDefForScope, domainDefs, domainScopeHasBuiltin } from './domains.js';
 
-const DOMAIN_LIST = DOMAIN_DEFS.map((def) => `domain:${def.id}（${def.title}）`).join('、');
+function domainList(): string { return domainDefs().map((def) => `domain:${def.id}（${def.title}）`).join('、'); }
 
 // ── send_tts 端点（chat-module 启动时注入；测试可覆盖） ─────────────────────
 let ttsBaseUrl = 'http://127.0.0.1:8020';
@@ -1656,7 +1656,7 @@ export async function executeChatTool(
       if (targetType === 'domain' && domainDefForScope(`domain:${targetId}`) === null) {
         return {
           ok: false,
-          output: `没有注册 domain:${targetId} 这个领域中枢。现有领域: ${DOMAIN_LIST}。`,
+          output: `没有注册 domain:${targetId} 这个领域中枢。现有领域: ${domainList()}。`,
         };
       }
       if (targetType === context.scopeType && targetId === context.scopeId) return { ok: false, output: '目标是当前会话（主AI自己），直接处理即可，无需委派。' };
@@ -1681,7 +1681,7 @@ export async function executeChatTool(
         return { ok: true, output: '已直发最高级中枢（主AI）。' };
       }
       if (domainDefForScope(`domain:${target}`) === null) {
-        return { ok: false, output: `没有注册 domain:${target} 这个领域中枢。现有领域: ${DOMAIN_LIST}；找最高级中枢传 target="master"。` };
+        return { ok: false, output: `没有注册 domain:${target} 这个领域中枢。现有领域: ${domainList()}；找最高级中枢传 target="master"。` };
       }
       if (context.scopeType === 'domain' && context.scopeId === target) {
         return { ok: false, output: '目标就是自己，直接处理即可。' };

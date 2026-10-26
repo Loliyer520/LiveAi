@@ -25,6 +25,7 @@ import type { DiarySummarizer } from '../store/summarizer.js';
 import type { RelationGraph } from '../relations/graph.js';
 import type { KnowledgeBase } from '../knowledge/kb.js';
 import { domainDefForScope, hubForScope } from './domains.js';
+import { withProbe } from '../observability/probe.js';
 import type { IntelCollector } from '../relations/collector.js';
 import { PromptStore } from '../prompt/store.js';
 import { buildChildMessages } from '../prompt/assemble.js';
@@ -346,7 +347,8 @@ export class AiOrchestrator {
       }
       const turnStart = Date.now();
       console.info(`[orchestrator] turn start scope=${scopeKey}`);
-      const followup = await this.runMessageTurn(scopeKey, current);
+      const turnItem: TurnItem = current;
+      const followup = await withProbe('chat.turn', () => this.runMessageTurn(scopeKey, turnItem), { scope: scopeKey });
       console.info(`[orchestrator] turn done scope=${scopeKey} took=${Math.round((Date.now() - turnStart) / 1000)}s`);
       current = followup;
     }
