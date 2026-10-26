@@ -1,0 +1,33 @@
+{
+  "napcat": {
+    "ws_url": "ws://127.0.0.1:7821/openclaw-bind",
+    "http_url": "http://127.0.0.1:7822",
+    "self_id": 0,
+    "access_token": "",
+    "reconnect_base_ms": 1000,
+    "reconnect_max_ms": 30000
+  },
+  "ai": {
+    "master_qq": 123456789,
+    "admin_qq": 123456789,
+    "global_trigger_rate": 0.08,
+    "stale_message_max_age_seconds": 300,
+    "history_limit": 500,
+    "request_timeout_ms": 180000,
+    "summary_enabled": true,
+    "intel_enabled": true
+  },
+  "storage": {
+    "state_dir": "data/state",
+    "models_config_path": "data/models_config.json",
+    "prompt_dir": "data/prompt"
+  },
+  "webui": {
+    "host": "127.0.0.1",
+    "token": ""
+  },
+  "novel_command": {
+    "scopes": [],
+    "base_url": "http://127.0.0.1:7640"
+  }
+}

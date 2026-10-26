@@ -42,3 +42,11 @@ test('replyMessageLines drops empty lines', () => {
 test('replyMessageLines on empty input yields nothing to send', () => {
   assert.deepEqual(replyMessageLines('   \n \n'), []);
 });
+
+test('literal \\n escapes from the model become real newlines', () => {
+  assert.deepEqual(replyMessageLines('看到消息\\n放学路上慢点嘛'), ['看到消息', '放学路上慢点嘛']);
+});
+
+test('stray content pseudo-tags are stripped', () => {
+  assert.deepEqual(replyMessageLines('说了我才能对比呀</content>'), ['说了我才能对比呀']);
+});

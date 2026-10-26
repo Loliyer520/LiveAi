@@ -103,9 +103,17 @@ export class ScopeActorDispatcher {
     record.task = this.runActor(scopeKey, record);
     this.actors.set(scopeKey, record);
     // Self-cleanup: drop the actor record once its loop exits while idle.
-    void record.task.then(() => {
-      if (this.actors.get(scopeKey) === record) this.actors.delete(scopeKey);
-    });
+    // 崩了也要摘记录——否则 dead record 卡在 map 里，ensureActor 永远 no-op，
+    // 该 scope 的消息就在信箱里堆到天荒地老；摘掉后下个事件会重建 actor 继续消费。
+    void record.task.then(
+      () => {
+        if (this.actors.get(scopeKey) === record) this.actors.delete(scopeKey);
+      },
+      (error) => {
+        console.error(`[actor] scope=${scopeKey} 消费循环异常退出:`, error);
+        if (this.actors.get(scopeKey) === record) this.actors.delete(scopeKey);
+      },
+    );
   }
 
   private async runActor(scopeKey: string, record: ActorRecord): Promise<void> {

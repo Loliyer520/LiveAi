@@ -1,0 +1,153 @@
+{
+  "name": "novel",
+  "description": "番茄小说搜索/阅读/转发（本机 fq-novel 服务，免费全文含 VIP 章节）",
+  "enabled": true,
+  "tools": [
+    {
+      "name": "novel_search",
+      "description": "搜索小说：返回最相关的几本（书名/作者/分类/评分/简介/book_id）。用户想看小说、让推荐书、找书时用它。拿到 book_id 后用 novel_detail 看详情、novel_directory 列章节、novel_content 取正文。",
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string", "description": "书名/作者/关键词" }
+        },
+        "required": ["key"]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7640/search?q={{key}}"
+      },
+      "response": {
+        "format": "json",
+        "code_path": "code",
+        "ok_value": 0,
+        "msg_path": "message",
+        "list": {
+          "from": "data.books",
+          "max": 6,
+          "separator": "\n\n",
+          "item": "《{{title}}》 {{author}}｜{{category}}｜评分{{score}}｜{{word_count}}字\n{{summary}}\nbook_id: {{book_id}}"
+        }
+      }
+    },
+    {
+      "name": "novel_detail",
+      "description": "查看小说详情：字数/连载状态/总章数/简介/最新章标题。",
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "book_id": { "type": "string", "description": "novel_search 返回的 book_id" }
+        },
+        "required": ["book_id"]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7640/book/{{book_id}}"
+      },
+      "response": {
+        "format": "json",
+        "code_path": "code",
+        "ok_value": 0,
+        "msg_path": "message",
+        "template": "《{{data.title}}》 {{data.author}}｜{{data.category}}｜{{data.status}}｜{{data.word_count}}字｜共{{data.chapter_count}}章\n简介：{{data.summary}}\n最新章：{{data.last_chapter_title}}"
+      }
+    },
+    {
+      "name": "novel_directory",
+      "description": "列出小说章节目录（章节标题 + 每章 item_id）。默认列前 120 章，可用 count 调整（最多 300）；完整目录同时存到 novels/<book_id>_directory.json，更靠后的章节用 file_search/file_read 查那个文件。取正文时拿章节对应的 item_id 调 novel_content。注意：目录里的 char_count 字段通常没有值（null），它不代表锁章或没内容——判断某章能不能取，唯一依据是实际调 novel_content 的结果，不许看目录字段猜。",
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "book_id": { "type": "string", "description": "novel_search 返回的 book_id" },
+          "count": { "type": "number", "description": "列多少章，默认 120，最多 300", "default": 120 }
+        },
+        "required": ["book_id"]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7640/book/{{book_id}}/catalog"
+      },
+      "response": {
+        "format": "json",
+        "code_path": "code",
+        "ok_value": 0,
+        "msg_path": "message",
+        "list": {
+          "from": "data.volume_list[].chapter_list",
+          "max": "{{count}}",
+          "separator": "\n",
+          "item": "{{title}}｜{{item_id}}"
+        },
+        "save": {
+          "from": "data",
+          "path": "novels/{{book_id}}_directory.json"
+        }
+      }
+    },
+    {
+      "name": "novel_content",
+      "description": "取小说一章正文：自动去掉 HTML 标签存成 txt（novels/<book_id>/<item_id>.txt）。forward=true 时取到后直接把正文发给用户，一次调用搞定转发，不用你再调用别的工具、更不要自己复述；forward=false（默认）只存文件，之后自己读用 file_read，发整章用 send_file，发选段用 file_search 定位 + send_file_excerpt。只要一章时用它；连续多章必须改用 novel_chapters 一次批量取发。只有工具真实返回失败（code 非 0 / 内容为空）才叫「取不到」，其他任何推断都不算数。",
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "book_id": { "type": "string", "description": "novel_search 返回的 book_id（用于存档路径）" },
+          "item_id": { "type": "string", "description": "章节的 item_id（novel_directory 里拿）" },
+          "forward": { "type": "boolean", "description": "true=取到正文后直接原文发给用户；默认 false 只存 txt", "default": false }
+        },
+        "required": ["book_id", "item_id"]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7640/chapter/{{item_id}}"
+      },
+      "response": {
+        "format": "json",
+        "code_path": "code",
+        "ok_value": 0,
+        "msg_path": "message",
+        "template": "已取到章节《{{data.title}}》，正文已去标签存成 txt。",
+        "save": {
+          "from": "data.content",
+          "path": "novels/{{book_id}}/{{item_id}}.txt",
+          "html_to_text": true,
+          "send": "{{forward}}"
+        }
+      }
+    },
+    {
+      "name": "novel_chapters",
+      "description": "【多章必用】一次调用批量取多章正文并逐章存 txt / 逐章原文发给用户（forward 默认 true）。用户要连续几章（\"再取五章\"、\"207到211\"、\"继续往下发\"）时必须用它，一次搞定，禁止循环调 novel_content 一章一发。单次最多 15 章，更多分批。item_ids 用逗号分隔，顺序就是发送顺序。个别章节失败不影响其余章节，会逐章报告。",
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "book_id": { "type": "string", "description": "novel_search 返回的 book_id（用于存档路径）" },
+          "item_ids": { "type": "string", "description": "逗号分隔的章节 item_id 列表（novel_directory 里拿），最多 15 个" },
+          "forward": { "type": "boolean", "description": "true=取到后逐章原文发给用户（默认）；false=只存 txt 不发", "default": true }
+        },
+        "required": ["book_id", "item_ids"]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7640/chapters?ids={{item_ids}}&book_id={{book_id}}"
+      },
+      "response": {
+        "format": "json",
+        "code_path": "code",
+        "ok_value": 0,
+        "msg_path": "message",
+        "template": "批量取章完成，逐章结果：",
+        "save_each": {
+          "from": "data",
+          "path": "novels/{{book_id}}/{{__key}}.txt",
+          "html_to_text": true,
+          "send": "{{forward}}"
+        }
+      }
+    }
+  ]
+}

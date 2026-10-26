@@ -179,7 +179,7 @@ export function turnItemFromBatch(batch: EventBatch): TurnItem {
 function normalizeStoredMessage(data: Partial<ChatMessage>): ChatMessage {
   return {
     chatType: (data.chatType ?? 'private') as ChatMessage['chatType'],
-    chatId: Number(data.chatId ?? 0),
+    chatId: data.chatId ?? 0,
     userId: Number(data.userId ?? 0),
     text: String(data.text ?? ''),
     rawMessage: String(data.rawMessage ?? ''),

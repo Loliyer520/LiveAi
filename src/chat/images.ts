@@ -10,6 +10,7 @@
  */
 
 import type { ChatMessage } from './types.js';
+import { assertPublicUrl, fetchGuarded, readCapped } from './net.js';
 
 const CQ_IMAGE_PATTERN = /\[CQ:image,([^\]]*)\]/g;
 
@@ -75,15 +76,14 @@ const MAX_EMBED_BYTES = 6 * 1024 * 1024;
  */
 export async function embedImageAsDataUrl(url: string): Promise<string> {
   if (url.startsWith('data:') || !/^https?:\/\//i.test(url)) return url;
-  const response = await fetch(url, {
+  // QQ CDN 是公网地址，过 SSRF 守卫不影响正常用图；重定向逐跳复查，读体走硬上限。
+  const checked = await assertPublicUrl(url);
+  const response = await fetchGuarded(checked, {
     headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://im.qq.com/' },
     signal: AbortSignal.timeout(30_000),
   });
   if (!response.ok) throw new Error(`图片下载失败 HTTP ${response.status}`);
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.byteLength > MAX_EMBED_BYTES) {
-    throw new Error(`图片太大（${Math.round(buffer.byteLength / 1024)}KB），无法内嵌解析`);
-  }
+  const buffer = await readCapped(response, MAX_EMBED_BYTES);
   const mime = (response.headers.get('content-type') ?? '').split(';', 1)[0].trim() || 'image/jpeg';
   if (!mime.startsWith('image/')) throw new Error(`不是图片内容: ${mime}`);
   return `data:${mime};base64,${buffer.toString('base64')}`;

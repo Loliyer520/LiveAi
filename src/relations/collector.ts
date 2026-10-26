@@ -17,7 +17,7 @@ import type { RelationGraph, FactCategory } from './graph.js';
 import { FACT_CATEGORIES } from './graph.js';
 import type { ScopeRepository } from '../store/repository.js';
 import type { ModelManager } from '../models/manager.js';
-import { completeChat } from '../models/protocol.js';
+import { completeChatTracked } from '../models/usage.js';
 import { isInternalReportEntry } from '../chat/types.js';
 import type { HistoryEntry } from '../chat/types.js';
 
@@ -51,8 +51,17 @@ export class IntelCollector {
     private readonly models: ModelManager,
     /** Live bot self-id (may be adopted from events after startup). */
     private readonly selfIdOf: () => number,
-    private readonly enabled = true,
+    private enabled = true,
   ) {}
+
+  /** 管理面板总开关热切换（免重启）；config.json 的初始值仍是重启后的落点。 */
+  setEnabled(enabled: boolean): void {
+    this.enabled = enabled;
+  }
+
+  isEnabled(): boolean {
+    return this.enabled;
+  }
 
   /** Count one real user message; fires an extraction when the window fills. */
   notify(scopeType: string, scopeId: string): void {
@@ -154,16 +163,23 @@ export class IntelCollector {
   }
 
   private async callModel(prompt: string): Promise<string> {
+    this.models.beginRequest('summary');
     const model = this.models.getModelForRole('summary');
     if (model === null) throw new Error('没有可用的情报模型（roles.summary 未配置且无法回退到 main）');
-    const reply = await completeChat(model, {
+    let reply;
+    try {
+      reply = await completeChatTracked('summary', model, {
       system: [{ text: '你是严谨的信息抽取工具，只输出 JSON，不输出任何其他内容。' }],
       messages: [{ role: 'user', content: prompt }],
       tools: [],
       temperature: 0.2,
       maxTokens: 1024,
-      thinkingLevel: 'off',
-    });
+        thinkingLevel: 'off',
+      });
+    } catch (error) {
+      this.models.notifyFailure('summary');
+      throw error;
+    }
     const text = reply.text.trim();
     if (!text) throw new Error('情报模型返回空内容');
     return text;

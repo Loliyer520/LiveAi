@@ -51,14 +51,40 @@ test('sourceKindOf classifies internal and self-device sources', () => {
 });
 
 test('cleanText strips CQ:at of the bot and trims', () => {
-  const message = groupMessage(`[CQ:at,qq=3592217365] 你好呀`);
-  assert.equal(cleanText(message, 3592217365), '你好呀');
+  const message = groupMessage(`[CQ:at,qq=987654322] 你好呀`);
+  assert.equal(cleanText(message, 987654322), '你好呀');
 });
 
 test('markMentionsSelf prefixes the marker for group mentions', () => {
   const message = groupMessage('你好', { mentionsSelf: true });
   assert.equal(markMentionsSelf(message, '你好'), '[被@] 你好');
   assert.equal(markMentionsSelf(groupMessage('hi'), 'hi'), 'hi');
+});
+
+test('markMentionsSelf skips the marker for the debounce synthetic', () => {
+  // Regression 2026-09-29: rendering the debounce trigger as [被@] pressured
+  // the model into re-answering its own last reply verbatim.
+  const synthetic = buildDebounceTriggerMessage('1', 5, 987654322);
+  assert.equal(markMentionsSelf(synthetic, synthetic.text), synthetic.text);
+  assert.ok(synthetic.text.includes('stay_silent'), 'debounce text guides silence-when-answered');
+});
+
+test('cancel() drops an armed window so it never fires', async () => {
+  const fired: string[] = [];
+  const windows = new GroupReplyWindows({
+    isEpochStale: () => false,
+    isScopeBusy: () => false,
+    fireTrigger: (scopeKey) => fired.push(scopeKey),
+  });
+  windows.touch('group:9', '9', 5);
+  const record = (windows as unknown as { windows: Map<string, { lastMessageTime: number; armedAt: number }> }).windows;
+  const entry = record.get('group:9')!;
+  entry.lastMessageTime = Date.now() - 6000;
+  entry.armedAt = Date.now() - 7000;
+  windows.cancel('group:9'); // bot just spoke — window must die
+  await sleep(1500);
+  assert.equal(fired.length, 0);
+  assert.equal(record.has('group:9'), false);
 });
 
 test('debounce window fires only after 5s silence, once, and only when idle', async () => {
@@ -97,8 +123,8 @@ test('debounce suppresses fire when scope is busy', async () => {
 });
 
 test('buildDebounceTriggerMessage is a mentions-self synthetic with unique id', () => {
-  const one = buildDebounceTriggerMessage('777', 3, 3592217365);
-  const two = buildDebounceTriggerMessage('777', 3, 3592217365);
+  const one = buildDebounceTriggerMessage('777', 3, 987654322);
+  const two = buildDebounceTriggerMessage('777', 3, 987654322);
   assert.equal(one.chatType, 'group');
   assert.equal(one.chatId, 777);
   assert.equal(one.mentionsSelf, true);
@@ -119,6 +145,7 @@ function triggerToolContext(): { context: ToolContext; agent: AgentRecord } {
     impression: '',
     triggerWords: ['冰糖', 'bingtang'],
     triggerRate: 0.01,
+    enabled: true,
     displayName: '',
     createdAt: 0,
     overallSummary: '',
@@ -140,6 +167,7 @@ function triggerToolContext(): { context: ToolContext; agent: AgentRecord } {
     notifyMaster: () => {},
     delegateToChild: () => 't',
     sendToScope: async () => 'ok',
+    peerInject: () => undefined,
     triggerImageRefs: [],
     describeImage: async () => '',
     scopeType: 'group',
@@ -215,3 +243,165 @@ test('trigger_config list reports current settings', async () => {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// ── scope_manage (主AI 管控工具) ────────────────────────────────────────────
+
+function makeAgent(scopeType: string, scopeId: string): AgentRecord {
+  return {
+    agentId: `agent_${scopeId}`,
+    scopeType,
+    scopeId,
+    persona: '',
+    impression: '',
+    triggerWords: ['冰糖', 'bingtang'],
+    triggerRate: 0.01,
+    enabled: true,
+    displayName: '',
+    createdAt: 0,
+    overallSummary: '',
+    overallSummaryBuiltAt: 0,
+    overallSummaryAtSegments: 0,
+  };
+}
+
+function scopeManageContext(): { context: ToolContext; agents: Map<string, AgentRecord> } {
+  const agents = new Map<string, AgentRecord>();
+  agents.set('group:777', makeAgent('group', '777'));
+  agents.set('group:888', makeAgent('group', '888'));
+  agents.set('private:123456789', makeAgent('private', '123456789'));
+  const repo = {
+    getOrCreateAgent: (t: string, i: string) => {
+      const key = `${t}:${i}`;
+      if (!agents.has(key)) agents.set(key, makeAgent(t, i));
+      return agents.get(key)!;
+    },
+    updateAgent: (t: string, i: string, patch: Partial<AgentRecord>) => {
+      const key = `${t}:${i}`;
+      const agent = agents.get(key) ?? makeAgent(t, i);
+      Object.assign(agent, patch);
+      agents.set(key, agent);
+    },
+    listAgents: () => [...agents.values()],
+  };
+  const context = {
+    bot: {} as never,
+    repo: repo as never,
+    archive: {} as never,
+    relations: {} as never,
+    tasks: {} as never,
+    masterQq: 123456789,
+    isMaster: true,
+    notifyMaster: () => {},
+    delegateToChild: () => 't',
+    sendToScope: async () => 'ok',
+    peerInject: () => undefined,
+    triggerImageRefs: [],
+    describeImage: async () => '',
+    scopeType: 'private',
+    scopeId: '123456789',
+    executedTools: [],
+    workspace: new Workspace('/tmp/liveai-test-workspace'),
+    networkBudget: { used: 0 },
+  } satisfies ToolContext;
+  return { context, agents };
+}
+
+test('scope_manage refuses non-master callers', async () => {
+  const { context } = scopeManageContext();
+  const result = await executeChatTool(
+    { name: 'scope_manage', arguments: { action: 'list' } },
+    { ...context, isMaster: false },
+  );
+  assert.equal(result.ok, false);
+  assert.ok(result.output.includes('仅限主AI'));
+});
+
+test('scope_manage list and get report scope configs', async () => {
+  const { context } = scopeManageContext();
+  const list = await executeChatTool(
+    { name: 'scope_manage', arguments: { action: 'list' } },
+    context,
+  );
+  assert.equal(list.ok, true);
+  assert.ok(list.output.includes('group:777'));
+  assert.ok(list.output.includes('private:123456789'));
+
+  const get = await executeChatTool(
+    { name: 'scope_manage', arguments: { action: 'get', target_scope_type: 'group', target_scope_id: '888' } },
+    context,
+  );
+  assert.equal(get.ok, true);
+  assert.ok(get.output.includes('group:888'));
+  assert.ok(get.output.includes('冰糖'));
+});
+
+test('scope_manage set_enabled gates triggering but not history', async () => {
+  const { context, agents } = scopeManageContext();
+  const off = await executeChatTool(
+    { name: 'scope_manage', arguments: { action: 'set_enabled', target_scope_type: 'group', target_scope_id: '777', enabled: false } },
+    context,
+  );
+  assert.equal(off.ok, true);
+  assert.equal(agents.get('group:777')!.enabled, false);
+  // @bot and trigger words no longer fire while disabled
+  const msg = { ...groupMessage('冰糖在吗'), mentionsSelf: true };
+  assert.equal(shouldTrigger(msg, '冰糖在吗', agents.get('group:777')!), false);
+
+  const on = await executeChatTool(
+    { name: 'scope_manage', arguments: { action: 'set_enabled', target_scope_type: 'group', target_scope_id: '777', enabled: true } },
+    context,
+  );
+  assert.equal(on.ok, true);
+  assert.equal(agents.get('group:777')!.enabled, true);
+});
+
+test('scope_manage never disables the master scope', async () => {
+  const { context, agents } = scopeManageContext();
+  const result = await executeChatTool(
+    { name: 'scope_manage', arguments: { action: 'set_enabled', target_scope_type: 'private', target_scope_id: '123456789', enabled: false } },
+    context,
+  );
+  assert.equal(result.ok, false);
+  assert.equal(agents.get('private:123456789')!.enabled, true, 'master scope stays enabled');
+});
+
+test('scope_manage set_trigger_rate validates 0~1', async () => {
+  const { context, agents } = scopeManageContext();
+  const ok = await executeChatTool(
+    { name: 'scope_manage', arguments: { action: 'set_trigger_rate', target_scope_type: 'group', target_scope_id: '777', rate: 0.3 } },
+    context,
+  );
+  assert.equal(ok.ok, true);
+  assert.equal(agents.get('group:777')!.triggerRate, 0.3);
+
+  const bad = await executeChatTool(
+    { name: 'scope_manage', arguments: { action: 'set_trigger_rate', target_scope_type: 'group', target_scope_id: '777', rate: 1.5 } },
+    context,
+  );
+  assert.equal(bad.ok, false);
+  assert.equal(agents.get('group:777')!.triggerRate, 0.3, 'invalid rate leaves the setting alone');
+});
+
+test('scope_manage trigger words add/remove with dedupe and non-empty guard', async () => {
+  const { context, agents } = scopeManageContext();
+  const added = await executeChatTool(
+    { name: 'scope_manage', arguments: { action: 'add_trigger_words', target_scope_type: 'group', target_scope_id: '777', words: ['小糖', ' 冰糖 '] } },
+    context,
+  );
+  assert.equal(added.ok, true);
+  assert.deepEqual(agents.get('group:777')!.triggerWords, ['冰糖', 'bingtang', '小糖'], 'trims and dedupes');
+
+  const removed = await executeChatTool(
+    { name: 'scope_manage', arguments: { action: 'remove_trigger_words', target_scope_type: 'group', target_scope_id: '777', words: ['bingtang', '小糖'] } },
+    context,
+  );
+  assert.equal(removed.ok, true);
+  assert.deepEqual(agents.get('group:777')!.triggerWords, ['冰糖']);
+
+  const empty = await executeChatTool(
+    { name: 'scope_manage', arguments: { action: 'remove_trigger_words', target_scope_type: 'group', target_scope_id: '777', words: ['冰糖'] } },
+    context,
+  );
+  assert.equal(empty.ok, false, 'refuses to empty the word list');
+  assert.deepEqual(agents.get('group:777')!.triggerWords, ['冰糖']);
+});

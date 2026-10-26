@@ -22,6 +22,8 @@ import { sourceKindOf } from './source.js';
 export interface TriggerAgentConfig {
   triggerWords: string[];
   triggerRate: number;
+  /** 子AI 总开关：false 时任何消息（含 @ 和触发词）都不触发生成。 */
+  enabled?: boolean;
 }
 
 export interface GroupReplyWindow {
@@ -102,6 +104,12 @@ export class GroupReplyWindows {
     if (this.windows.get(scopeKey) === window) this.windows.delete(scopeKey);
   }
 
+  /** Drop a scope's window (e.g. right after the bot spoke — no instant re-trigger). */
+  cancel(scopeKey: string): void {
+    const window = this.windows.get(scopeKey);
+    if (window) this.dispose(scopeKey, window);
+  }
+
   cancelAll(): void {
     for (const [key, window] of this.windows) this.dispose(key, window);
   }
@@ -113,8 +121,12 @@ export function shouldTrigger(
   agent: TriggerAgentConfig,
   log: (line: string) => void = () => {},
 ): boolean {
+  if (agent.enabled === false) return false;
+  const kind: SourceKind = sourceKindOf(message);
+  // 内部任务（闹钟/周期任务/主AI委派/请求事件）在任何会话都必须触发——
+  // 否则群里的闹钟和委派 99% 被随机率拦掉，任务形同虚设。
+  if (kind === 'internal_task') return true;
   if (message.chatType === 'private') {
-    const kind: SourceKind = sourceKindOf(message);
     if (kind === 'system_private') return false;
     return true;
   }
@@ -135,7 +147,9 @@ export function shouldTrigger(
 
 /** Synthetic continuation message for the debounce path. */
 export function buildDebounceTriggerMessage(scopeId: string, epoch: number, selfId: number): ChatMessage {
-  const text = '（连续对话触发：用户回复后已静默5秒，请自然接续对话）';
+  const text =
+    '（连续对话触发：群里沉默了5秒。先看看最后的话题——如果你刚刚已经回复过、没有新内容可接，直接 stay_silent；'
+    + '有别人抛出了新话题或你确实有想补充的，再用 send_message 自然接一句。不要重复自己已经说过的话。）';
   return {
     chatType: 'group',
     chatId: Number(scopeId),

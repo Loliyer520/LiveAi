@@ -4,8 +4,11 @@
  */
 
 export interface ChatMessage {
-  chatType: 'group' | 'private';
-  chatId: number;
+  /** 'domain' = 领域主级 AI 的虚拟 scope（无 QQ 窗口，只走内部注入）；
+   * 'bili'/'mcclient' = 领域下级 AI 的虚拟 scope（每视频/每 MC client 一个，同样无 QQ 窗口）。 */
+  chatType: 'group' | 'private' | 'domain' | 'bili' | 'mcclient';
+  /** domain/bili/mcclient scope 用字符串 id（如 'mc'、'BV1xx'），QQ scope 是数字号。 */
+  chatId: number | string;
   userId: number;
   text: string;
   rawMessage: string;
@@ -24,6 +27,7 @@ export type SourceKind =
   | 'admin_webui'
   | 'internal_task'
   | 'self_other_device'
+  | 'dataline'
   | 'group'
   | 'friend_private'
   | 'group_temp_private'
@@ -33,7 +37,8 @@ export type SourceKind =
 const SOURCE_LABELS: Record<SourceKind, string> = {
   admin_webui: '系统管理员（后台控制台）',
   internal_task: '后台任务',
-  self_other_device: '本人-其他设备',
+  self_other_device: '本账号其他设备',
+  dataline: '主人-手机数据线',
   group: 'QQ群消息',
   friend_private: 'QQ好友私聊',
   group_temp_private: '群临时会话',

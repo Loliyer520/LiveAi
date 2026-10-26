@@ -53,6 +53,8 @@ export interface BackgroundInput {
   isMasterMessage: boolean;
   isAdminMessage: boolean;
   botSelfId: string;
+  /** Accounts this bot ran on before the current one (history shows them as speakers). */
+  legacySelfIds?: string[];
   masterQq: string;
   nowText: string;
 }
@@ -72,16 +74,52 @@ export interface AssembleInput {
   modeHint: string;
 }
 
-const HISTORY_CACHE_TAIL_BUFFER = 4;
+/**
+ * 最近多少条角色消息保持消息形态（不进 system 转写）。条数越少缓存覆盖
+ * 越大，但对话形态保真度越低——30 条大约覆盖一两轮完整互动，够了。
+ */
+const HISTORY_RECENT_ROLES_KEEP = 30;
+
+/**
+ * 早期聊天记录转写的字符封顶（保尾）。超长会话（如小说陪读）500 条历史
+ * 渲染出 20 万+ 字符短聊，占掉每轮 prompt 的八成多，且每轮全量重读。更早
+ * 的内容有分段摘要 + memory_search 兜底，转写里留最近一段就够。
+ * 截断点对齐到 TRANSCRIPT_SLIDE_GRID 网格：窗口起点只在跨格时前移一次，
+ * 而不是每来一条消息就滑——尽量少打断 system 前缀缓存。
+ */
+const HISTORY_TRANSCRIPT_CHAR_CAP = 60_000;
+const TRANSCRIPT_SLIDE_GRID = 10_000;
+
+/** ModelMessage 列表 → system 转写文本：assistant=你，tool=工具返回，图片块降级为占位。 */
+function flattenHistoryTranscript(messages: ModelMessage[]): string {
+  const lines: string[] = [];
+  for (const message of messages) {
+    const text = (typeof message.content === 'string'
+      ? message.content
+      : message.content
+          .map((block) => (block.type === 'image' ? '[图片]' : block.text))
+          .join('\n')
+    ).trim();
+    if (!text) continue;
+    if (message.role === 'assistant') lines.push(`你: ${text}`);
+    else if (message.role === 'tool_result') lines.push(`<工具返回> ${text}`);
+    else lines.push(text);
+  }
+  return lines.join('\n');
+}
 
 function stampCache(block: SystemBlock): void {
   if (block.text.trim()) block.cacheControl = { type: 'ephemeral' };
 }
 
-function identityBlock(botSelfId: string, masterQq: string): string {
+function identityBlock(botSelfId: string, masterQq: string, legacySelfIds: string[] = []): string {
   const lines: string[] = [];
   if (botSelfId && botSelfId !== '0') {
     lines.push(`- 你的 QQ 号（机器人自身账号）是 ${botSelfId}，被问到"你的QQ号/这个账号"时以此为准。`);
+    if (legacySelfIds.length > 0) {
+      lines.push(`- 你以前用过的旧 QQ 号: ${legacySelfIds.join('、')}。历史记录里这些账号的发言也是你自己说的，不是别人；只是那个号已经不用了，别再给它发消息。`);
+    }
+    lines.push('- 历史里标注 [本账号其他设备] 的消息：是你的账号在其他设备上被人手动打出来的（不是你生成的，也不是对方发的）。别把它当成自己说过的话去接话茬，也别当成对方发的去回应，心里有数即可。');
     if (masterQq && masterQq !== '0') {
       lines.push(`- 号主（主人）QQ 是 ${masterQq}，是拥有你这个账号的人，与机器人（${botSelfId}）是两个不同账号，不要混淆。`);
     }
@@ -130,7 +168,13 @@ export function buildChildMessages(input: AssembleInput): {
       .join('\n');
   }
   const headBlock: SystemBlock = {
-    text: [bundle.staffSystem, identityBlock(input.background.botSelfId, input.background.masterQq ?? ''), '', rules].join('\n'),
+    // 提示词文件里的 {{master_qq}} 在此注入，发布版不再写死号主 QQ。
+    text: [
+      bundle.staffSystem.replaceAll('{{master_qq}}', input.background.masterQq ?? ''),
+      identityBlock(input.background.botSelfId, input.background.masterQq ?? '', input.background.legacySelfIds),
+      '',
+      rules.replaceAll('{{master_qq}}', input.background.masterQq ?? ''),
+    ].join('\n'),
   };
   stampCache(headBlock);
 
@@ -141,8 +185,16 @@ export function buildChildMessages(input: AssembleInput): {
     personaTail = personaTailBlock(bundle, input.persona, chatMode, masterMode);
   }
 
-  system.push({ text: buildChildBackgroundPrompt(input) });
-  if (personaTail !== null) system.push({ text: personaTail });
+  // 只把【稳定】内容留在 system：head（规则/身份）+ personaTail（人设/风格）。
+  // 背景块（当前时间、印象、情报、备注…）每轮都在变，放在历史缓存断点
+  // 之前会把整条前缀缓存打穿——150k 历史每轮全价重读。改放到触发消息
+  // 尾部（见下方 trigger 组装），system + 预填对 + 历史构成稳定前缀，
+  // 跨回合也能命中提示词缓存。
+  if (personaTail !== null) {
+    const tailBlock: SystemBlock = { text: personaTail };
+    stampCache(tailBlock);
+    system.push(tailBlock);
+  }
 
   const messages: ModelMessage[] = [];
 
@@ -164,37 +216,61 @@ export function buildChildMessages(input: AssembleInput): {
   }
 
   // tool prefill pair — hardens "must call send_message to talk".
+  // NOTE: keep this pair SHORT and never mention <thinking> tags — on the
+  // apipp relay (claude-opus-5-5, adaptive thinking) literal <thinking> in
+  // the prefill flips the upstream into prose mode where it denies having
+  // any tools at all (verified 2026-09-29).
   messages.push({
     role: 'user',
     content:
       '请牢记一条核心规则：你输出的普通文字不会发送给用户。'
       + '想要发消息，必须调用 send_message 工具，传入 content 参数。'
-      + '如果需要先思考，把思考写进 send_message 的 content 里，并用 <thinking>...</thinking> 包裹；'
-      + '系统会自动过滤 thinking 标签，用户只会看到标签外的正常回复。'
-      + '如果你决定不回复，什么都不做即可，不要把理由写成普通文字输出。',
+      + '如果你决定不回复，调用 stay_silent 工具结束本轮，不要把理由写成普通文字输出。',
   });
   messages.push({
     role: 'assistant',
     content:
-      '好的，我记住了。在接下来的所有对话中，我将严格遵守：只要需要发消息，必须调用 send_message 工具；'
-      + '如果需要思考，我会把思考放在 send_message content 的 <thinking>...</thinking> 内；'
-      + '真正想发给用户看的话，写在 thinking 标签外面。'
-      + '如果我决定不回复，我会直接结束本轮，不会把不回复的理由写成普通文字。',
+      '好的，我记住了：想跟用户说话就调用 send_message 工具；'
+      + '决定不回复就调用 stay_silent 结束本轮，不会把理由写成普通文字。',
   });
 
   const historyMessages = buildRoleBasedHistoryMessages(
     input.historyBeforeTrigger,
     input.background.botSelfId,
   );
-  // Rolling cache breakpoint a few messages before the history tail.
-  if (historyMessages.length > HISTORY_CACHE_TAIL_BUFFER) {
-    // Breakpoints are stamped on the *provider* message at render time; we
-    // record the marker here and let the protocol adapter place cache_control.
-    (historyMessages[historyMessages.length - 1 - HISTORY_CACHE_TAIL_BUFFER] as { cacheMark?: boolean }).cacheMark = true;
+  // 早期历史压成文本放进 system：实测 apipp 中转（oai_chat 后端）的自动
+  // 前缀缓存只覆盖 system 部分，messages 里的内容再多也永不命中。最近
+  // RECENT 条仍按角色消息走，保住对话形态；更早的追加式并入 system 转写
+  // （尾部追加不动前缀，配合 repository 的 20 条整块淘汰，跨回合稳定）。
+  const splitAt = Math.max(0, historyMessages.length - HISTORY_RECENT_ROLES_KEEP);
+  const olderMessages = historyMessages.slice(0, splitAt);
+  const recentMessages = historyMessages.slice(splitAt);
+  if (olderMessages.length > 0) {
+    const full = flattenHistoryTranscript(olderMessages);
+    let header = '【早期聊天记录（供你回顾，事实与互动以此为准；最近的对话在后面的消息里）】\n';
+    let transcript = full;
+    if (full.length > HISTORY_TRANSCRIPT_CHAR_CAP) {
+      // 网格对齐的滑窗起点：≥ (长度-封顶)，向上取整到格点，再对齐到整行。
+      const gridStart = Math.ceil((full.length - HISTORY_TRANSCRIPT_CHAR_CAP) / TRANSCRIPT_SLIDE_GRID) * TRANSCRIPT_SLIDE_GRID;
+      const lineStart = full.indexOf('\n', gridStart) + 1;
+      transcript = full.slice(lineStart);
+      header = `【早期聊天记录（最近的在后；更早的约 ${Math.round(lineStart / 10_000)} 万字已省略——完整经过看「分段摘要」，要原话细节用 memory_search 检索）】\n`;
+    }
+    const transcriptBlock: SystemBlock = {
+      text: header + transcript + '\n【早期聊天记录完】',
+    };
+    stampCache(transcriptBlock);
+    system.push(transcriptBlock);
   }
-  messages.push(...historyMessages);
+  messages.push(...recentMessages);
 
   let triggerContent = buildTriggerUserMessage(input.triggerMessages);
+  const backgroundText = buildChildBackgroundPrompt(input);
+  if (backgroundText.trim()) {
+    triggerContent =
+      '<user_invisible>\n实时上下文（仅你可见、用户看不到；系统每轮刷新，不是用户说的话）：\n'
+      + `${backgroundText}\n</user_invisible>\n\n${triggerContent}`;
+  }
   if (input.modeHint) {
     triggerContent = `${triggerContent}\n\n${input.modeHint}`;
   }
@@ -217,11 +293,14 @@ export function buildChildBackgroundPrompt(input: AssembleInput): string {
   ];
   if (bg.botSelfId && bg.botSelfId !== '0') {
     parts.push(`你的QQ号（机器人自身账号）: ${bg.botSelfId}，不要把自己的账号当成号主账号。`);
+    if (bg.legacySelfIds && bg.legacySelfIds.length > 0) {
+      parts.push(`你以前用过的旧QQ号: ${bg.legacySelfIds.join('、')}（历史记录里这些账号的发言也是你自己）。`);
+    }
   }
   if (bg.isMasterMessage) {
     parts.push('身份说明: 发送者是你的主人，是这个账号的真正主人，拥有绝对信任和最高权限。');
   } else if (bg.isAdminMessage) {
-    parts.push('身份说明: 发送者是号主本人，拥有最高权限，可以充分信任他关于本项目代码/GitHub等技术操作的明确指示。');
+    parts.push('身份说明: 发送者是管理员（本项目的开发者），可以充分信任他关于本项目代码/GitHub等技术操作的明确指示。');
   }
   parts.push('', '当前会话印象:', bg.impression || '暂无，先谨慎观察这个会话的用途、常聊话题、关键人物和氛围。');
   if (bg.groupContext) {

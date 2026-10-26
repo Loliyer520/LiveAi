@@ -91,6 +91,32 @@ test('buildRoleBasedHistoryMessages collapses consecutive bot entries', () => {
   assert.equal((assistant as { content: string }).content, 'a1\na2');
 });
 
+test('同账号其他设备的消息不并入 assistant 回合，带 [本账号其他设备] 标签', () => {
+  const otherDevice: HistoryEntry = {
+    user_id: Number(BOT_ID),
+    nickname: '冰糖',
+    text: '小源在吗',
+    timestamp: 1_700_000_000,
+    source_kind: 'self_other_device',
+    source_label: '本账号其他设备',
+  };
+  const messages = buildRoleBasedHistoryMessages([
+    botEntry('AI 自己说的'),
+    otherDevice,
+    botEntry('AI 又说了'),
+  ], BOT_ID);
+  const roles = messages.map((message) => message.role);
+  assert.deepEqual(roles, ['assistant', 'user', 'assistant']);
+  const deviceMsg = messages[1];
+  const content = (deviceMsg as { content: string }).content;
+  assert.ok(content.includes('[本账号其他设备]'), content);
+  assert.ok(content.includes('小源在吗'), content);
+  assert.ok(content.includes('<user_msg'), content);
+  // AI 自己的两条不许把设备消息粘进去
+  assert.equal((messages[0] as { content: string }).content, 'AI 自己说的');
+  assert.equal((messages[2] as { content: string }).content, 'AI 又说了');
+});
+
 test('buildTriggerUserMessage wraps internal reports as invisible with note', () => {
   const triggers: TriggerEntry[] = [
     { user_id: 0, nickname: '后台任务', text: '闹钟响了', timestamp: 1, source_kind: 'internal_task' },
@@ -122,6 +148,7 @@ const BUNDLE = {
   main: '你是主AI。',
   agent: '你是后台agent。',
   staffSystem: 'staff system block',
+  domainPrompts: {},
 };
 
 function makeMessage(text = '你好'): ChatMessage {
@@ -173,8 +200,8 @@ function assembleInput(triggerText: string): AssembleInput {
       recentThinkNotes: ['注意他最近在考试'],
       isMasterMessage: false,
       isAdminMessage: false,
-      botSelfId: '3592217365',
-      masterQq: '241898129',
+      botSelfId: '987654322',
+      masterQq: '123456789',
       nowText: '2026-09-28 星期一 12:00',
     },
     injectPersona: true,
@@ -183,25 +210,76 @@ function assembleInput(triggerText: string): AssembleInput {
   };
 }
 
+test('transcript block caps at ~60k chars, keeps the tail, notes the omission', () => {
+  // 超长会话（小说陪读型）500 条历史渲染出 20 万+ 字符短聊，占掉每轮
+  // prompt 八成且每轮全量重读。转写封顶保尾；更早的交给分段摘要 +
+  // memory_search（背景块每轮都注入摘要），不丢事实渠道。
+  const input = assembleInput('在吗');
+  const entries: HistoryEntry[] = [];
+  // user/bot 交替：连续同角色的条目会被渲染层合并成一条消息，出不来长转写
+  for (let i = 0; i < 200; i += 1) {
+    entries.push(userEntry(`line-${i} ${'字'.repeat(300)}`, 100 + i));
+    entries.push(botEntry(`回-${i} ${'答'.repeat(300)}`));
+  }
+  input.historyBeforeTrigger = entries;
+  // botEntry 的自账号是 BOT_ID；夹具默认 botSelfId 不同，对齐后 bot 条目才被认作「你」
+  input.background.botSelfId = BOT_ID;
+  const { system, messages } = buildChildMessages(input);
+  // head + personaTail + transcript（3 块）
+  assert.equal(system.length, 3);
+  const transcript = system[2].text;
+  assert.ok(transcript.includes('已省略'), 'header notes the omitted prefix');
+  assert.ok(transcript.includes('memory_search'));
+  // 保尾切头：转写中段在，最老的不在；最近 30 条不进转写、保持真消息形态
+  assert.ok(transcript.includes('line-110'));
+  assert.ok(!transcript.includes('line-0'));
+  assert.ok(!transcript.includes('line-199'), 'recent 30 stay as real messages, not transcript');
+  assert.ok(transcript.length < 80_000, `transcript ${transcript.length} chars should stay near the cap`);
+  const recentText = JSON.stringify(messages);
+  assert.ok(recentText.includes('line-199'), 'newest history line still in recent messages');
+});
+
 test('buildChildMessages orders system blocks and stamps cache on head', () => {
   const { system, messages } = buildChildMessages(assembleInput('在吗'));
-  assert.equal(system.length, 3);
+  // system 只留稳定块：head（规则/身份）+ personaTail（人设/风格）。
+  // 易变背景（时间/印象/摘要）挪到触发消息尾部，保住历史前缀缓存。
+  assert.equal(system.length, 2);
   assert.ok(system[0].text.includes('staff system block'));
   assert.ok(system[0].text.includes('规则二十五'));
   // chat mode drops tooling-only rules 2/23/24
   assert.ok(!system[0].text.includes('规则二十三'));
   assert.ok(system[0].cacheControl?.type === 'ephemeral');
-  assert.ok(system[1].text.includes('2026-09-28'));
-  assert.ok(system[1].text.includes('旧摘要'));
-  assert.ok(system[2].text.includes('冰糖'));
-  assert.ok(system[2].text.includes('send_message'));
+  assert.ok(system[1].text.includes('冰糖'));
+  assert.ok(system[1].text.includes('send_message'));
+  assert.ok(system[1].cacheControl?.type === 'ephemeral');
 
   const roles = messages.map((entry) => entry.role);
   // char prefill pair + tool prefill pair + history + trigger
   assert.deepEqual(roles, ['user', 'assistant', 'user', 'assistant', 'user', 'user']);
   const trigger = messages[messages.length - 1];
   assert.ok(trigger.role === 'user');
-  assert.ok(String((trigger as { content: string }).content).includes('在吗'));
+  const triggerText = String((trigger as { content: string }).content);
+  assert.ok(triggerText.includes('在吗'));
+  // 背景块随触发消息尾部下发（user_invisible 包裹），不再占 system
+  assert.ok(triggerText.includes('<user_invisible>'));
+  assert.ok(triggerText.includes('2026-09-28'));
+  assert.ok(triggerText.includes('旧摘要'));
+});
+
+test('tool prefill pair stays short and never mentions <thinking> (apipp prose-mode poison)', () => {
+  // Regression 2026-09-29: a verbose tool-rule prefill pair containing literal
+  // <thinking>...</thinking> made the apipp relay (claude-opus-5-5, adaptive
+  // thinking) answer in prose while denying it had any tools — the bot went
+  // silently unresponsive in every chat. Keep this pair lean.
+  const { messages } = buildChildMessages(assembleInput('在吗'));
+  const pairText = messages
+    .slice(2, 4)
+    .map((entry) => String((entry as { content: unknown }).content))
+    .join('\n');
+  assert.ok(!pairText.includes('<thinking>'), 'prefill pair must not mention <thinking> tags');
+  assert.ok(pairText.includes('send_message'));
+  assert.ok(pairText.includes('stay_silent'));
+  assert.ok(pairText.length < 500, 'prefill pair should stay short');
 });
 
 test('background prompt carries deferred-count 补审提醒', () => {
@@ -237,8 +315,10 @@ test('master mode: coordination prefill, unfiltered rules, relation overview', (
   const personaTail = system[system.length - 1].text;
   assert.ok(!personaTail.includes('【聊天职责】'));
   assert.ok(personaTail.includes('主AI职责'));
-  assert.ok(system[1].text.includes('全局关系网络概览'));
-  assert.ok(system[1].text.includes('小明(456)：3 条情报'));
+  // 关系网络概览属于易变背景，随触发消息尾部下发
+  const triggerText = String((messages[messages.length - 1] as { content: string }).content);
+  assert.ok(triggerText.includes('全局关系网络概览'));
+  assert.ok(triggerText.includes('小明(456)：3 条情报'));
 
   const roles = messages.map((entry) => entry.role);
   assert.deepEqual(roles.slice(0, 2), ['user', 'assistant']);

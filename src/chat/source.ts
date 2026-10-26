@@ -14,6 +14,9 @@ export function sourceKindOf(message: ChatMessage): SourceKind {
   if (message.userId === 0 && raw.source === 'agent_message') return 'internal_task';
   if (message.userId === 0 && raw.source === 'qq_request_event') return 'internal_task';
   if (raw.source === 'self_other_device') return 'self_other_device';
+  // QQ 数据线（我的电脑/我的手机）：同账号手机端发来的消息，桥侧打 sub_type
+  // 标记；orchestrator 注入主AI会话时再放 source=dataline。两条路都认。
+  if (raw.sub_type === 'dataline' || raw.source === 'dataline') return 'dataline';
   if (message.chatType === 'group') return 'group';
   const subType = String(raw.sub_type ?? '').trim().toLowerCase();
   const nickname = String(message.sender?.nickname ?? '');
@@ -48,6 +51,10 @@ export const MENTION_SELF_MARK = '[被@] ';
 
 export function markMentionsSelf(message: ChatMessage, text: string): string {
   if (message.chatType !== 'group' || !message.mentionsSelf) return text;
+  // The debounce continuation trigger only borrows mentionsSelf to pass the
+  // trigger gate — it is not a real @, and rendering one pressures the model
+  // into answering (it re-answered its own last reply, verbatim, 2026-09-29).
+  if ((message.rawData as Record<string, unknown> | undefined)?.source === 'group_reply_debounce') return text;
   if (text.startsWith(MENTION_SELF_MARK)) return text;
   return `${MENTION_SELF_MARK}${text}`;
 }

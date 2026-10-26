@@ -17,7 +17,7 @@
 
 import type { ScopeRepository } from './repository.js';
 import type { ModelManager } from '../models/manager.js';
-import { completeChat } from '../models/protocol.js';
+import { completeChatTracked } from '../models/usage.js';
 import { formatArchiveLine } from './archive.js';
 import type { HistoryEntry } from '../chat/types.js';
 
@@ -31,8 +31,17 @@ export class DiarySummarizer {
   constructor(
     private readonly repo: ScopeRepository,
     private readonly models: ModelManager,
-    private readonly enabled = true,
+    private enabled = true,
   ) {}
+
+  /** 管理面板总开关热切换（免重启）；config.json 的初始值仍是重启后的落点。 */
+  setEnabled(enabled: boolean): void {
+    this.enabled = enabled;
+  }
+
+  isEnabled(): boolean {
+    return this.enabled;
+  }
 
   /** Called after appendMessage rolled a segment; also a fine retry hook. */
   notify(scopeType: string, scopeId: string): void {
@@ -69,13 +78,17 @@ export class DiarySummarizer {
     // 2) refresh the overall primer when enough new summaries landed
     const agent = this.repo.getOrCreateAgent(scopeType, scopeId);
     const summaries = this.repo.getDiarySummaries(scopeType, scopeId);
-    const fresh = summaries.length - agent.overallSummaryAtSegments;
+    // 注意：diarySummaries 只保留最近 20 条，不能用数组长度当进度基准——
+    // 攒满 20 条后 length 恒为 20，fresh 永远算成 0，整体梗概就再也不会重建。
+    // 用最新一条摘要的分段下标（单调递增）作基准。
+    const lastIndex = summaries[summaries.length - 1]?.index ?? 0;
+    const fresh = lastIndex - agent.overallSummaryAtSegments;
     if (summaries.length > 0 && (agent.overallSummary === '' || fresh >= OVERALL_REFRESH_SEGMENTS)) {
       const overall = await this.summarizeOverall(agent.overallSummary, summaries.map((item) => item.text));
       this.repo.updateAgent(scopeType, scopeId, {
         overallSummary: overall,
         overallSummaryBuiltAt: Date.now() / 1000,
-        overallSummaryAtSegments: summaries.length,
+        overallSummaryAtSegments: lastIndex,
       });
     }
   }
@@ -123,16 +136,23 @@ export class DiarySummarizer {
   }
 
   private async callModel(prompt: string): Promise<string> {
+    this.models.beginRequest('summary');
     const model = this.models.getModelForRole('summary');
     if (model === null) throw new Error('没有可用的摘要模型（roles.summary 未配置且无法回退到 main）');
-    const reply = await completeChat(model, {
+    let reply;
+    try {
+      reply = await completeChatTracked('summary', model, {
       system: [{ text: '你是一个严谨的聊天记录摘要工具，只输出摘要正文，不要任何前言、后缀或解释。' }],
       messages: [{ role: 'user', content: prompt }],
       tools: [],
       temperature: 0.3,
       maxTokens: 1024,
-      thinkingLevel: 'off',
-    });
+        thinkingLevel: 'off',
+      });
+    } catch (error) {
+      this.models.notifyFailure('summary');
+      throw error;
+    }
     const text = reply.text.trim();
     if (!text) throw new Error('摘要模型返回空内容');
     return text;

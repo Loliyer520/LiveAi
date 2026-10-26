@@ -105,6 +105,15 @@ export class ModelManager {
     }
   }
 
+  /** 一次新请求开始时调用：fallback_reset 渠道回到首选模型（否则它与 fallback 毫无区别）。 */
+  beginRequest(role: string): void {
+    const channelName = this.resolveRoleChannel(role);
+    if (channelName === null) return;
+    const channel = this.findChannel(channelName);
+    if (!channel || normalizeStrategy(channel.strategy) !== 'fallback_reset') return;
+    this.requestFallbackIndexes.delete(channel.name);
+  }
+
   resolveRoleChannel(role: string): string | null {
     const wanted = String(role ?? '').trim();
     let channelName = String(this.config.roles[wanted] ?? '').trim();
@@ -156,6 +165,8 @@ export class ModelManager {
       displayName: `${upstream.name}/${modelId}`,
       channelName: channel.name,
       upstreamName: upstream.name,
+      thinkingDisabled: upstream.thinking_disabled === true,
+      dropTemperature: upstream.drop_temperature === true,
     };
   }
 

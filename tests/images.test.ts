@@ -130,6 +130,7 @@ async function makeToolHarness(options: {
       notifyMaster: () => {},
       delegateToChild: () => 't',
       sendToScope: async () => 'ok',
+      peerInject: () => undefined,
       triggerImageRefs: options.triggerImageRefs ?? [],
       describeImage: async (url, question) => {
         described.push({ url, question });
@@ -335,7 +336,7 @@ test('child cannot cancel another scope\'s task; master can', async () => {
 
 test('tool schemas include the image + task tools for both roles', () => {
   for (const isMaster of [false, true]) {
-    const names = chatToolSchemas(isMaster).map((schema) => schema.name);
+    const names = chatToolSchemas('private:123456789', isMaster).map((schema) => schema.name);
     for (const expected of ['view_image', 'send_image', 'create_task', 'list_tasks', 'cancel_task']) {
       assert.ok(names.includes(expected), `${expected} present (isMaster=${isMaster})`);
     }

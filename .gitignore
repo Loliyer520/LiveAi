@@ -11,3 +11,7 @@ data/*
 !data/plugins/
 data/plugins/secrets.json
 data/plugins/_state.json
+
+# 示例配置是发布物，豁免 data/* 排除
+!data/config.example.json
+!data/models_config.example.json

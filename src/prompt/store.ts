@@ -2,7 +2,7 @@
  * Layered prompt file store. Ported from legacy core/prompt_store.py.
  *
  * Layout under data/prompt/:
- *   char.txt           — persona (冰糖/洛天成)
+ *   char.txt           — persona 人设
  *   char_prefill.txt   — assistant's persona acknowledgement (fake exchange)
  *   chat_focus.txt     — chat-mode duties (watch group, report intel)
  *   chat_style.txt     — pre-send self check list
@@ -22,7 +22,7 @@ import { readdir } from 'node:fs/promises';
 const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const PROMPT_DIR = join(PROJECT_ROOT, 'data', 'prompt');
 
-export const DEFAULT_CHAR_PROMPT = 'liveAi，由洛神赋开发的自运行数字生命项目。';
+export const DEFAULT_CHAR_PROMPT = 'DeepLive，为你的 AGI 搭建一个生命空间。';
 
 async function readText(path: string, fallback: string): Promise<string> {
   try {
@@ -60,6 +60,8 @@ export interface PromptBundle {
   main: string;
   agent: string;
   staffSystem: string;
+  /** 领域主级 AI 提示词：data/prompt/domain/<id>.txt，按 domain id 索引。 */
+  domainPrompts: Record<string, string>;
 }
 
 export class PromptStore {
@@ -90,6 +92,15 @@ export class PromptStore {
       join(this.promptDir, 'staff.txt'),
       '',
     );
+    const domainPrompts: Record<string, string> = {};
+    try {
+      for (const name of (await readdir(join(this.promptDir, 'domain'))).filter((n) => n.endsWith('.txt'))) {
+        const text = (await readFile(join(this.promptDir, 'domain', name), 'utf-8')).trim();
+        if (text) domainPrompts[name.slice(0, -'.txt'.length)] = text;
+      }
+    } catch {
+      // domain 提示词目录不存在 = 无领域中枢配置，正常。
+    }
     this.cache = {
       char,
       charPrefill,
@@ -99,6 +110,7 @@ export class PromptStore {
       main,
       agent,
       staffSystem: staffTemplate.replaceAll('{{char_prompt}}', char),
+      domainPrompts,
     };
     this.loadedAt = now;
     return this.cache;

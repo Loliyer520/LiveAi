@@ -14,7 +14,7 @@
  */
 
 import { mkdir, readdir, rename, writeFile } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -41,12 +41,14 @@ export interface AgentRecord {
   impression: string; // DEPRECATED: 会话印象已并入关系网（relations 的 scope 节点），此字段仅用于一次性迁移
   triggerWords: string[];
   triggerRate: number;
+  /** 子AI 总开关：false 时该会话任何消息都不触发生成（历史照记）。 */
+  enabled: boolean;
   displayName: string;
   createdAt: number;
   /** Rolling overall summary of the whole scope (compaction primer). */
   overallSummary: string;
   overallSummaryBuiltAt: number;
-  /** diarySummaries.length when the overall summary was last built. */
+  /** 最近一次重建整体梗概时最新摘要的分段下标（index 单调递增，不受 20 条上限影响）。 */
   overallSummaryAtSegments: number;
 }
 
@@ -78,6 +80,13 @@ const REF_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 const DIARY_SEGMENT_SIZE = 50;
 /** Raw unsummarized segments kept for retry; overflow gets a fallback summary. */
 const MAX_UNSUMMARIZED_SEGMENTS = 10;
+/**
+ * 历史窗口按 20 条整块淘汰，与 assemble 的缓存网格断点对齐：逐条淘汰会让
+ * 窗口每条消息都前移一格，整个前缀字节级变动，上游提示词缓存（apipp 是
+ * 自动前缀缓存）永远命不中历史部分。整块淘汰后窗口起点每 20 条才跳一次，
+ * 跳动之间前缀完全稳定，跨回合缓存命中率从 ~10% 提到 ~97%。
+ */
+const HISTORY_EVICT_CHUNK = 20;
 
 export class ScopeRepository {
   private readonly cache = new Map<string, ScopeState>();
@@ -101,6 +110,25 @@ export class ScopeRepository {
     this.persist(state);
   }
 
+  /** Every scope that has a state file on disk (group_<id>.json / private_<id>.json). */
+  listAgents(): AgentRecord[] {
+    let files: string[] = [];
+    try {
+      files = readdirSync(this.stateDir);
+    } catch {
+      return [];
+    }
+    const agents: AgentRecord[] = [];
+    for (const file of files) {
+      const match = /^(group|private)_(\d+)\.json$/.exec(file);
+      if (!match) continue;
+      agents.push(this.getOrCreateAgent(match[1]!, match[2]!));
+    }
+    return agents.sort((a, b) =>
+      a.scopeType === b.scopeType ? Number(a.scopeId) - Number(b.scopeId) : a.scopeType.localeCompare(b.scopeType),
+    );
+  }
+
   // ── messages ──────────────────────────────────────────────────────────────
 
   /**
@@ -111,8 +139,8 @@ export class ScopeRepository {
   appendMessage(scopeType: string, scopeId: string, entry: HistoryEntry): boolean {
     const state = this.loadScope(scopeType, scopeId);
     state.messages.push(entry);
-    if (state.messages.length > this.historyLimit) {
-      state.messages.splice(0, state.messages.length - this.historyLimit);
+    if (state.messages.length > this.historyLimit + HISTORY_EVICT_CHUNK) {
+      state.messages.splice(0, HISTORY_EVICT_CHUNK);
     }
     this.archive?.append(scopeType, scopeId, entry);
     let needsSummarize = false;
@@ -285,7 +313,19 @@ export class ScopeRepository {
         messageRefs: raw.messageRefs ?? {},
         refToMessageId: raw.refToMessageId ?? {},
       };
-    } catch {
+    } catch (error) {
+      // 文件不存在 = 新会话，正常；但 JSON 损坏绝不能静默覆盖——
+      // 先留 .bak 再用全新状态启动，否则记忆丢了连线索都没有。
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        const broken = this.scopePath(scopeType, scopeId);
+        const backup = `${broken}.bak-${Date.now()}`;
+        try {
+          renameSync(broken, backup);
+          console.error(`[repository] 会话状态文件损坏，已备份到 ${backup}:`, error);
+        } catch {
+          console.error(`[repository] 会话状态文件损坏且备份失败:`, error);
+        }
+      }
       state = null;
     }
     state ??= {
@@ -304,19 +344,26 @@ export class ScopeRepository {
 
   /** NOTE: write-through is fire-and-forget; flush() awaits pending writes. */
   private pendingWrites = new Set<Promise<void>>();
+  /** 每文件写链：同一 scope 的 persist 必须按调用顺序落盘——
+   *  否则并发的 tmp+rename 可能让旧状态后落地，磁盘回退。 */
+  private readonly writeQueues = new Map<string, Promise<void>>();
 
   private persist(state: ScopeState): void {
     const key = `${state.agent.scopeType}:${state.agent.scopeId}`;
     const path = this.scopePath(state.agent.scopeType, state.agent.scopeId);
-    const write = (async () => {
-      await mkdir(dirname(path), { recursive: true });
-      const tmp = `${path}.${randomUUID().slice(0, 8)}.tmp`;
-      await writeFile(tmp, JSON.stringify(state, null, 2), 'utf-8');
-      await rename(tmp, path);
-    })().catch(() => {
-      // Write failures drop the cache so the next touch re-hydrates from disk.
-      this.cache.delete(key);
-    });
+    const snapshot = JSON.stringify(state, null, 2);
+    const write = (this.writeQueues.get(path) ?? Promise.resolve())
+      .then(async () => {
+        await mkdir(dirname(path), { recursive: true });
+        const tmp = `${path}.${randomUUID().slice(0, 8)}.tmp`;
+        await writeFile(tmp, snapshot, 'utf-8');
+        await rename(tmp, path);
+      })
+      .catch(() => {
+        // Write failures drop the cache so the next touch re-hydrates from disk.
+        this.cache.delete(key);
+      });
+    this.writeQueues.set(path, write);
     this.pendingWrites.add(write);
     void write.then(() => this.pendingWrites.delete(write));
   }
@@ -335,8 +382,9 @@ function defaultAgent(scopeType: string, scopeId: string): AgentRecord {
     scopeId,
     persona: '',
     impression: '',
-    triggerWords: ['冰糖', 'bingtang'],
+    triggerWords: [], // 默认只认 @；触发词由各会话自行配置（trigger_config / scope_manage）
     triggerRate: 0.01,
+    enabled: true,
     displayName: '',
     createdAt: Date.now() / 1000,
     overallSummary: '',

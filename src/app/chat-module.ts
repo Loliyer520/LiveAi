@@ -5,6 +5,7 @@
  */
 
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { exec } from 'node:child_process';
 import type { LiveAiModule } from '../host/types.js';
 import type { LiveAiConfig } from '../config/config.js';
@@ -14,13 +15,16 @@ import { ScopeRepository } from '../store/repository.js';
 import { MessageArchive } from '../store/archive.js';
 import { DiarySummarizer } from '../store/summarizer.js';
 import { RelationGraph } from '../relations/graph.js';
+import { KnowledgeBase } from '../knowledge/kb.js';
 import { IntelCollector } from '../relations/collector.js';
 import { PromptStore } from '../prompt/store.js';
 import { ModelManager } from '../models/manager.js';
 import { AiOrchestrator } from '../chat/orchestrator.js';
 import { NovelCommandHandler } from '../chat/novel-cmd.js';
 import { initPluginRegistry } from '../chat/plugins.js';
-import { configureStickers, configureTts } from '../chat/tools.js';
+import { configureMcBot, configureStickers, configureTts } from '../chat/tools.js';
+import { configureMediaSpool } from '../chat/media-spool.js';
+import { configureMc2d, mc2dClient } from '../chat/mc2d.js';
 
 export class ChatModule implements LiveAiModule {
   readonly name = 'chat';
@@ -30,6 +34,7 @@ export class ChatModule implements LiveAiModule {
   readonly archive: MessageArchive;
   readonly summarizer: DiarySummarizer;
   readonly relations: RelationGraph;
+  readonly kb: KnowledgeBase;
   readonly intel: IntelCollector;
   readonly prompts: PromptStore;
   readonly models: ModelManager;
@@ -43,9 +48,15 @@ export class ChatModule implements LiveAiModule {
   /** 重启后验证仍不在线 → 登录态失效，需要人工扫码，停止自动重启。 */
   private bridgeNeedsHuman = false;
   private lastHumanWarnAt = 0;
+  /** 反向 WS 模式（NapCat 跑在主人本地，主动连入）：看门狗不重启，只通知。 */
+  private readonly reverseMode: boolean;
   private readonly masterQq: number;
   private readonly napcatHttpUrl: string;
   private readonly napcatToken: string;
+  private readonly mc2dAutoJoin: boolean;
+  /** Minecraft 边车连接信息（管理面板代理探测用）。 */
+  readonly mcBotUrl: string;
+  readonly mcBotToken: string;
 
   constructor(config: LiveAiConfig) {
     this.archive = new MessageArchive(join(config.storage.stateDir, 'archive'));
@@ -54,6 +65,10 @@ export class ChatModule implements LiveAiModule {
     this.models = new ModelManager(config.storage.modelsConfigPath);
     this.summarizer = new DiarySummarizer(this.repo, this.models, config.ai.summaryEnabled);
     this.relations = new RelationGraph(join(config.storage.stateDir, 'relations.json'));
+    this.kb = new KnowledgeBase(
+      join(config.storage.stateDir, '..', 'knowledge'),
+      `private:${config.ai.masterQq}`,
+    );
     this.intel = new IntelCollector(
       this.relations,
       this.repo,
@@ -69,7 +84,9 @@ export class ChatModule implements LiveAiModule {
     this.bridgeWatchdog = this.watchdogEnabled
       ? new BridgeWatchdog({ onRestartNeeded: (n) => this.onBridgeZombie(n) })
       : null;
+    this.reverseMode = config.napcat.mode === 'server';
     this.bot = new NapcatBot({
+      mode: config.napcat.mode,
       wsUrl: config.napcat.wsUrl,
       httpUrl: config.napcat.httpUrl,
       selfId: config.napcat.selfId,
@@ -77,7 +94,8 @@ export class ChatModule implements LiveAiModule {
       accessToken: config.napcat.accessToken,
       reconnectBaseMs: config.napcat.reconnectBaseMs,
       reconnectMaxMs: config.napcat.reconnectMaxMs,
-      watchdog: this.bridgeWatchdog ?? undefined,      handlers: {
+      watchdog: this.bridgeWatchdog ?? undefined,
+      reverseWsPort: this.reverseMode ? config.napcat.reverseWsPort : undefined,      handlers: {
         onGroupMessage: (message) => this.orchestrator.handleMessage(message),
         onPrivateMessage: (message) => this.orchestrator.handleMessage(message),
         onSelfMessage: (message) => this.orchestrator.handleSelfMessage(message),
@@ -96,6 +114,7 @@ export class ChatModule implements LiveAiModule {
       summarizer: this.summarizer,
       relations: this.relations,
       intel: this.intel,
+      kb: this.kb,
       tasksPath: join(config.storage.stateDir, 'tasks.json'),
       novelCmd: config.novelCmd.scopes.length > 0
         ? new NovelCommandHandler({
@@ -111,6 +130,31 @@ export class ChatModule implements LiveAiModule {
     initPluginRegistry(process.env.LIVEAI_PLUGIN_DIR ?? join(config.storage.stateDir, '..', 'plugins'));
     configureTts(config.tts.baseUrl, config.tts.timeoutMs);
     configureStickers(join(config.storage.stateDir, '..', 'stickers', 'index.json'));
+    // 反向 WS 模式下 NapCat 在号主本地：视频/语音文件经 /media/ 外吐给它拉取。
+    configureMediaSpool(
+      this.reverseMode && config.napcat.publicBaseUrl !== ''
+        ? { dir: join(config.storage.stateDir, 'media-spool'), publicBase: config.napcat.publicBaseUrl }
+        : null,
+    );
+    this.mc2dAutoJoin = config.mc2d.autoJoin;
+    configureMc2d(
+      config.mc2d.enabled
+        ? { wsUrl: config.mc2d.wsUrl, name: config.mc2d.name, uid: config.mc2d.uid }
+        : null,
+    );
+    // Minecraft 边车：URL 可 env 覆盖；token 与 mc 插件共用 data/plugins/secrets.json
+    let mcBotToken = '';
+    try {
+      const secretsPath = join(config.storage.stateDir, '..', 'plugins', 'secrets.json');
+      const secrets = JSON.parse(readFileSync(secretsPath, 'utf-8')) as Record<string, string>;
+      mcBotToken = typeof secrets.MCBOT_TOKEN === 'string' ? secrets.MCBOT_TOKEN : '';
+    } catch {
+      // 没装 mc 插件/没有 secrets → mc_view 会收到 401，报错信息里已指路
+    }
+    const mcBotUrl = process.env.LIVEAI_MCBOT_URL ?? 'http://127.0.0.1:7660';
+    configureMcBot(mcBotUrl, mcBotToken);
+    this.mcBotUrl = mcBotUrl;
+    this.mcBotToken = mcBotToken;
   }
 
   async start(): Promise<void> {
@@ -121,6 +165,7 @@ export class ChatModule implements LiveAiModule {
     this.bot.start();
     this.scheduleStickerRefresh();
     this.startBridgeProbe();
+    if (this.mc2dAutoJoin) mc2dClient()?.autoJoin();
   }
 
   async stop(): Promise<void> {
@@ -137,6 +182,7 @@ export class ChatModule implements LiveAiModule {
     await this.orchestrator.stop();
     await this.summarizer.drainKnownScopes();
     await this.relations.flush();
+    mc2dClient()?.shutdown();
     this.bot.stop();
   }
 
@@ -144,8 +190,13 @@ export class ChatModule implements LiveAiModule {
    * QQ 宿主僵尸离线处置（2026-10-02 / 10-13 两次实发病灶）：
    * 连续 BRIDGE_NOT_READY → 自动重启 napcat-qq-host（重登录自愈），
    * 25s 后验证 online，恢复则私聊通知主人。
+   * 反向 WS 模式下宿主在主人本地，重启服务器侧无意义——只通知。
    */
   private onBridgeZombie(consecutiveFailures: number): void {
+    if (this.reverseMode) {
+      console.warn(`[bridge-watchdog] 连续 ${consecutiveFailures} 次动作失败（反向模式，宿主在号主本地，无法远程处置）`);
+      return;
+    }
     console.warn(`[bridge-watchdog] 连续 ${consecutiveFailures} 次 BRIDGE_NOT_READY，自动重启 napcat-qq-host`);
     exec('systemctl restart napcat-qq-host', (error) => {
       if (error) console.error('[bridge-watchdog] restart failed:', error.message);
@@ -160,13 +211,10 @@ export class ChatModule implements LiveAiModule {
 
   private async verifyBridgeRecovered(consecutiveFailures: number): Promise<void> {
     try {
-      const headers: Record<string, string> = { 'content-type': 'application/json' };
-      if (this.napcatToken) headers.authorization = `Bearer ${this.napcatToken}`;
-      const response = await fetch(`${this.napcatHttpUrl}/get_status`, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(10_000) });
-      const payload = (await response.json()) as { data?: { online?: boolean; stat?: { bridge?: { phase?: string } } } };
-      if (payload.data?.online !== true) {
+      const status = await this.bot.fetchStatus();
+      if (!status.online) {
         this.bridgeNeedsHuman = true;
-        console.warn(`[bridge-watchdog] 重启后 25s 仍未 online（phase=${payload.data?.stat?.bridge?.phase ?? '?'}）——登录态失效，自动重启无效，需人工扫码（NapCat WebUI :7630 取 txz 二维码）`);
+        console.warn(`[bridge-watchdog] 重启后 25s 仍未 online（phase=${status.phase}）——登录态失效，自动重启无效，需人工重新登录`);
         return;
       }
       this.bridgeNeedsHuman = false;
@@ -195,17 +243,14 @@ export class ChatModule implements LiveAiModule {
 
   private async probeBridge(): Promise<void> {
     try {
-      const headers: Record<string, string> = { 'content-type': 'application/json' };
-      if (this.napcatToken) headers.authorization = `Bearer ${this.napcatToken}`;
-      const response = await fetch(`${this.napcatHttpUrl}/get_status`, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(10_000) });
-      const payload = (await response.json()) as { data?: { online?: boolean; stat?: { bridge?: { phase?: string } } } };
-      if (payload.data?.online === true) {
+      const status = await this.bot.fetchStatus();
+      if (status.online) {
         this.bridgeProbeFailures = 0;
         this.bridgeNeedsHuman = false;
         return;
       }
       this.bridgeProbeFailures += 1;
-      const phase = payload.data?.stat?.bridge?.phase ?? '?';
+      const phase = status.phase;
       console.warn(`[bridge-watchdog] 探针发现 QQ 不在线（连续 ${this.bridgeProbeFailures} 次，phase=${phase}）`);
       if (this.bridgeNeedsHuman) {
         if (Date.now() - this.lastHumanWarnAt > 30 * 60_000) {

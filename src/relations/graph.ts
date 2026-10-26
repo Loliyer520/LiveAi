@@ -348,6 +348,15 @@ export class RelationGraph {
     };
   }
 
+  /** 管理面板关系网全量列表（面板侧自行排序/截断）。 */
+  listPeople(): PersonRecord[] {
+    return Object.values(this.load().people);
+  }
+
+  listScopes(): ScopeRecord[] {
+    return Object.values(this.load().scopes);
+  }
+
   async flush(): Promise<void> {
     await this.writeQueue;
   }

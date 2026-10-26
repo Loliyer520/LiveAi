@@ -1,0 +1,854 @@
+{
+  "name": "mc",
+  "description": "真实 Minecraft Java 版：进服务器、看状态、聊天、寻路、挖矿、放方块、打怪、砍树。底层是本机 7660 的 mineflayer 边车服务；工具持有者=Minecraft 中枢（domain:mc）与各 MC client 下级 AI（mcclient:*），主AI 经 delegate_to_child 委派。",
+  "enabled": true,
+  "tools": [
+    {
+      "name": "mc_ping",
+      "description": "进服前查服务器：是否在线、版本、MOTD、在线人数、延迟。只知道地址不确定版本时先用它。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "host": {
+            "type": "string",
+            "description": "服务器地址（域名或 IP）"
+          },
+          "port": {
+            "type": "number",
+            "description": "端口，默认 25565",
+            "default": 25565
+          },
+          "version": {
+            "type": "string",
+            "description": "服务器版本，默认 auto 自动探测；探测失败再手填如 1.20.4",
+            "default": "auto"
+          }
+        },
+        "required": [
+          "host"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/ping?host={{host}}&port={{port}}&version={{version}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_join",
+      "description": "进入真实 Minecraft Java 版服务器。host=地址，port 默认 25565；离线/盗版服 auth=offline，正版服 auth=microsoft（需要账号，首次登录信息会出现在边车日志）。用户名只能 3-16 位字母/数字/下划线（中文名进不去），默认 BingTang。进服后先 mc_status 看位置、mc_events 看聊天。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "host": {
+            "type": "string",
+            "description": "服务器地址（域名或 IP）"
+          },
+          "port": {
+            "type": "number",
+            "description": "端口，默认 25565",
+            "default": 25565
+          },
+          "username": {
+            "type": "string",
+            "description": "游戏内用户名（3-16 位字母/数字/下划线）",
+            "default": "BingTang"
+          },
+          "version": {
+            "type": "string",
+            "description": "版本，默认 auto；连不上时手填服务器版本",
+            "default": "auto"
+          },
+          "auth": {
+            "type": "string",
+            "description": "offline=离线/盗版服（默认），microsoft=微软正版登录",
+            "default": "offline"
+          },
+          "password": {
+            "type": "string",
+            "description": "登录插件密码（AuthMe 等），没有就留空",
+            "default": ""
+          },
+          "register": {
+            "type": "string",
+            "description": "需要注册时填要设置的密码，没有就留空",
+            "default": ""
+          },
+          "auto_reconnect": {
+            "type": "boolean",
+            "description": "掉线自动重连，默认 true",
+            "default": true
+          }
+        },
+        "required": [
+          "host"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/join?host={{host}}&port={{port}}&username={{username}}&version={{version}}&auth={{auth}}&password={{password}}&register={{register}}&auto_reconnect={{auto_reconnect}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_leave",
+      "description": "主动下线离开 Minecraft 服务器。换服或长时间不玩前调用。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/leave",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_status",
+      "description": "查看冰糖在 MC 里的实时状态：坐标、生命、饥饿、维度、时间、在线玩家、附近实体、手持和背包。每次行动后都该看一眼。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/status",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_events",
+      "description": "读取服务器事件：玩家聊天、私聊、进出服、受伤、死亡、被踢。返回 next；下次带 since=上次的 next 只看新事件。聊天回复前先看这里。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "since": {
+            "type": "number",
+            "description": "上次返回的 next，只看比它新的事件；默认 0",
+            "default": 0
+          },
+          "limit": {
+            "type": "number",
+            "description": "最多返回条数，默认 25",
+            "default": 25
+          }
+        },
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/events?since={{since}}&limit={{limit}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_chat",
+      "description": "在 MC 服务器公屏说话（240 字符以内）。像普通玩家一样简短自然，不要刷屏，不要暴露自己是机器人或 AI。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "要说的话"
+          }
+        },
+        "required": [
+          "message"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/chat?message={{message}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_command",
+      "description": "以玩家身份执行服务器命令（/ 开头）。只有 op 或允许的命令才生效；普通玩家滥用会被踢，非必要不用。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "完整命令，如 /time set day 或 time set day"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/command?command={{command}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_goto",
+      "description": "寻路走到坐标。y 省略时只按 x/z 走到附近；range 是到达半径（默认 1）。会自动绕障碍、跳台阶，超时会尝试脱困。返回实际位置和剩余距离。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "目标 X 坐标"
+          },
+          "z": {
+            "type": "number",
+            "description": "目标 Z 坐标"
+          },
+          "y": {
+            "type": "number",
+            "description": "目标 Y 坐标，可省略（留空则只按 X/Z 走）",
+            "default": ""
+          },
+          "range": {
+            "type": "number",
+            "description": "到达半径（格），默认 1",
+            "default": 1
+          },
+          "timeout": {
+            "type": "number",
+            "description": "超时秒数，默认 45，最大 180",
+            "default": 45
+          }
+        },
+        "required": [
+          "x",
+          "z"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/goto?x={{x}}&z={{z}}&y={{y}}&range={{range}}&timeout={{timeout}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_dig",
+      "description": "挖掉指定坐标的方块。太远会自动走近，会换合适工具。挖穿脚下掉进坑里会自动尝试跳出来。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "方块 X 坐标"
+          },
+          "y": {
+            "type": "number",
+            "description": "方块 Y 坐标"
+          },
+          "z": {
+            "type": "number",
+            "description": "方块 Z 坐标"
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "z"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/dig?x={{x}}&y={{y}}&z={{z}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_place",
+      "description": "在指定空位放方块。item 可指定物品 id（如 dirt/cobblestone/oak_planks），省略则用背包第一个可放置方块。目标周围必须有实体方块可依附，不能放在自己脚下。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "要放到的 X 坐标"
+          },
+          "y": {
+            "type": "number",
+            "description": "要放到的 Y 坐标"
+          },
+          "z": {
+            "type": "number",
+            "description": "要放到的 Z 坐标"
+          },
+          "item": {
+            "type": "string",
+            "description": "物品 id，可省略",
+            "default": ""
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "z"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/place?x={{x}}&y={{y}}&z={{z}}&item={{item}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_block",
+      "description": "查看某个坐标是什么方块：名字、能不能挖、能不能替换、相邻方块。挖矿或放方块前不确定就查。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "X 坐标"
+          },
+          "y": {
+            "type": "number",
+            "description": "Y 坐标"
+          },
+          "z": {
+            "type": "number",
+            "description": "Z 坐标"
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "z"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/block?x={{x}}&y={{y}}&z={{z}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_attack",
+      "description": "攻击附近实体。name 填实体 id（pig/zombie）或玩家名；不填则优先最近敌对生物，没有就打最近生物。count=出手次数（1-20，默认 1）。会先走近到攻击距离。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "目标实体/玩家名，可省略",
+            "default": ""
+          },
+          "count": {
+            "type": "number",
+            "description": "出手次数，默认 1",
+            "default": 1
+          }
+        },
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/attack?name={{name}}&count={{count}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_follow",
+      "description": "持续跟随某个在线玩家，保持 distance 格（默认 3）。用 mc_stop 停止。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "玩家名"
+          },
+          "distance": {
+            "type": "number",
+            "description": "保持距离（格），默认 3",
+            "default": 3
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/follow?name={{name}}&distance={{distance}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_stop",
+      "description": "停止寻路和跟随，取消所有移动。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/stop",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_unstuck",
+      "description": "卡住或掉进 1×1 坑里时，让冰糖朝四个方向跳着挤出来。mc_goto 超时会自动尝试一次，仍卡住再手动调用。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/unstuck",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_collect",
+      "description": "自动采集附近的某种方块（寻路+挖+捡）。block=方块 id，如 oak_log/coal_ore/iron_ore；count 目标数量（最多 16）；radius 搜索半径默认 32。适合砍树、挖矿。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "block": {
+            "type": "string",
+            "description": "方块 id，如 oak_log、coal_ore、iron_ore"
+          },
+          "count": {
+            "type": "number",
+            "description": "采多少个，默认 1，最多 16",
+            "default": 1
+          },
+          "radius": {
+            "type": "number",
+            "description": "搜索半径，默认 32，最大 64",
+            "default": 32
+          }
+        },
+        "required": [
+          "block"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/collect?block={{block}}&count={{count}}&radius={{radius}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_inventory",
+      "description": "查看背包、手持和装备。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/inventory",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_entities",
+      "description": "列出附近实体（玩家/生物）的名称、类型、距离、坐标、生命。radius 默认 16，最大 64。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "radius": {
+            "type": "number",
+            "description": "半径（格），默认 16",
+            "default": 16
+          }
+        },
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/entities?radius={{radius}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_scan",
+      "description": "扫描附近方块分布，并列出值得注意的矿石/树木/水/箱子坐标。找矿、找树、判断地形时用。radius 默认 8，最大 16。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "radius": {
+            "type": "number",
+            "description": "水平半径（格），默认 8",
+            "default": 8
+          }
+        },
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/scan?radius={{radius}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_eat",
+      "description": "吃背包里的食物回复饥饿。生命或饥饿低时用。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/eat",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_equip",
+      "description": "把背包物品装到手上或装备栏。destination=hand/head/torso/legs/feet/off-hand，默认 hand。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "item": {
+            "type": "string",
+            "description": "物品 id，如 iron_pickaxe/iron_helmet"
+          },
+          "destination": {
+            "type": "string",
+            "description": "hand/head/torso/legs/feet/off-hand",
+            "default": "hand"
+          }
+        },
+        "required": [
+          "item"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/equip?item={{item}}&destination={{destination}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_use",
+      "description": "使用当前手持物品（右键）：开门、按按钮、放床、吃东西等。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/use",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    }
+  ]
+}

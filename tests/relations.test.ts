@@ -236,6 +236,7 @@ function toolContext(graph: RelationGraph, isMaster = false): ToolContext {
     notifyMaster: () => {},
     delegateToChild: () => 'delegate_x',
     sendToScope: async () => 'ok',
+    peerInject: () => undefined,
     triggerImageRefs: [],
     describeImage: async () => '',
     scopeType: 'group',
@@ -247,14 +248,14 @@ function toolContext(graph: RelationGraph, isMaster = false): ToolContext {
 }
 
 test('chatToolSchemas swaps report tools for master tools in the master scope', () => {
-  const child = chatToolSchemas(false).map((schema) => schema.name);
+  const child = chatToolSchemas('group:1', false).map((schema) => schema.name);
   assert.ok(child.includes('notify_master'));
   assert.ok(child.includes('intel_report'));
   assert.ok(child.includes('impression_write'));
   assert.ok(!child.includes('relation_write'));
   assert.ok(!child.includes('delegate_to_child'));
 
-  const master = chatToolSchemas(true).map((schema) => schema.name);
+  const master = chatToolSchemas('private:241898129', true).map((schema) => schema.name);
   assert.ok(!master.includes('notify_master'), 'master never relays to itself');
   assert.ok(!master.includes('intel_report'));
   assert.ok(master.includes('relation_write'));

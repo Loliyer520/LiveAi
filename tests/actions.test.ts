@@ -162,7 +162,7 @@ async function makeActionContext() {
   const repo = new ScopeRepository(join(dir, 'state'), 500);
   const sent: string[] = [];
   const bot = {
-    selfId: 3592217365,
+    selfId: 987654322,
     async sendText(_chatType: string, _targetId: number, text: string) {
       sent.push(text);
       return { message_id: 8000 + sent.length };
@@ -174,11 +174,12 @@ async function makeActionContext() {
     archive: null as never,
     relations: null as never,
     tasks: null as never,
-    masterQq: 241898129,
+    masterQq: 123456789,
     isMaster: false,
     notifyMaster: () => undefined,
     delegateToChild: () => '',
     sendToScope: async () => '',
+    peerInject: () => undefined,
     workspace: new Workspace(join(dir, 'workspace')),
     networkBudget: { used: 0 },
     triggerImageRefs: [],
@@ -187,7 +188,10 @@ async function makeActionContext() {
     scopeId: '123',
     executedTools: [],
   };
-  return { context, repo, sent, cleanup: () => rm(dir, { recursive: true, force: true }) };
+  return { context, repo, sent, cleanup: async () => {
+    await repo.flush();
+    await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  } };
 }
 
 test('file_write → file_read → file_search round trip inside the sandbox', async () => {
@@ -222,7 +226,7 @@ test('file tools refuse paths outside the workspace', async () => {
   }
 });
 
-test('send_file_excerpt delivers verbatim lines as separate messages and persists them', async () => {
+test('send_file_excerpt delivers verbatim lines packed into one message and persists them', async () => {
   const { context, repo, sent, cleanup } = await makeActionContext();
   try {
     await executeActionTool(
@@ -235,13 +239,87 @@ test('send_file_excerpt delivers verbatim lines as separate messages and persist
     );
     assert.ok(result?.ok);
     assert.equal(result?.sentToUser, true);
-    // blank line skipped, two verbatim lines sent as two messages
-    assert.deepEqual(sent, ['他走进雨里，没有回头。', '灯火在远处亮了。']);
+    // blank line skipped, both lines merged into a single verbatim message
+    assert.deepEqual(sent, ['他走进雨里，没有回头。\n灯火在远处亮了。']);
     const history = repo.getMessages('private', '123');
     const excerpts = history.filter((entry) => entry.source_label === 'file-excerpt');
-    assert.equal(excerpts.length, 2);
+    assert.equal(excerpts.length, 1);
     assert.ok(excerpts.every((entry) => entry.message_ref !== undefined));
   } finally {
+    await cleanup();
+  }
+});
+
+test('send_file dumps a whole file verbatim and reports remaining lines', async () => {
+  const { context, sent, cleanup } = await makeActionContext();
+  try {
+    const longText = Array.from({ length: 160 }, (_, index) => `第${index + 1}行内容。`).join('\n');
+    await executeActionTool({ name: 'file_write', arguments: { path: 'long.txt', content: longText } }, context);
+    const first = await executeActionTool({ name: 'send_file', arguments: { path: 'long.txt' } }, context);
+    assert.ok(first?.ok);
+    assert.equal(first?.sentToUser, true);
+    // 150 short lines fit well under the batch ceiling → one single message
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0]!.startsWith('第1行内容。\n'));
+    assert.ok(sent[0]!.includes('第150行内容。'));
+    assert.ok(first?.output.includes('from=151'), 'continuation hint points at line 151');
+
+    const rest = await executeActionTool({ name: 'send_file', arguments: { path: 'long.txt', from: 151 } }, context);
+    assert.ok(rest?.ok);
+    assert.equal(sent.length, 2);
+    assert.ok(!rest?.output.includes('续发'));
+
+    const outOfRange = await executeActionTool({ name: 'send_file', arguments: { path: 'long.txt', from: 200 } }, context);
+    assert.equal(outOfRange?.ok, false);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('verbatim delivery splits only when a batch would exceed the char ceiling', async () => {
+  const { context, sent, cleanup } = await makeActionContext();
+  try {
+    const chunk = '长'.repeat(1500);
+    const longText = Array.from({ length: 6 }, () => chunk).join('\n');
+    await executeActionTool({ name: 'file_write', arguments: { path: 'fat.txt', content: longText } }, context);
+    const result = await executeActionTool({ name: 'send_file', arguments: { path: 'fat.txt' } }, context);
+    assert.ok(result?.ok);
+    // 6×1500 chars → two lines per 4000-char batch → exactly 3 messages
+    assert.equal(sent.length, 3);
+    for (const message of sent) assert.ok(message.length <= 4000, `batch too long: ${message.length}`);
+    assert.equal(sent.join('\n').replace(/\n/g, '').length, 6 * 1500);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('download_qq_file saves into a fresh workspace inbox (regression: missing mkdir)', async () => {
+  const { context, repo, cleanup } = await makeActionContext();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response('群文件内容', { status: 200, headers: { 'content-type': 'text/markdown' } })) as typeof fetch;
+  try {
+    const ref = repo.registerMessageRef('private', '123', 123456);
+    repo.appendMessage('private', '123', {
+      user_id: 987654321,
+      nickname: '砂糖',
+      text: '[文件: 报告.md]',
+      raw_message: '',
+      message_id: 123456,
+      message_ref: ref,
+      timestamp: Date.now() / 1000,
+      image_refs: [],
+      file_refs: [{ name: '报告.md', url: 'https://8.8.8.8/ftn_handler/abc', size: 12 }],
+    });
+    // workspace root exists but inbox/ does not — must not ENOENT
+    await context.workspace.ensure();
+    const result = await executeActionTool({ name: 'download_qq_file', arguments: { message_ref: ref } }, context);
+    assert.ok(result?.ok, result?.output);
+    assert.ok(result?.output.includes('inbox/报告.md'));
+    const saved = await readFile(context.workspace.resolvePath('inbox/报告.md'), 'utf-8');
+    assert.equal(saved, '群文件内容');
+  } finally {
+    globalThis.fetch = originalFetch;
     await cleanup();
   }
 });

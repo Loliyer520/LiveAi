@@ -74,8 +74,9 @@ export async function extractZip(buffer: Buffer, destDir: string): Promise<strin
     const name = safeEntryName(rawName);
     if (name.endsWith('/')) continue; // directory marker
 
-    totalBytes += uncompressedSize;
-    if (totalBytes > MAX_TOTAL_BYTES) throw new Error('解压后总量超过 64MB 上限');
+    // 中央目录里的 uncompressedSize 是压缩包自报的，可能是假的（zip 炸弹）。
+    // 只用它做廉价的早期拒绝，真正的账按解压后的实际字节数算。
+    if (uncompressedSize > MAX_TOTAL_BYTES) throw new Error(`条目 ${name} 声明大小超过 64MB 上限`);
     if (method !== 0 && method !== 8) throw new Error(`不支持的压缩方式 ${method}（条目 ${name}）`);
     if (localOffset + 30 > buffer.length || buffer.readUInt32LE(localOffset) !== LOCAL_SIG) {
       throw new Error(`条目 ${name} 的本地头损坏`);
@@ -85,7 +86,9 @@ export async function extractZip(buffer: Buffer, destDir: string): Promise<strin
     const dataStart = localOffset + 30 + localNameLength + localExtraLength;
     const compressed = buffer.subarray(dataStart, dataStart + compressedSize);
     const content = method === 0 ? Buffer.from(compressed) : inflateRawSync(compressed);
+    totalBytes += content.byteLength;
     if (content.byteLength > MAX_TOTAL_BYTES) throw new Error(`条目 ${name} 解压后过大`);
+    if (totalBytes > MAX_TOTAL_BYTES) throw new Error('解压后总量超过 64MB 上限');
 
     const target = join(destDir, name);
     if (!target.startsWith(destDir + sep)) throw new Error(`压缩包内含越界路径: ${name}`);

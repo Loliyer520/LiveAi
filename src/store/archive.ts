@@ -80,6 +80,8 @@ export class MessageArchive {
   private readonly archiveDir: string;
   /** line cache per scope file: { lines, loaded } — refreshed on demand. */
   private readonly cache = new Map<string, HistoryEntry[]>();
+  /** 每 scope 追加代际：loadLines 读盘期间发生 append 时禁止回填旧缓存。 */
+  private readonly versions = new Map<string, number>();
   /** Per-file append chain: JSONL line order must match call order. */
   private readonly appendQueues = new Map<string, Promise<void>>();
 
@@ -96,6 +98,7 @@ export class MessageArchive {
         await mkdir(this.archiveDir, { recursive: true });
         await appendFile(path, JSON.stringify(entry) + '\n', 'utf-8');
         // Best-effort cache invalidation so searches see fresh appends.
+        this.versions.set(scopeKey, (this.versions.get(scopeKey) ?? 0) + 1);
         this.cache.delete(scopeKey);
       })
       .catch((error) => {
@@ -169,6 +172,7 @@ export class MessageArchive {
   private async loadLines(scopeKey: string, path: string): Promise<HistoryEntry[]> {
     const cached = this.cache.get(scopeKey);
     if (cached) return cached;
+    const versionBefore = this.versions.get(scopeKey) ?? 0;
     let entries: HistoryEntry[] = [];
     try {
       const raw = await readFile(path, 'utf-8');
@@ -180,7 +184,10 @@ export class MessageArchive {
     } catch {
       entries = [];
     }
-    this.cache.set(scopeKey, entries);
+    // 读盘期间有 append 完成的话这份内容已经过时，不能进缓存。
+    if ((this.versions.get(scopeKey) ?? 0) === versionBefore) {
+      this.cache.set(scopeKey, entries);
+    }
     return entries;
   }
 }

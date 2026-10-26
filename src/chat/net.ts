@@ -12,14 +12,48 @@
  */
 
 import { lookup } from 'node:dns/promises';
-import { writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
 
 const MAX_REDIRECTS = 3;
 const DEFAULT_TIMEOUT_MS = 20_000;
 
+/** 提取 IPv4-mapped IPv6（::ffff:a.b.c.d / ::ffff:7f00:1 / 全展开形式）里的 v4 地址，非映射返回 null。 */
+function mappedV4Address(ip: string): string | null {
+  let addr = ip.toLowerCase();
+  const quad = /(\d{1,3}(?:\.\d{1,3}){3})$/.exec(addr);
+  if (quad !== null) {
+    const nums = quad[1].split('.').map(Number);
+    const hi = ((nums[0]! << 8) | nums[1]!).toString(16);
+    const lo = ((nums[2]! << 8) | nums[3]!).toString(16);
+    addr = addr.slice(0, addr.length - quad[1].length) + hi + ':' + lo;
+  }
+  const groups = addr.split(':');
+  let full: string[];
+  const emptyAt = groups.findIndex((group) => group === '');
+  if (emptyAt >= 0) {
+    const head = groups.slice(0, emptyAt);
+    const tail = groups.slice(emptyAt + 1).filter((group) => group !== '');
+    const missing = 8 - head.length - tail.length;
+    if (missing < 0) return null;
+    full = [...head, ...Array<string>(missing).fill('0'), ...tail];
+  } else {
+    full = groups;
+  }
+  if (full.length !== 8) return null;
+  if (!full.slice(0, 5).every((group) => parseInt(group, 16) === 0)) return null;
+  if (parseInt(full[5]!, 16) !== 0xffff) return null;
+  const hi = parseInt(full[6]!, 16);
+  const lo = parseInt(full[7]!, 16);
+  if (Number.isNaN(hi) || Number.isNaN(lo)) return null;
+  return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+}
+
 export function isPrivateAddress(address: string, family: number): boolean {
   if (family === 6) {
     const ip = address.toLowerCase();
+    const mapped = mappedV4Address(ip);
+    if (mapped !== null) return isPrivateAddress(mapped, 4);
     return ip === '::1' || ip.startsWith('fe80:') || ip.startsWith('fc') || ip.startsWith('fd') || ip === '::';
   }
   const parts = address.split('.').map((part) => Number(part));
@@ -34,8 +68,8 @@ export function isPrivateAddress(address: string, family: number): boolean {
   );
 }
 
-/** Parse + validate a URL, refusing internal destinations. Throws on refusal. */
-export async function assertPublicUrl(rawUrl: string): Promise<URL> {
+/** Parse + basic-validate a URL: http(s) only, no credentials. No address check. */
+function parseHttpUrl(rawUrl: string): URL {
   let url: URL;
   try {
     url = new URL(String(rawUrl ?? '').trim());
@@ -44,6 +78,12 @@ export async function assertPublicUrl(rawUrl: string): Promise<URL> {
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('只支持 http(s) 链接');
   if (url.username || url.password) throw new Error('不支持带凭据的 URL');
+  return url;
+}
+
+/** Parse + validate a URL, refusing internal destinations. Throws on refusal. */
+export async function assertPublicUrl(rawUrl: string): Promise<URL> {
+  const url = parseHttpUrl(rawUrl);
   const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.internal') || hostname.endsWith('.local')) {
     throw new Error('禁止访问内网地址');
@@ -65,7 +105,7 @@ export async function assertPublicUrl(rawUrl: string): Promise<URL> {
   return url;
 }
 
-async function fetchGuarded(url: URL, init: RequestInit, redirectsLeft = MAX_REDIRECTS): Promise<Response> {
+export async function fetchGuarded(url: URL, init: RequestInit, redirectsLeft = MAX_REDIRECTS, allowInternal = false): Promise<Response> {
   const response = await fetch(url, {
     ...init,
     redirect: 'manual',
@@ -74,15 +114,17 @@ async function fetchGuarded(url: URL, init: RequestInit, redirectsLeft = MAX_RED
   if (response.status >= 300 && response.status < 400) {
     const location = response.headers.get('location');
     if (location && redirectsLeft > 0) {
-      const next = await assertPublicUrl(new URL(location, url).toString());
-      return fetchGuarded(next, { ...init, signal: init.signal }, redirectsLeft - 1);
+      const next = allowInternal
+        ? parseHttpUrl(new URL(location, url).toString())
+        : await assertPublicUrl(new URL(location, url).toString());
+      return fetchGuarded(next, { ...init, signal: init.signal }, redirectsLeft - 1, allowInternal);
     }
   }
   return response;
 }
 
-/** Read a response body as text with a hard byte cap. */
-async function readCapped(response: Response, maxBytes: number): Promise<Buffer> {
+/** Read a response body with a hard byte cap (declared length is pre-checked, then enforced while streaming). */
+export async function readCapped(response: Response, maxBytes: number): Promise<Buffer> {
   const declared = Number(response.headers.get('content-length') ?? 0);
   if (declared > maxBytes) throw new Error(`响应太大（${Math.round(declared / 1024)}KB > ${Math.round(maxBytes / 1024)}KB 上限）`);
   const reader = response.body?.getReader();
@@ -109,21 +151,24 @@ export interface WebFetchResult {
   truncated: boolean;
 }
 
-/** GET/POST a URL and return text, capped. The model's generic HTTP tool. */
+/** GET/POST a URL and return text, capped. The model's generic HTTP tool.
+ *  `allowInternal` skips the SSRF address check — only for URLs declared in
+ *  master-controlled plugin manifests (`allow_internal: true`), never for
+ *  model-supplied URLs. */
 export async function webFetch(
   rawUrl: string,
-  options: { method?: string; headers?: Record<string, string>; body?: string; maxBytes?: number; displayLimit?: number } = {},
+  options: { method?: string; headers?: Record<string, string>; body?: string; maxBytes?: number; displayLimit?: number; allowInternal?: boolean } = {},
 ): Promise<WebFetchResult> {
-  const url = await assertPublicUrl(rawUrl);
+  const url = options.allowInternal ? parseHttpUrl(rawUrl) : await assertPublicUrl(rawUrl);
   const maxBytes = options.maxBytes ?? 512 * 1024;
   const method = (options.method ?? 'GET').toUpperCase();
   if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(method)) throw new Error(`不支持的方法: ${method}`);
-  const headers: Record<string, string> = { 'user-agent': 'Mozilla/5.0 (LiveAI bot)', ...options.headers };
+  const headers: Record<string, string> = { 'user-agent': 'Mozilla/5.0 (DeepLive bot)', ...options.headers };
   const response = await fetchGuarded(url, {
     method,
     headers,
     body: options.body === undefined || method === 'GET' || method === 'HEAD' ? undefined : options.body,
-  });
+  }, MAX_REDIRECTS, options.allowInternal === true);
   const contentType = (response.headers.get('content-type') ?? '').split(';', 1)[0].trim();
   const buffer = await readCapped(response, maxBytes);
   const text = buffer.toString('utf-8');
@@ -139,12 +184,17 @@ export async function webFetch(
 }
 
 /** Download a URL to a local path with a byte cap. Returns bytes written. */
-export async function downloadToFile(rawUrl: string, destPath: string, maxBytes: number): Promise<{ bytes: number; contentType: string }> {
-  const url = await assertPublicUrl(rawUrl);
-  const response = await fetchGuarded(url, { method: 'GET', headers: { 'user-agent': 'Mozilla/5.0 (LiveAI bot)' } });
+export async function downloadToFile(rawUrl: string, destPath: string, maxBytes: number, options: { allowInternal?: boolean; timeoutMs?: number; headers?: Record<string, string> } = {}): Promise<{ bytes: number; contentType: string }> {
+  const url = options.allowInternal ? parseHttpUrl(rawUrl) : await assertPublicUrl(rawUrl);
+  const response = await fetchGuarded(url, {
+    method: 'GET',
+    headers: { 'user-agent': 'Mozilla/5.0 (DeepLive bot)', ...options.headers },
+    ...(options.timeoutMs !== undefined ? { signal: AbortSignal.timeout(options.timeoutMs) } : {}),
+  }, MAX_REDIRECTS, options.allowInternal === true);
   if (!response.ok) throw new Error(`下载失败 HTTP ${response.status}`);
   const contentType = (response.headers.get('content-type') ?? '').split(';', 1)[0].trim();
   const buffer = await readCapped(response, maxBytes);
+  await mkdir(dirname(destPath), { recursive: true });
   await writeFile(destPath, buffer);
   return { bytes: buffer.byteLength, contentType };
 }

@@ -142,13 +142,17 @@ export function buildRoleBasedHistoryMessages(history: HistoryEntry[], botUserId
     const item = history[index];
     const userId = String(item.user_id ?? '').trim();
     const text = String(item.text ?? '').trim();
-    if (userId && userId === botUserId) {
+    // 同账号其他设备手发的消息虽然 user_id 是自己，但不是模型说的——
+    // 走 user 桶渲染（保留 [本账号其他设备] 标签），否则会被并进 assistant
+    // 回合，模型分不清哪些话是自己说的、哪些是号主拿这个号手打的。
+    if (userId && userId === botUserId && item.source_kind !== 'self_other_device') {
       flushPending();
       const assistantTexts: string[] = [];
       let toolContext: ModelMessage[] = [];
       while (index < history.length) {
         const current = history[index];
-        if (String(current.user_id ?? '').trim() !== botUserId) break;
+        // 同账号其他设备的消息要破开 assistant 回合（外层会把它放进 user 桶）
+        if (String(current.user_id ?? '').trim() !== botUserId || current.source_kind === 'self_other_device') break;
         const context = normalizeToolContextMessages(current.tool_context_messages);
         if (context.length > 0) toolContext = context;
         const currentText = String(current.text ?? '').trim();

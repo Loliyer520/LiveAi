@@ -94,7 +94,8 @@ test('segment fills at 50, summarizes, then overall primer is built', async () =
     assert.equal(fixture.repo.getUnsummarizedSegments('group', '1').length, 0, 'raw segment retired');
     const agent = fixture.repo.getOrCreateAgent('group', '1');
     assert.equal(agent.overallSummary, '默认摘要');
-    assert.equal(agent.overallSummaryAtSegments, 1);
+    // 基准是分段下标（0 起），不是摘要条数——条数会被 20 条上限截断。
+    assert.equal(agent.overallSummaryAtSegments, 0);
     await fixture.repo.flush();
   } finally {
     await fixture.cleanup();
@@ -113,7 +114,7 @@ test('overall primer refreshes only after 3 fresh segments', async () => {
 
     // 3rd call = overall rebuild (calls: seg1, seg2, seg3, overall)
     const agent = fixture.repo.getOrCreateAgent('group', '2');
-    assert.equal(agent.overallSummaryAtSegments, 3);
+    assert.equal(agent.overallSummaryAtSegments, 2, '最新摘要的分段下标');
     await fixture.repo.flush();
   } finally {
     await fixture.cleanup();
@@ -136,6 +137,36 @@ test('failed summarization keeps the raw segment queued for retry', async () => 
     fixture.summarizer.notify('private', '3');
     await waitFor(() => fixture.repo.getDiarySummaries('private', '3').length === 1);
     assert.equal(fixture.repo.getUnsummarizedSegments('private', '3').length, 0);
+    await fixture.repo.flush();
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('overall primer keeps refreshing after the 20-summary cap (no freeze)', async () => {
+  const fixture = await makeFixture();
+  try {
+    // 23 段 = 1150 条消息，摘要数超过 20 条上限
+    for (let count = 0; count < 1150; count += 1) {
+      fixture.repo.appendMessage('group', '4', entry(count));
+    }
+    fixture.summarizer.notify('group', '4');
+    await waitFor(() => {
+      const agent = fixture.repo.getOrCreateAgent('group', '4');
+      return fixture.repo.getDiarySummaries('group', '4').length === 20 && agent.overallSummary !== '';
+    });
+    let agent = fixture.repo.getOrCreateAgent('group', '4');
+    assert.equal(fixture.repo.getDiarySummaries('group', '4').length, 20, 'cap at 20');
+    assert.equal(agent.overallSummaryAtSegments, 22, '基准跟着分段下标走，不被截断');
+
+    // 再来 3 段（下标 23~25）：旧实现里 fresh=20-20=0 永远不刷新；现在必须刷新
+    for (let count = 0; count < 150; count += 1) {
+      fixture.repo.appendMessage('group', '4', entry(count));
+    }
+    fixture.summarizer.notify('group', '4');
+    await waitFor(() => fixture.repo.getOrCreateAgent('group', '4').overallSummaryAtSegments === 25);
+    agent = fixture.repo.getOrCreateAgent('group', '4');
+    assert.equal(agent.overallSummaryAtSegments, 25);
     await fixture.repo.flush();
   } finally {
     await fixture.cleanup();

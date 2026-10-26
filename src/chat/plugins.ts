@@ -12,17 +12,19 @@
  * reload makes the tools live; no rebuild, no restart, no prompt edits.
  *
  * Safety: every plugin request goes through the SSRF-guarded webFetch and the
- * per-turn network budget; secret values are scrubbed from tool output; a
+ * per-turn network budget (a manifest may declare `allow_internal: true` on a
+ * tool to reach loopback/private services — a master-only decision since
+ * manifests live on disk); secret values are scrubbed from tool output; a
  * broken manifest is quarantined (recorded, skipped) instead of crashing
  * anything.
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { ToolSchema } from '../models/types.js';
 import type { ToolContext, ToolResult } from './tools.js';
 import { webFetch } from './net.js';
-import { spendNetworkBudget } from './actions.js';
+import { spendNetworkBudget, sendLinesVerbatim, SEND_FILE_MAX_LINES } from './actions.js';
 
 export interface PluginToolRequest {
   method?: string;
@@ -37,6 +39,36 @@ export interface PluginToolResponse {
   extract?: string;
   /** Output template with {{dot.path}} placeholders resolved against the JSON body, then params. */
   template?: string;
+  /** APIs that signal failure in-band: compare this path's value to ok_value. */
+  code_path?: string;
+  ok_value?: unknown;
+  /** Failure message path (default 'msg'). */
+  msg_path?: string;
+  /** Render an array from the body: `from` supports `a.b[].c` flattening. */
+  list?: { from: string; item: string; max?: number | string; separator?: string };
+  /** Persist a body subtree into the scope workspace (for file_* / send_file_excerpt). */
+  save?: {
+    from: string;
+    path: string;
+    html_to_text?: boolean;
+    /** Truthy after interpolation ("true"/"1"/"yes") → also deliver the saved text verbatim, line by line. */
+    send?: string;
+  };
+  /**
+   * Batch variant of save for map-shaped bodies (`{itemId: item, …}`): iterate
+   * every entry, per-item save (+ optional verbatim send). `{{__key}}` in
+   * path/item templates resolves to the map key; other placeholders resolve
+   * against the item, then tool params. One round-trip instead of N calls —
+   * the agent loop re-bills the whole prompt per tool call, so bulk endpoints
+   * must be consumed in bulk.
+   */
+  save_each?: {
+    from: string;
+    path: string;
+    html_to_text?: boolean;
+    /** Truthy after interpolation → also deliver each item's text verbatim. */
+    send?: string;
+  };
 }
 
 export interface PluginToolDef {
@@ -45,6 +77,19 @@ export interface PluginToolDef {
   parameters: Record<string, unknown>;
   /** true = only the master scope sees this tool. */
   master_only?: boolean;
+  /**
+   * 可见 scope 白名单（与 master_only 互斥、优先）：列出 scope key
+   * （如 "domain:mc"）、"master" 占位符（=主AI scope）或裸类型名
+   * （如 "bili"/"mcclient" = 该类型全部 scope，领域中枢的下级 AI 用）。
+   * 中枢把工具下放给领域主级 AI 时用它——主AI 收敛后不再持有领域执行工具。
+   */
+  scopes?: string[];
+  /**
+   * true = this tool's URL may point at loopback/private addresses (skips the
+   * SSRF address check). Only settable in the on-disk manifest — never from
+   * model input — so it stays a master decision (e.g. local novel API).
+   */
+  allow_internal?: boolean;
   request: PluginToolRequest;
   response?: PluginToolResponse;
 }
@@ -67,6 +112,24 @@ export interface PluginInfo {
 const NAME_PATTERN = /^[a-z][a-z0-9_]{0,31}$/;
 const PLACEHOLDER = /\{\{\s*([\w.[\]]+)\s*\}\}/g;
 const MAX_OUTPUT_CHARS = 4000;
+const MAX_SAVE_CHARS = 2_000_000;
+/** save_each 单次处理的条目上限（批量章节接口 20 章可达 1MB+，更多让模型分批）。 */
+const SAVE_EACH_MAX_ITEMS = 15;
+
+/**
+ * scopes 白名单条目匹配："master"=主AI scope；精确 scope key；"type" 裸
+ * 类型名=该类型全部 scope（如 "bili" 命中 bili:BV1xx，"mcclient" 命中各
+ * MC client 下级 AI）。
+ */
+function scopeEntryMatches(entry: string, scopeKey: string, includeMaster: boolean): boolean {
+  if (entry === 'master') return includeMaster;
+  if (entry === scopeKey) return true;
+  if (!entry.includes(':')) {
+    const separator = scopeKey.indexOf(':');
+    return entry === (separator === -1 ? scopeKey : scopeKey.slice(0, separator));
+  }
+  return false;
+}
 
 export class PluginRegistry {
   private manifests = new Map<string, PluginManifest>();
@@ -156,12 +219,17 @@ export class PluginRegistry {
   }
 
   /** Tool schemas exposed to the model; reservedNames (builtin) win collisions. */
-  toolSchemas(includeMaster: boolean, reservedNames: Set<string>): ToolSchema[] {
+  toolSchemas(scopeKey: string, includeMaster: boolean, reservedNames: Set<string>): ToolSchema[] {
     const schemas: ToolSchema[] = [];
     for (const manifest of this.manifests.values()) {
       if (!this.isEnabled(manifest)) continue;
       for (const tool of manifest.tools) {
-        if (tool.master_only === true && !includeMaster) continue;
+        if (tool.scopes !== undefined) {
+          const visible = tool.scopes.some((entry) => scopeEntryMatches(entry, scopeKey, includeMaster));
+          if (!visible) continue;
+        } else if (tool.master_only === true && !includeMaster) {
+          continue;
+        }
         if (reservedNames.has(tool.name)) {
           this.errors.set(manifest.name, `工具名 ${tool.name} 与内置工具冲突，已跳过`);
           continue;
@@ -191,6 +259,16 @@ export class PluginRegistry {
     }
     if (!owner || !def) return null;
 
+    // 可见性硬检查（与 toolSchemas 同步）：声明了 scopes 的工具只对白名单
+    // scope 放行——模型在别的会话里猜出工具名也执行不了。
+    const requesterScope = `${context.scopeType}:${context.scopeId}`;
+    if (def.scopes !== undefined) {
+      const visible = def.scopes.some((entry) => scopeEntryMatches(entry, requesterScope, context.isMaster));
+      if (!visible) return { ok: false, output: `${toolName} 未挂载给本会话（${requesterScope}），不可执行。` };
+    } else if (def.master_only === true && !context.isMaster) {
+      return { ok: false, output: `${toolName} 仅主AI可用。` };
+    }
+
     try {
       spendNetworkBudget(context);
 
@@ -199,7 +277,14 @@ export class PluginRegistry {
       const missing = required.filter((key) => args[key] === undefined || args[key] === null || String(args[key]).trim() === '');
       if (missing.length > 0) return { ok: false, output: `${toolName}: 缺少必填参数 ${missing.join('、')}。` };
 
-      const secretValues = Object.values(this.secrets).filter((value) => value.length >= 6);
+      // Fill JSON-schema defaults for omitted optional params.
+      const properties = (def.parameters as { properties?: Record<string, { default?: unknown }> }).properties ?? {};
+      args = { ...args };
+      for (const [key, spec] of Object.entries(properties)) {
+        if (args[key] === undefined && spec && typeof spec === 'object' && 'default' in spec) args[key] = spec.default;
+      }
+
+      const secretValues = this.secretValuesForScrub();
       const url = interpolate(def.request.url, (key) => this.resolveValue(key, args, context, true));
       const headers: Record<string, string> = {};
       for (const [key, template] of Object.entries(def.request.headers ?? {})) {
@@ -211,29 +296,79 @@ export class PluginRegistry {
 
       // displayLimit ≥ maxBytes: plugins must parse the FULL JSON body;
       // the model-facing truncation happens after extract/template below.
+      // maxBytes 同步放宽到 2MB——批量章节接口一次十几章正文就有 1MB+，
+      // 512KB 会把 JSON 截成非法体。
       const result = await webFetch(url, {
         method: def.request.method ?? 'GET',
         headers,
         body,
-        displayLimit: 512 * 1024,
+        maxBytes: 2 * 1024 * 1024,
+        displayLimit: 2 * 1024 * 1024,
+        allowInternal: def.allow_internal === true,
       });
       let output: string;
+      let saveNote = '';
+      let savedAndSent = false;
       const response = def.response ?? {};
       const format = response.format ?? 'json';
-      let parsed: unknown = null;
       if (format === 'json') {
+        let parsed: unknown;
         try {
           parsed = JSON.parse(result.body);
         } catch {
           output = `接口返回的不是 JSON（HTTP ${result.status}）：\n${result.body.slice(0, 1000)}`;
           return { ok: result.status < 400, output: this.scrub(output, secretValues) };
         }
+        // In-band error codes (e.g. novel API: code=1 success / code=0 failure).
+        if (response.code_path) {
+          const code = extractPath(parsed, response.code_path);
+          const okValue = response.ok_value ?? 0;
+          if (String(code) !== String(okValue)) {
+            const msg = extractPath(parsed, response.msg_path ?? 'msg');
+            return {
+              ok: false,
+              output: this.scrub(`接口返回失败（${response.code_path}=${String(code)}）：${String(msg ?? '未知错误')}`, secretValues),
+            };
+          }
+        }
+        if (response.save_each) {
+          const batched = await this.saveEachToWorkspace(response.save_each, parsed, args, context);
+          saveNote = batched.note;
+          savedAndSent = batched.sentToUser;
+        }
+        if (response.save) {
+          const saved = await this.saveToWorkspace(response.save, parsed, args, context);
+          saveNote = saved.note;
+          savedAndSent = saved.sentToUser;
+        }
         if (response.template) {
-          output = interpolate(response.template, (key) => {
-            const fromBody = extractPath(parsed, key);
-            if (fromBody !== undefined) return typeof fromBody === 'object' ? JSON.stringify(fromBody, null, 0) : String(fromBody);
-            return this.resolveValue(key, args, context, false);
-          });
+          try {
+            output = interpolate(response.template, (key) => {
+              const fromBody = extractPath(parsed, key);
+              if (fromBody !== undefined) return typeof fromBody === 'object' ? JSON.stringify(fromBody, null, 0) : String(fromBody);
+              return this.resolveValue(key, args, context, false);
+            });
+          } catch (error) {
+            // 模板字段在响应里不存在（如上游抖动时 200 + 缺 data.title 的残缺体）。
+            // 把接口自带的错误说明翻出来给模型一个可判断的失败——而不是
+            // 「参数 data.title 缺失」这种让模型原样转述给用户、又无法重试的黑话。
+            const keyMatch = error instanceof Error ? /^参数 (.+) 缺失$/.exec(error.message) : null;
+            if (keyMatch === null) throw error;
+            const why = [extractPath(parsed, response.msg_path ?? 'msg'), extractPath(parsed, 'data.error')]
+              .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
+              .join('；');
+            const savedNote = savedAndSent ? '（注意：data.content 其实已保存/发出，不要重复发送）' : '';
+            return {
+              ok: false,
+              output: this.scrub(
+                `接口响应缺少字段 ${keyMatch[1]}${why ? `，接口报错：${why}` : ''}（响应开头：${result.body.slice(0, 300)}）${savedNote}`
+                  + '。多半是上游临时抖动，请原样重试一次；仍失败就如实告诉用户暂时取不到、稍后再试，不要编造内容。',
+                secretValues,
+              ),
+            };
+          }
+        } else if (response.list) {
+          output = this.renderList(response.list, parsed, args, context);
         } else {
           const extracted = response.extract ? extractPath(parsed, response.extract) : parsed;
           if (response.extract && extracted === undefined) {
@@ -246,10 +381,22 @@ export class PluginRegistry {
       }
       if (output.length > MAX_OUTPUT_CHARS) output = `${output.slice(0, MAX_OUTPUT_CHARS)}\n…（已截断）`;
       const statusNote = result.status >= 400 ? `（HTTP ${result.status}）` : '';
-      return { ok: result.status < 400, output: this.scrub(`${output}${statusNote}`, secretValues) };
+      return { ok: result.status < 400, output: this.scrub(`${output}${saveNote}${statusNote}`, secretValues), sentToUser: savedAndSent || undefined };
     } catch (error) {
-      return { ok: false, output: `${toolName} 调用失败: ${error instanceof Error ? error.message : String(error)}` };
+      // 异常消息也可能带密钥（比如 fetch 报错里拼的完整 URL），同样要过脱敏。
+      return {
+        ok: false,
+        output: this.scrub(`${toolName} 调用失败: ${error instanceof Error ? error.message : String(error)}`, this.secretValuesForScrub()),
+      };
     }
+  }
+
+  /** 待脱敏的密钥形态：原值 + URL 编码形态（响应可能回显编码后的查询串）。
+   *  下限 4 字符：过短的值误伤面太大，但 4~5 位的短 appid 也得盖住。 */
+  private secretValuesForScrub(): string[] {
+    return Object.values(this.secrets)
+      .filter((value) => value.trim().length >= 4)
+      .flatMap((value) => [value, encodeURIComponent(value)]);
   }
 
   /** Resolve a {{placeholder}}: secrets.*, scope.*, then tool params. */
@@ -268,6 +415,169 @@ export class PluginRegistry {
       raw = typeof value === 'object' ? JSON.stringify(value) : String(value);
     }
     return encode ? encodeURIComponent(raw) : raw;
+  }
+
+  /** Render response.list: flatten `from` (supports `a.b[].c`), template each item, cap at max. */
+  private renderList(
+    list: NonNullable<PluginToolResponse['list']>,
+    parsed: unknown,
+    args: Record<string, unknown>,
+    context: ToolContext,
+  ): string {
+    const items = resolveList(parsed, list.from);
+    if (items.length === 0) return `（${list.from} 是空的，没有结果）`;
+    let max = 20;
+    if (typeof list.max === 'number') max = list.max;
+    else if (typeof list.max === 'string') {
+      try {
+        const interpolated = Number(interpolate(list.max, (key) => this.resolveValue(key, args, context, false)));
+        if (Number.isFinite(interpolated)) max = interpolated;
+      } catch {
+        // max placeholder unresolvable (param omitted) → keep default
+      }
+    }
+    max = Math.min(Math.max(Math.trunc(max), 1), 300);
+    const shown = items.slice(0, max).map((item) =>
+      interpolate(list.item, (key) => {
+        const fromItem = extractPath(item, key);
+        if (fromItem !== undefined) return typeof fromItem === 'object' ? JSON.stringify(fromItem, null, 0) : String(fromItem);
+        try {
+          return this.resolveValue(key, args, context, false);
+        } catch {
+          return ''; // field missing on both item and params — render blank, don't fail the call
+        }
+      }),
+    );
+    const truncated = items.length > max ? `\n…（共 ${items.length} 条，只列了前 ${max} 条）` : '';
+    return shown.join(list.separator ?? '\n') + truncated;
+  }
+
+  /**
+   * Batch save: iterate a map-shaped body (`itemId → item`), per-item
+   * html_to_text/save/verbatim-forward. One failing item (上游抖动/锁章) never
+   * aborts the rest — it degrades to a per-item line in the note.
+   */
+  private async saveEachToWorkspace(
+    batch: NonNullable<PluginToolResponse['save_each']>,
+    parsed: unknown,
+    args: Record<string, unknown>,
+    context: ToolContext,
+  ): Promise<{ note: string; sentToUser: boolean }> {
+    const map = extractPath(parsed, batch.from);
+    if (map === null || typeof map !== 'object' || Array.isArray(map)) {
+      return { note: `\n（批量保存失败：响应里 ${batch.from} 不是对象映射）`, sentToUser: false };
+    }
+    const entries = Object.entries(map as Record<string, unknown>);
+    if (entries.length === 0) return { note: `\n（批量保存失败：${batch.from} 是空映射）`, sentToUser: false };
+
+    // 发送开关整批复用（{{forward}} 之类只与参数有关，逐项求一次即可）。
+    let flag = '';
+    if (batch.send !== undefined) {
+      try {
+        flag = interpolate(batch.send, (key) => this.resolveValue(key, args, context, false));
+      } catch {
+        flag = batch.send;
+      }
+    }
+    const wantSend = /^(true|1|yes|是)$/i.test(flag.trim());
+
+    const lines: string[] = [];
+    let okCount = 0;
+    let sentCount = 0;
+    let sentToUser = false;
+    for (const [key, raw] of entries.slice(0, SAVE_EACH_MAX_ITEMS)) {
+      const item: Record<string, unknown> = raw !== null && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+      const title = typeof item.title === 'string' && item.title ? item.title : key;
+      const itemError = typeof item.error === 'string' && item.error ? item.error : '';
+      const rawText = item.content;
+      if (typeof rawText !== 'string' || rawText.trim() === '') {
+        lines.push(`《${title}》失败：${itemError || '响应里没有正文'}`);
+        continue;
+      }
+      let text = batch.html_to_text ? htmlToText(rawText) : rawText;
+      if (text.length > MAX_SAVE_CHARS) text = `${text.slice(0, MAX_SAVE_CHARS)}\n…（超长已截断）`;
+      try {
+        const rel = interpolate(batch.path, (k) => this.resolveValue(k, { ...args, __key: key }, context, false));
+        const abs = context.workspace.resolvePath(rel);
+        mkdirSync(dirname(abs), { recursive: true });
+        writeFileSync(abs, text, 'utf-8');
+        okCount += 1;
+        if (wantSend) {
+          const sendable = text.split('\n').slice(0, SEND_FILE_MAX_LINES).filter((line) => line.trim());
+          const { sent, failure } = await sendLinesVerbatim(context, sendable, 'file-excerpt');
+          if (sent > 0) {
+            sentCount += 1;
+            sentToUser = true;
+            lines.push(`《${title}》已存并发给用户`);
+          } else {
+            lines.push(`《${title}》已存，但发送失败: ${failure || '没有可发送的行'}`);
+          }
+        } else {
+          lines.push(`《${title}》已存 ${context.workspace.displayPath(abs)}`);
+        }
+      } catch (error) {
+        lines.push(`《${title}》失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    const overflow = entries.length > SAVE_EACH_MAX_ITEMS
+      ? `\n…（响应共 ${entries.length} 项，单次最多处理 ${SAVE_EACH_MAX_ITEMS} 项，剩下的请分批再调）`
+      : '';
+    const sendNote = wantSend ? `，已发出 ${sentCount} 章` : '';
+    return {
+      note: `\n（批量完成 ${okCount}/${entries.length} 章${sendNote}：\n${lines.join('\n')}${overflow}）`,
+      sentToUser,
+    };
+  }
+
+  /** Persist a body subtree into the scope workspace; returns a note for the tool output. */
+  private async saveToWorkspace(
+    save: NonNullable<PluginToolResponse['save']>,
+    parsed: unknown,
+    args: Record<string, unknown>,
+    context: ToolContext,
+  ): Promise<{ note: string; sentToUser: boolean }> {
+    const none = { note: '', sentToUser: false };
+    const value = extractPath(parsed, save.from);
+    if (value === undefined) return { ...none, note: `\n（保存失败：响应里没有 ${save.from}）` };
+    let text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    if (save.html_to_text) text = htmlToText(text);
+    if (text.length > MAX_SAVE_CHARS) text = `${text.slice(0, MAX_SAVE_CHARS)}\n…（超长已截断）`;
+    let rel: string;
+    try {
+      rel = interpolate(save.path, (key) => this.resolveValue(key, args, context, false));
+      const abs = context.workspace.resolvePath(rel);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, text, 'utf-8');
+      rel = context.workspace.displayPath(abs);
+    } catch (error) {
+      return { ...none, note: `\n（保存失败：${error instanceof Error ? error.message : String(error)}）` };
+    }
+    let note = `\n（已存到 ${rel}，${text.length} 字符；可用 file_read/file_search/send_file 处理）`;
+
+    // One-shot forwarding: deliver the saved text verbatim when send is truthy.
+    if (save.send !== undefined) {
+      let flag = '';
+      try {
+        flag = interpolate(save.send, (key) => this.resolveValue(key, args, context, false));
+      } catch {
+        flag = save.send; // literal string like "true"
+      }
+      if (/^(true|1|yes|是)$/i.test(flag.trim())) {
+        const lines = text.split('\n').slice(0, SEND_FILE_MAX_LINES);
+        const sendable = lines.filter((line) => line.trim());
+        const { sent, failure } = await sendLinesVerbatim(context, sendable, 'file-excerpt');
+        const total = text.split('\n').length;
+        const notes: string[] = [];
+        if (total > SEND_FILE_MAX_LINES) notes.push(`只发了前 ${SEND_FILE_MAX_LINES} 行，剩余用 send_file from=${SEND_FILE_MAX_LINES + 1} 续发`);
+        if (failure) notes.push(`发送中断: ${failure}`);
+        if (sent > 0) {
+          note += `；已把原文发给用户（${sent} 条消息）${notes.length ? `，${notes.join('，')}` : ''}`;
+          return { note, sentToUser: true };
+        }
+        note += `；发送失败: ${failure || '没有可发送的行'}`;
+      }
+    }
+    return { note, sentToUser: false };
   }
 
   /** Keep API keys out of anything the model (and history) gets to see. */
@@ -303,6 +613,40 @@ export function extractPath(value: unknown, path: string): unknown {
 
 function interpolate(template: string, resolveKey: (key: string) => string): string {
   return template.replace(PLACEHOLDER, (_match, key: string) => resolveKey(key));
+}
+
+/** Resolve a list path, flattening `[]` segments: `data.volumes[].chapters` walks every volume. */
+function resolveList(value: unknown, path: string): unknown[] {
+  const idx = path.indexOf('[].');
+  if (idx === -1) {
+    const resolved = extractPath(value, path);
+    if (resolved === undefined) return [];
+    return Array.isArray(resolved) ? resolved : [resolved];
+  }
+  const head = extractPath(value, path.slice(0, idx));
+  if (!Array.isArray(head)) return [];
+  const rest = path.slice(idx + 3);
+  return head.flatMap((item) => resolveList(item, rest));
+}
+
+/** Light HTML→plain-text for API bodies like novel chapters: <p>/<br> → newlines, tags stripped, entities decoded. */
+function htmlToText(html: string): string {
+  return html
+    // style/script CONTENT survives plain tag-stripping — drop the blocks first
+    .replace(/<\s*(style|script)\b[\s\S]*?<\s*\/\s*\1\s*>/gi, '')
+    .replace(/<\s*br\s*\/?\s*>/gi, '\n')
+    .replace(/<\/\s*(p|h[1-6]|div|li|section|article)\s*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\u200B/g, '') // zero-width spaces common in ebook markup
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim();
 }
 
 // ── default registry (module singleton used by tools.ts) ────────────────────

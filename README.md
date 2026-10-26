@@ -1,18 +1,30 @@
-# LiveAI
+# DeepLive
 
-> 让 AI 活在你的社交账户上。
+> 为你的 AGI 搭建一个生命空间！
+
+三层架构（中枢 → 领域主级AI → 下级AI）与记忆库设计见 [docs/architecture.md](docs/architecture.md)。
 
 使用了那么多 Agent，工作量却与日俱增？社交消息繁忙，几乎没有完整、不被打扰的时间认真做一件事情？在快节奏的时代，如何享受一个下午的慢生活，又不怕与时代脱节？
 
 是时候把自己蒸馏成 Agent，来应对纷繁的世界。
 
-LiveAI 希望把 AI 从一个需要被反复打开的聊天窗口，变成真正生活在社交账户上的数字代理。它负责接收消息、理解上下文、调用模型、管理账户，并在明确的权限边界内替你处理重复而繁琐的事情。
+DeepLive 参考 OpenClaw、DeepSeek Harness 的设计思路，以**长期记忆、自主生命周期、多领域可达**为目的，为 DeepSeek 建立高效的可拓展框架——把 AI 从一个需要被反复打开的聊天窗口，变成真正生活在社交账户上的数字代理。它负责接收消息、理解上下文、调用模型、管理账户，并在明确的权限边界内替你处理重复而繁琐的事情。
 
 > 当前已完成：Phase 0 宿主骨架，以及从旧版 Python 架构移植的完整聊天运行时（NapCat/OneBot 适配、作用域串行管线、插队合并、提示词分层、模型渠道、JSON 持久化、聊天工具集）。WebUI 与提示词评估仍在路线图上。
 
+## 内置插件
+
+| 插件 | 能力 |
+|---|---|
+| OneBot 桥（NapCat） | 给你的大肥鱼一个社交账号：QQ 私聊/群聊收发、反向 WS、表情包库 |
+| Bilibili Reader | 让你的肥鱼可以刷 B 站：搜索/详情/取直链发视频（`bili_*` 插件工具 + `send_video`），多帧抽帧贴长图交给视觉模型「看视频」（`watch_video`） |
+| Minecraft | 让你的鱼陪你玩 MC：mineflayer 边车（`deeplive-mcbot.service` @127.0.0.1:7660）+ 22 个 `mc_*` 工具（进服/寻路/挖矿/放方块/打怪/砍树/聊天），`mc_view` 俯视+剖面渲染图接视觉模型 |
+
+插件均为声明式 HTTP 工具（`data/plugins/<name>/plugin.json`），改文件 + `plugin_manage reload` 热加载，见 `data/plugins/README.md`。
+
 ## 项目目标
 
-LiveAI 是一个由单一宿主进程管理的模块化 Node.js 应用，连接以下几类能力：
+DeepLive 是一个由单一宿主进程管理的模块化 Node.js 应用，连接以下几类能力：
 
 - 社交账户和 Bot 连接
 - 多个模型渠道、上游服务和模型
@@ -32,13 +44,13 @@ LiveAI 是一个由单一宿主进程管理的模块化 Node.js 应用，连接�
 - 用一套固定提示词解决所有人格和场景问题
 - 在没有观测数据的情况下过早优化调度算法
 
-LiveAI 首先需要拥有一个稳定、可观测、能够优雅启动和关闭的宿主，再逐步增加连接器与智能能力。
+DeepLive 首先需要拥有一个稳定、可观测、能够优雅启动和关闭的宿主，再逐步增加连接器与智能能力。
 
 ## 核心功能
 
 ### 1. WebUI
 
-WebUI 是配置和观察 LiveAI 的主要入口，目标能力包括：
+WebUI 是配置和观察 DeepLive 的主要入口，目标能力包括：
 
 - 查看和配置模型渠道、上游服务与模型
 - 配置 Bot 的连接方式，例如 OneBot / NapCat
@@ -48,6 +60,8 @@ WebUI 是配置和观察 LiveAI 的主要入口，目标能力包括：
 - 由首页主 AI 辅助完成配置、诊断和日常操作
 
 WebUI 不直接操作 Bot 连接或模型供应商，而是通过 API 调用宿主内的领域服务。
+
+**当前已内置一个极简管理面板**（与 `/health` 同端口，`src/api/webui*.ts`）：打开 `http://127.0.0.1:3000/` 即是——主AI网页对话（右下角悬浮窗，可开合、带未读角标；以「系统管理员（后台控制台）」身份直接对主AI发话，消息进号主私聊会话同一份历史，QQ 侧照常收到回复）、状态概览（QQ 连接/账号/各角色当前模型、请求次数与 token 用量统计——按角色/模型分桶，自启动累计，含最近一条模型错误）、会话管理（逐会话开关子AI、调触发率、增删触发词，号主会话禁止关闭防失联）、提示词在线编辑（保存即让缓存失效，最迟 30s 热生效）、`models_config.json` 在线编辑（入库前校验结构，写坏一律 400 不落盘；保存自动留 `.bak-<时间戳>` 备份并热重载；api_key 掩码显示为 `•••`+尾 4 位，未改动的掩码项保存时自动还原真值）。可选鉴权：设 `LIVEAI_WEBUI_TOKEN=xxx`（或 config.json 的 `webui.token`）后页面与 API 都要 `?token=` 或 Bearer。监听地址默认 127.0.0.1，要对公网开放就 config.json 里写 `"webui": {"host": "0.0.0.0", "token": "<随机串>"}` 并放行防火墙——**暴露公网务必设 token**（面板能改提示词、能关会话）。
 
 ### 2. API 模块
 
@@ -71,7 +85,7 @@ Bot 模块负责连接和管理社交账户，初期以 OneBot 生态为主要�
 - 统一接收私聊、群聊、好友请求、群请求等事件
 - 统一发送消息和调用账户动作
 - 管理连接状态、重连、心跳和能力发现
-- 将平台差异转换成 LiveAI 内部事件
+- 将平台差异转换成 DeepLive 内部事件
 
 Bot 适配器只负责连接和协议，不负责决定 AI 应该说什么或是否允许某项账户操作。
 
@@ -82,7 +96,7 @@ Bot 适配器只负责连接和协议，不负责决定 AI 应该说什么或是
 - 处理账户相关的配置和状态
 - 识别并管理好友、群组和请求
 - 发起加好友、加群、同意请求等账户操作
-- 与 LiveAI 主 AI 对话
+- 与 DeepLive 主 AI 对话
 - 为下属会话 Agent 提供账户级策略和上下文
 
 每个用户或群聊对应一个单线程会话 Agent：
@@ -92,11 +106,11 @@ Bot 适配器只负责连接和协议，不负责决定 AI 应该说什么或是
 - 会话 Agent 拥有稳定的上下文边界
 - 会话 Agent 不能绕过能力层直接操作账户连接
 
-“单线程”指会话级处理队列，不意味着整个 LiveAI 进程只能同时处理一个请求。
+“单线程”指会话级处理队列，不意味着整个 DeepLive 进程只能同时处理一个请求。
 
 ### 5. 提示词工程
 
-LiveAI 的目标不是让 AI 机械地回复消息，而是让它在社交环境中表现得稳定、自然并且可控。提示词系统将逐步覆盖：
+DeepLive 的目标不是让 AI 机械地回复消息，而是让它在社交环境中表现得稳定、自然并且可控。提示词系统将逐步覆盖：
 
 - 账户人格、身份和表达风格
 - 私聊、群聊和账户管理场景
@@ -112,8 +126,8 @@ LiveAI 的目标不是让 AI 机械地回复消息，而是让它在社交环境
 
 | 概念 | 说明 |
 | --- | --- |
-| 宿主进程 | LiveAI 的唯一主进程，负责模块注册、生命周期、配置和基础设施 |
-| 账户 | 一个可被 LiveAI 管理的社交身份，通常对应一个 Bot 登录身份 |
+| 宿主进程 | DeepLive 的唯一主进程，负责模块注册、生命周期、配置和基础设施 |
+| 账户 | 一个可被 DeepLive 管理的社交身份，通常对应一个 Bot 登录身份 |
 | Bot 连接 | 账户与 OneBot 或其他平台连接方式之间的适配器实例 |
 | 渠道 | 一组模型服务配置和连接能力，例如某个 API 服务商 |
 | 上游 | 渠道中的具体服务端点、凭据和可用模型集合 |
@@ -126,11 +140,11 @@ LiveAI 的目标不是让 AI 机械地回复消息，而是让它在社交环境
 
 ## 总体架构
 
-LiveAI 采用模块化单体架构：所有核心模块先运行在同一个 Node.js 进程内，通过明确的服务接口和进程内事件总线协作。这样可以先获得简单的部署、调试和状态管理方式，未来再根据真实负载拆分独立服务。
+DeepLive 采用模块化单体架构：所有核心模块先运行在同一个 Node.js 进程内，通过明确的服务接口和进程内事件总线协作。这样可以先获得简单的部署、调试和状态管理方式，未来再根据真实负载拆分独立服务。
 
 ```mermaid
 flowchart TD
-    Host[LiveAI Host\n单一 Node.js 进程]
+    Host[DeepLive Host\n单一 Node.js 进程]
 
     Host --> WebUI[WebUI]
     Host --> API[API]
@@ -389,7 +403,7 @@ conversationKey = accountId + ":" + conversationId
 
 ### 提示词系统（`data/prompt/` + `src/prompt/`）
 
-- 分层文件：`char.txt` 人设、`char_prefill` 人设确认、`staff/10-50` 逐层拼接、`child_rules.txt` 25 条会话规则、`chat_focus` / `chat_style`
+- 分层文件：`char.txt` 人设、`char_prefill` 人设确认、`staff/10-50` 逐层拼接、`child_rules.txt` 会话规则、`chat_focus` / `chat_style`；文件里可用 `{{master_qq}}`（staff / child_rules / main）与 `{{char_prompt}}`（staff）占位符，启动时注入（仓库只带 `data/prompt.example/` 通用示例，复制为 `data/prompt/` 后按喜好改）
 - system 块顺序与旧版一致：`[staff+身份基线+规则（可缓存）] → [动态背景（时间/会话/印象/摘要/补审提醒）] → [人设尾巴放最后避免稀释]`
 - 消息协议：`<user_msg>` / `<user_invisible><tool_report>` / 短ID `[#A1B2]`；Anthropic 提示缓存断点在 system[0]、prefill 末尾与历史尾部前 4 条
 - 发言必须走 `send_message` 工具，`stay_silent` 显式沉默，`<thinking>` 标签自动过滤
@@ -490,6 +504,7 @@ pnpm build
 ```bash
 cp data/config.example.json data/config.json
 cp data/models_config.example.json data/models_config.json
+cp -r data/prompt.example data/prompt   # 示例提示词（通用人设），按喜好改
 # 填入 NapCat 地址/token 与模型渠道后：
 pnpm start
 ```
@@ -500,11 +515,11 @@ pnpm start
 LIVEAI_HOST=127.0.0.1
 LIVEAI_PORT=3000
 LIVEAI_LOG_LEVEL=info
-LIVEAI_NAPCAT_WS_URL=ws://127.0.0.1:7821/openclaw-bind
-LIVEAI_NAPCAT_HTTP_URL=http://127.0.0.1:7822
+LIVEAI_NAPCAT_WS_URL=ws://127.0.0.1:7631/openclaw-bind
+LIVEAI_NAPCAT_HTTP_URL=http://127.0.0.1:7632
 LIVEAI_NAPCAT_SELF_ID=0        # 0 = 从首个事件自动学习
 LIVEAI_NAPCAT_TOKEN=...
-LIVEAI_MASTER_QQ=241898129
+LIVEAI_MASTER_QQ=123456789   # 换成你自己的 QQ 号
 ```
 
 健康检查：
@@ -514,6 +529,6 @@ curl http://127.0.0.1:3000/health
 curl http://127.0.0.1:3000/ready
 ```
 
-测试覆盖：作用域管线（FIFO/停车/顺序/并行）、提示词渲染与组装、触发判定与防抖（含 trigger_config 自调）、关系网络与主AI协调闭环、任务调度（持久化/补发/周期/取消）、图片解析与收发工具，以及端到端编排流（插队合并、回合后续合并、中断备注、闹钟回注、图片提示、群聊触发提示），共 94 例。
+测试覆盖：作用域管线（FIFO/停车/顺序/并行）、提示词渲染与组装、触发判定与防抖（含 trigger_config 自调）、关系网络与主AI协调闭环、任务调度（持久化/补发/周期/取消）、图片解析与收发工具，以及端到端编排流（插队合并、回合后续合并、中断备注、闹钟回注、图片提示、群聊触发提示），共 181 例。
 
 接入真实账户前，应先使用测试账户、最小权限和明确的测试群聊验证消息路由与能力策略。

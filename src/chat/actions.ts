@@ -29,6 +29,14 @@ const READ_MAX_CHARS = 12_000;
 const SEARCH_MAX_HITS = 30;
 const EXCERPT_MAX_LINES = 30;
 const EXCERPT_LINE_MAX_CHARS = 4_000;
+/** Whole-file dump (send_file / plugin save.send): bigger budget than excerpts. */
+export const SEND_FILE_MAX_LINES = 150;
+/**
+ * Verbatim delivery packs as many lines as possible into ONE message; only
+ * content beyond this budget spills into a follow-up message (QQ rejects
+ * over-long texts, so "no splitting" still needs a ceiling).
+ */
+export const VERBATIM_BATCH_CHARS = 4_000;
 const NETWORK_CALLS_PER_TURN = 8;
 
 export const ACTION_TOOL_SCHEMAS: ToolSchema[] = [
@@ -149,8 +157,9 @@ export const ACTION_TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'send_file_excerpt',
     description:
-      '把工作区文件的指定行区间【原文】直接发给用户：每一行作为一条独立消息逐条发出，不需要你复述内容。'
-      + '配合 file_search 定位行号后使用（如发小说选段）。单次最多 30 行；from/to 为 1 起始的行号（含两端）。',
+      '把工作区文件的指定行区间【原文】直接发给用户，不需要你复述内容。'
+      + '配合 file_search 定位行号后使用（如发小说选段）。单次最多 30 行；from/to 为 1 起始的行号（含两端）。'
+      + '要发整个文件（整章小说）改用 send_file。',
     parameters: {
       type: 'object',
       properties: {
@@ -159,6 +168,22 @@ export const ACTION_TOOL_SCHEMAS: ToolSchema[] = [
         to: { type: 'number', description: '结束行（含；最多 from+29）' },
       },
       required: ['path', 'from', 'to'],
+    },
+  },
+  {
+    name: 'send_file',
+    description:
+      '把工作区文件【整个】原文发给用户，不需要你复述内容。'
+      + '发整章小说、整份文档用它（比 send_file_excerpt 省得数行号）。单次最多 150 行，'
+      + '文件更长时会告知剩余行数，用 from 参数续发。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '工作区内相对路径' },
+        from: { type: 'number', description: '从第几行开始发（1 起始，默认 1，续发用）' },
+        max_lines: { type: 'number', description: '本次最多发多少行（默认 150）' },
+      },
+      required: ['path'],
     },
   },
 ];
@@ -237,7 +262,7 @@ async function run(name: string, args: Record<string, unknown>, context: ToolCon
       if (!entry) return { ok: false, output: `没有找到短ID ${ref} 对应的消息。` };
       const fileRefs = Array.isArray(entry.file_refs) ? entry.file_refs : [];
       if (fileRefs.length === 0) return { ok: false, output: `消息 ${ref} 里没有文件。` };
-      const index = Math.max(1, Number(args.index ?? 1) || 1);
+      const index = Math.max(1, Math.trunc(Number(args.index ?? 1)) || 1);
       if (index > fileRefs.length) return { ok: false, output: `消息 ${ref} 只有 ${fileRefs.length} 个文件。` };
       const fileRef = fileRefs[index - 1] as { name?: string; url?: string; fileId?: string };
       let url = String(fileRef.url ?? '').trim();
@@ -346,7 +371,9 @@ async function run(name: string, args: Record<string, unknown>, context: ToolCon
         return { ok: true, output: `已解出 ${names.length} 个文件到 ${destRel}/：\n${shown.join('\n')}${names.length > 50 ? '\n…' : ''}` };
       }
       if (isGzip(buffer)) {
-        const destAbs = abs.replace(/\.gz$/i, '');
+        // 不以 .gz 结尾时 replace 是空操作，不兜底会把原压缩包覆盖成解压内容
+        let destAbs = abs.replace(/\.gz$/i, '');
+        if (destAbs === abs) destAbs = `${abs}.out`;
         const bytes = await extractGzip(buffer, destAbs);
         return { ok: true, output: `已解出 ${context.workspace.displayPath(destAbs)}（${formatBytes(bytes)}）。` };
       }
@@ -366,47 +393,40 @@ async function run(name: string, args: Record<string, unknown>, context: ToolCon
         to = from + EXCERPT_MAX_LINES - 1;
         truncatedByCap = true;
       }
-      const selected: string[] = [];
-      for (let index = from; index <= to; index += 1) {
-        let line = (lines[index - 1] ?? '').trimEnd();
-        if (line.length > EXCERPT_LINE_MAX_CHARS) line = `${line.slice(0, EXCERPT_LINE_MAX_CHARS)}…`;
-        if (line.trim()) selected.push(line);
-      }
+      const selected = pickSendableLines(lines, from, to);
       if (selected.length === 0) return { ok: false, output: `第 ${from}-${to} 行都是空行，没有可发送的内容。` };
 
-      // Verbatim delivery: each source line becomes its own QQ message,
-      // untranslated and un-narrated; per-line history like send_message.
-      const refs: string[] = [];
-      let failure = '';
-      for (const line of selected) {
-        try {
-          const result = await context.bot.sendText(context.scopeType as 'group' | 'private', Number(context.scopeId), line);
-          const sentId = (result as { message_id?: number | string }).message_id;
-          const msgRef = context.repo.registerMessageRef(context.scopeType, context.scopeId, sentId ?? null);
-          refs.push(msgRef);
-          const entry: HistoryEntry = {
-            user_id: context.bot.selfId,
-            nickname: '冰糖',
-            text: line,
-            raw_message: line,
-            message_id: sentId ?? null,
-            message_ref: msgRef,
-            timestamp: Date.now() / 1000,
-            source_label: 'file-excerpt',
-          };
-          context.repo.appendMessage(context.scopeType, context.scopeId, entry);
-        } catch (error) {
-          failure = error instanceof Error ? error.message : String(error);
-          break;
-        }
-      }
-      if (refs.length === 0) return { ok: false, output: `send_file_excerpt 发送失败: ${failure}` };
+      const { sent, failure } = await sendLinesVerbatim(context, selected, 'file-excerpt');
+      if (sent === 0) return { ok: false, output: `send_file_excerpt 发送失败: ${failure}` };
       const notes: string[] = [];
       if (truncatedByCap) notes.push(`行数超过单次上限，只发了前 ${EXCERPT_MAX_LINES} 行，剩余请再调用本工具续发`);
       if (failure) notes.push(`后续行发送中断: ${failure}`);
       return {
         ok: true,
-        output: `已把第 ${from}-${to} 行原文逐条发出（共 ${refs.length} 条）${notes.length ? `。${notes.join('；')}` : '。'}`,
+        output: `已把第 ${from}-${to} 行原文发出（${sent} 条消息）${notes.length ? `。${notes.join('；')}` : '。'}`,
+        sentToUser: true,
+      };
+    }
+
+    case 'send_file': {
+      const abs = context.workspace.resolvePath(String(args.path ?? ''));
+      const content = await readTextCapped(abs);
+      const lines = content.split('\n');
+      const from = Math.max(1, Number(args.from ?? 1) || 1);
+      if (from > lines.length) return { ok: false, output: `文件只有 ${lines.length} 行，from=${from} 超出范围。` };
+      const maxLines = Math.min(Math.max(1, Math.trunc(Number(args.max_lines ?? SEND_FILE_MAX_LINES) || SEND_FILE_MAX_LINES)), SEND_FILE_MAX_LINES);
+      const to = Math.min(lines.length, from + maxLines - 1);
+      const selected = pickSendableLines(lines, from, to);
+      if (selected.length === 0) return { ok: false, output: `第 ${from}-${to} 行都是空行，没有可发送的内容。` };
+
+      const { sent, failure } = await sendLinesVerbatim(context, selected, 'file-excerpt');
+      if (sent === 0) return { ok: false, output: `send_file 发送失败: ${failure}` };
+      const notes: string[] = [];
+      if (to < lines.length) notes.push(`文件共 ${lines.length} 行，本次发到第 ${to} 行，剩余用 from=${to + 1} 续发`);
+      if (failure) notes.push(`后续行发送中断: ${failure}`);
+      return {
+        ok: true,
+        output: `已把文件第 ${from}-${to} 行原文发出（${sent} 条消息）${notes.length ? `。${notes.join('；')}` : '。'}`,
         sentToUser: true,
       };
     }
@@ -422,6 +442,66 @@ export function spendNetworkBudget(context: ToolContext): void {
   if (context.networkBudget.used > NETWORK_CALLS_PER_TURN) {
     throw new Error(`本轮网络调用次数已用完（${NETWORK_CALLS_PER_TURN} 次上限），先用已有结果收尾。`);
   }
+}
+
+/** Trim/cap/filer lines for verbatim delivery: 1-based inclusive range, empties dropped. */
+function pickSendableLines(lines: string[], from: number, to: number): string[] {
+  const selected: string[] = [];
+  for (let index = from; index <= to; index += 1) {
+    let line = (lines[index - 1] ?? '').trimEnd();
+    if (line.length > EXCERPT_LINE_MAX_CHARS) line = `${line.slice(0, EXCERPT_LINE_MAX_CHARS)}…`;
+    if (line.trim()) selected.push(line);
+  }
+  return selected;
+}
+
+/**
+ * Verbatim delivery shared by send_file_excerpt / send_file / plugin save.send:
+ * lines are packed into as few QQ messages as possible (VERBATIM_BATCH_CHARS
+ * ceiling), each sent message gets its own history entry, un-narrated.
+ */
+export async function sendLinesVerbatim(
+  context: ToolContext,
+  lines: string[],
+  sourceLabel: string,
+): Promise<{ sent: number; failure: string }> {
+  const batches: string[] = [];
+  let current = '';
+  for (const line of lines) {
+    if (current && current.length + 1 + line.length > VERBATIM_BATCH_CHARS) {
+      batches.push(current);
+      current = line;
+    } else {
+      current = current ? `${current}\n${line}` : line;
+    }
+  }
+  if (current) batches.push(current);
+
+  let sent = 0;
+  let failure = '';
+  for (const batch of batches) {
+    try {
+      const result = await context.bot.sendText(context.scopeType as 'group' | 'private', Number(context.scopeId), batch);
+      const sentId = (result as { message_id?: number | string }).message_id;
+      const msgRef = context.repo.registerMessageRef(context.scopeType, context.scopeId, sentId ?? null);
+      const entry: HistoryEntry = {
+        user_id: context.bot.selfId,
+        nickname: context.bot.selfNickname || 'AI',
+        text: batch,
+        raw_message: batch,
+        message_id: sentId ?? null,
+        message_ref: msgRef,
+        timestamp: Date.now() / 1000,
+        source_label: sourceLabel,
+      };
+      context.repo.appendMessage(context.scopeType, context.scopeId, entry);
+      sent += 1;
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+      break;
+    }
+  }
+  return { sent, failure };
 }
 
 const spendNetwork = spendNetworkBudget;
