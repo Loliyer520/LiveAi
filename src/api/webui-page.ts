@@ -11,6 +11,7 @@ export const WEBUI_PAGE = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#f3f7fd">
 <title>DeepLive 控制台</title>
+<link rel="icon" type="image/png" href="/favicon.png">
 <style>
 :root {
   color-scheme: light;
@@ -23,7 +24,7 @@ export const WEBUI_PAGE = `<!DOCTYPE html>
   --shadow: 0 14px 40px rgba(36, 76, 135, 0.075);
   --radius: 22px;
 }
-* { box-sizing: border-box; }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html { min-width: 320px; scroll-behavior: smooth; }
 body {
   margin: 0; min-height: 100vh; min-height: 100dvh; overflow-x: hidden; color: var(--text);
@@ -47,11 +48,14 @@ body::after {
 }
 ::selection { color: #15345f; background: rgba(128, 174, 238, 0.28); }
 button, input, textarea, select { font: inherit; }
-button, a { -webkit-tap-highlight-color: transparent; }
 button { cursor: pointer; }
 a { color: inherit; }
 button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 3px;
+}
+/* 触屏点按不画键盘焦点蓝框（保留桌面键盘导航的可见焦点） */
+@media (pointer: coarse) {
+  button:focus, a:focus, input:focus, textarea:focus, select:focus { outline: none; }
 }
 ::-webkit-scrollbar { width: 7px; height: 7px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -80,6 +84,11 @@ aside .brand { display: flex; align-items: center; gap: 12px; padding: 28px 24px
   box-shadow: inset 0 1px rgba(255,255,255,0.24), 0 8px 22px rgba(40, 85, 163, 0.18);
 }
 .brand-logo .icon { width: 25px; height: 25px; }
+.brand-logo img { width: 37px; height: 37px; border-radius: 10px; }
+.qq-avatar {
+  width: 52px; height: 52px; flex: 0 0 auto; border-radius: 50%; object-fit: cover;
+  border: 3px solid #3c74cb; box-shadow: 0 4px 14px rgba(40, 85, 163, 0.22); background: #eef4fc;
+}
 .brand-name { color: #17345e; font-size: 20px; line-height: 1.2; font-weight: 720; letter-spacing: -0.4px; }
 aside .brand small { display: block; margin-top: 5px; color: #8295b0; font-size: 9px; letter-spacing: 1.8px; }
 .side-caption {
@@ -237,6 +246,21 @@ tr:last-child td { border-bottom: none; }
 .btn.danger { color: #cb4c64; }
 .btn.danger:hover { color: #b8324d; border-color: rgba(202, 64, 89, 0.27); background: rgba(226, 79, 104, 0.07); }
 .btn.small { min-height: 29px; padding: 4px 11px; border-radius: 9px; font-size: 11px; }
+.seg { display: flex; gap: 4px; background: rgba(43, 99, 189, 0.07); border-radius: 12px; padding: 4px; margin-bottom: 12px; }
+.seg button { flex: 1; min-height: 34px; padding: 6px 10px; border: none; background: transparent; border-radius: 9px; color: var(--sub); font-size: 13px; font-weight: 600; cursor: pointer; transition: all .18s ease; }
+.seg button.on { background: #fff; color: var(--accent-strong); box-shadow: 0 1px 4px rgba(37, 74, 126, 0.14); }
+.urow { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; background: rgba(255, 255, 255, 0.55); }
+.urow .uhead { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 2px 10px; font-weight: 600; font-size: 13px; margin-bottom: 8px; }
+.urow .uhead span { font-weight: 400; color: var(--sub); font-size: 12px; }
+.ugrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.ucell { background: rgba(43, 99, 189, 0.055); border-radius: 9px; padding: 7px 9px; min-width: 0; }
+.ucell b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ucell span { display: block; color: var(--sub); font-size: 11px; margin-top: 1px; }
+.usec { color: #91a2b9; font-size: 11px; font-weight: 600; letter-spacing: 1.5px; text-transform: uppercase; margin: 14px 0 8px; }
+@media (max-width: 560px) {
+  .ugrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ucell b { font-size: 13px; }
+}
 .btn:disabled { opacity: .4; cursor: default; transform: none; }
 
 input[type=text], input[type=number], input[type=password], select, textarea {
@@ -261,6 +285,45 @@ label.field span { display: block; margin-bottom: 6px; color: var(--sub); font-s
 .mono { font-family: var(--mono); font-size: 11px; color: #607c9f; }
 .dim { color: var(--sub); }
 .clickable { color: var(--accent); cursor: pointer; }
+
+/* ── NapCat 连接页 ── */
+.napcat-status { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 14px 18px; }
+.napcat-id { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.napcat-id-copy { min-width: 0; }
+.napcat-avatar {
+  width: 48px; height: 48px; flex: 0 0 auto; display: grid; place-items: center;
+  color: #f5f9ff; font-size: 19px; font-weight: 650; border-radius: 15px;
+  background: linear-gradient(145deg, #4a80d4, #2a589f);
+  box-shadow: inset 0 1px rgba(255,255,255,0.24), 0 8px 20px rgba(40, 85, 163, 0.18);
+}
+.napcat-avatar.off { background: linear-gradient(145deg, #b3c0d2, #8b9cb3); box-shadow: inset 0 1px rgba(255,255,255,0.3), 0 8px 20px rgba(86, 106, 136, 0.12); }
+.napcat-name { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: #183b6d; font-size: 17px; font-weight: 650; letter-spacing: -0.2px; }
+.napcat-meta { margin: 2px 0 0; color: var(--sub); font-size: 12px; }
+.napcat-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--line); }
+.napcat-mode { color: var(--sub); font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.napcat-hint { margin: -2px 0 14px; padding: 9px 12px; color: #58719a; background: rgba(226, 238, 253, 0.5); border: 1px solid rgba(54, 96, 154, 0.08); border-radius: 12px; font-size: 12px; line-height: 1.6; }
+.napcat-hint code { color: #214f9c; font-family: var(--mono); font-size: 11px; word-break: break-all; }
+details.napcat-advanced { margin: 0 0 14px; background: rgba(255,255,255,0.42); border: 1px solid var(--line); border-radius: 14px; }
+details.napcat-advanced summary { display: flex; align-items: center; gap: 7px; padding: 10px 14px; color: #5c769b; font-size: 12px; cursor: pointer; list-style: none; }
+details.napcat-advanced summary::-webkit-details-marker { display: none; }
+details.napcat-advanced summary::before { content: "＋"; color: #8ba0bd; }
+details.napcat-advanced[open] summary::before { content: "－"; }
+.napcat-advanced-body { padding: 0 14px 6px; }
+.npc-way-num { display: inline-block; margin-right: 8px; padding: 2px 9px; color: #fff; background: #3f74c4; border-radius: 999px; font-size: 11px; font-weight: 600; vertical-align: 2px; }
+details.npc-way2 summary { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 7px; padding: 6px 0; color: var(--ink); font-size: 14px; cursor: pointer; list-style: none; }
+details.npc-way2 summary b { min-width: 0; }
+details.npc-way2 summary b i.dim { font-style: normal; font-weight: 400; }
+details.npc-way2 summary > .dim { font-size: 12px; font-weight: 400; }
+details.npc-way2 summary > .pill { margin-left: auto; flex: 0 0 auto; }
+details.npc-way2 summary .npc-way-num { flex: 0 0 auto; white-space: nowrap; vertical-align: middle; }
+@media (max-width: 480px) {
+  details.npc-way2 summary { font-size: 13px; }
+  .npc-way-num { margin-right: 6px; padding: 2px 7px; font-size: 10px; }
+}
+details.npc-way2 summary::-webkit-details-marker { display: none; }
+details.npc-way2 summary::before { content: "▸"; color: #8ba0bd; font-size: 12px; }
+details.npc-way2[open] summary::before { content: "▾"; }
+details.npc-way2 .napcat-advanced-body { padding: 4px 0 8px; }
 
 /* ── 选项卡与聊天 ── */
 .tabs { display: flex; gap: 5px; width: fit-content; max-width: 100%; margin: 0 0 14px; padding: 4px; overflow-x: auto; background: rgba(255, 255, 255, 0.64); border: 1px solid var(--line); border-radius: 15px; backdrop-filter: blur(16px); }
@@ -292,6 +355,9 @@ label.field span { display: block; margin-bottom: 6px; color: var(--sub); font-s
 .switch input:checked + i { background: linear-gradient(135deg, #4079cf, #2d5da9); box-shadow: 0 0 14px rgba(46, 90, 166, 0.16); }
 .switch input:checked + i::after { background: #fff; transform: translateX(19px); }
 .switch input:focus-visible + i { outline: 2px solid var(--accent); outline-offset: 3px; }
+@media (pointer: coarse) {
+  .switch input:focus + i, .switch input:focus-visible + i { outline: none; }
+}
 
 /* ── 登录、加载与反馈 ── */
 #toast {
@@ -389,6 +455,9 @@ label.field span { display: block; margin-bottom: 6px; color: var(--sub); font-s
   .card { padding: 16px; border-radius: 18px; }
   .form-grid { grid-template-columns: 1fr; }
   .form-grid .wide { grid-column: auto; }
+  .napcat-status { align-items: flex-start; }
+  .napcat-foot { flex-wrap: wrap; }
+  .napcat-mode { flex: 1 1 auto; }
   .hero { min-height: 0; padding: 20px; }
   .hero h2 { margin-bottom: 7px; font-size: 21px; }
   .hero p { font-size: 12px; }
@@ -454,8 +523,8 @@ label.field span { display: block; margin-bottom: 6px; color: var(--sub); font-s
 <div id="scrim" onclick="closeDrawer()"></div>
 <aside>
   <div class="brand">
-    <div class="brand-logo" data-icon="spark"></div>
-    <div class="brand-copy"><div class="brand-name">DeepLive</div><small>智能助手控制台</small></div>
+    <div class="brand-logo"><img src="/favicon.png" alt=""></div>
+    <div class="brand-copy"><div class="brand-name">DeepLive</div><small>一键养鱼框架</small></div>
   </div>
   <div class="side-caption"><span class="status-orb"></span> 控制台</div>
   <nav id="nav" aria-label="主导航"></nav>
@@ -581,6 +650,8 @@ var FIXED_NAV = [
   { route: "kb", title: "知识库", icon: "book", render: renderKb },
   { route: "manage", title: "主 AI 对话", icon: "message", render: renderManage },
   { route: "napcat", title: "NapCat 配置", icon: "database", render: renderNapcat },
+  { route: "models", title: "模型配置", icon: "cpu", render: renderModels },
+  { route: "persona", title: "人设编辑", icon: "users", render: renderPersona },
   { route: "probes", title: "性能", icon: "activity", render: renderProbes },
 ];
 
@@ -650,7 +721,7 @@ function route() {
     var name = r.slice(7);
     var page = PLUGIN_PAGES[name];
     if (page) { page.render(main); return; }
-    if (/^[\w-]+$/.test(name)) { renderToolPlugin(main, name); return; }
+    if (/^[\\w-]+$/.test(name)) { renderToolPlugin(main, name); return; }
   }
   if (r === "settings") { renderSettings(main); return; }
   if (r === "update") { renderUpdate(main); return; }
@@ -671,12 +742,6 @@ function renderHome(main) {
   api("/api/status").then(function (s) {
     var usage = s.usage || {};
     var total = usage.total || {};
-    var rolesHtml = "";
-    var roleNames = { main: "主对话", vision: "图片理解", summary: "后台总结" };
-    for (var i = 0; i < s.roles.length; i++) {
-      var role = s.roles[i];
-      rolesHtml += "<tr><td>" + h(roleNames[role.role] || role.role) + "</td><td>" + h(role.channel) + "</td><td class=mono>" + h(role.model) + "</td></tr>";
-    }
     main.innerHTML = pageHead("首页", "机器人、会话和模型的运行概况") +
       '<div class="card hero"><div class="hero-copy"><div class="eyebrow">运行概况</div><h2>DeepLive 控制台</h2>' +
       '<p>绿色表示运行正常；如果 QQ 显示离线，请先检查 NapCat 是否已连接。</p>' +
@@ -691,7 +756,10 @@ function renderHome(main) {
         '<a class="btn" href="#/manage">' + icon("message") + '先在面板和它聊聊</a></div></div>' : "") +
       '<div class="grid c3 metrics">' +
       '<div class="card metric-card"><div class="metric-top"><span>QQ 状态</span><span class="metric-icon">' + icon("bot") + '</span></div>' +
-      '<div class="stat">' + (s.bot.connected ? '<span class="pill ok">在线</span>' : '<span class="pill bad">离线</span>') + '</div>' +
+      '<div class="row" style="gap:12px;align-items:center;margin-top:2px">' +
+      (s.bot.selfId ? '<img src="https://q1.qlogo.cn/g?b=qq&amp;nk=' + h(String(s.bot.selfId)) + '&amp;s=100" alt="" class="qq-avatar"' +
+        ' onerror="this.remove()">' : "") +
+      '<div class="stat" style="margin:0">' + (s.bot.connected ? '<span class="pill ok">在线</span>' : '<span class="pill bad">离线</span>') + '</div></div>' +
       '<div class="stat-label">' + h(s.bot.nickname) + " · " + h(s.bot.selfId || "未知") + '</div>' +
       '<a class="btn" href="#/napcat" style="margin-top:10px">' + icon("database") + 'NapCat 设置</a></div>' +
       '<div class="card metric-card"><div class="metric-top"><span>运行时间</span><span class="metric-icon">' + icon("clock") + '</span></div>' +
@@ -699,17 +767,13 @@ function renderHome(main) {
       '<div class="card metric-card"><div class="metric-top"><span>自动回复</span><span class="metric-icon">' + icon("users") + '</span></div>' +
       '<div class="stat">' + s.scopes.enabled + ' <span style="color:#607a9f;font-size:20px;font-weight:500">/ ' + s.scopes.total + '</span></div>' +
       '<div class="stat-label">已启用 / 全部会话</div></div></div>' +
-      '<div class="grid c2">' +
-      '<div class="card">' + cardTitle("activity", "模型用量（本次启动）") + '<p class=help>统计 AI 调用次数和 Token 消耗，重启服务后重新计数。</p><table>' +
+      '<div class="card" style="max-width:520px">' + cardTitle("activity", "模型用量（本次启动）") + '<p class=help>统计 AI 调用次数和 Token 消耗，重启服务后重新计数。</p><table>' +
       "<tr><th>调用次数</th><td>" + (total.requests || 0) + "</td></tr>" +
       "<tr><th>失败次数</th><td>" + (total.failures || 0) + "</td></tr>" +
       "<tr><th>输入 Token</th><td>" + (total.inputTokens || 0).toLocaleString() + "</td></tr>" +
       "<tr><th>输出 Token</th><td>" + (total.outputTokens || 0).toLocaleString() + "</td></tr>" +
       (usage.lastError ? '<tr><th>最近错误</th><td class=mono style="color:var(--bad)">' + h(usage.lastError.message || usage.lastError) + "</td></tr>" : "") +
-      "</table></div>" +
-      '<div class="card">' + cardTitle("cpu", "各功能使用的模型") + '<p class=help>主对话、图片理解和后台总结可以分别使用不同模型。</p>' +
-      (rolesHtml ? "<table><tr><th>用途</th><th>渠道</th><th>模型</th></tr>" + rolesHtml + "</table>" : '<p class=dim>还没有配置模型</p>') +
-      "</div></div>";
+      "</table></div>";
   }).catch(function (e) { main.innerHTML = pageHead("首页", "") + '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
 }
 
@@ -839,7 +903,7 @@ var chatTimer = null;
 function renderManage(main) {
   if (chatTimer) { clearInterval(chatTimer); chatTimer = null; }
   chatLastTs = 0;
-  main.innerHTML = pageHead("主 AI 对话", "直接与主 AI 交谈；这里与主人 QQ 私聊共用对话记录") +
+  main.innerHTML = pageHead("主 AI 对话", "直接与主 AI（系统上级 agent）交谈；它没有 QQ 号，这里就是它的会话，号主数据线消息也汇入这里") +
     '<div class="chat-layout"><div class="chat" id="chatBox"></div>' +
     '<div class="chat-composer"><input type=text id=chatInput class=grow placeholder="输入消息，按回车发送…" aria-label="消息内容" onkeydown="if(event.key===\\'Enter\\')chatSend()">' +
     '<button class="btn primary" onclick="chatSend()">' + icon("send") + '发送</button></div></div>';
@@ -880,37 +944,242 @@ var obPrompts = null;
 var obPromptSel = "";
 var obPromptContent = "";
 
+function napcatModeText(mode) {
+  return mode === "server" ? "NapCat 主动连入" : "主动连接 NapCat";
+}
+function napcatModeSwitch(mode) {
+  var server = mode !== "client";
+  var i;
+  var serverNodes = document.querySelectorAll("#napcatBody .npc-server");
+  for (i = 0; i < serverNodes.length; i++) serverNodes[i].style.display = server ? "" : "none";
+  var clientNodes = document.querySelectorAll("#napcatBody .npc-client");
+  for (i = 0; i < clientNodes.length; i++) clientNodes[i].style.display = server ? "none" : "";
+}
 function napcatFormHtml(n) {
+  var server = n.mode !== "client";
+  var srv = server ? "" : ' style="display:none"';
+  var cli = server ? ' style="display:none"' : "";
+  var accs = n.knownAccounts || [];
+  var cur = Number(n.selfId || 0) || Number(n.connectedId || 0);
+  var qqField;
+  if (accs.length) {
+    var opts = "";
+    for (var k = 0; k < accs.length; k++) {
+      var a = accs[k];
+      opts += '<option value="' + a.id + '"' + (a.id === cur ? " selected" : "") + ">" +
+        h(a.nickname || "QQ") + " · " + a.id + (a.id === Number(n.connectedId || 0) ? "（当前连接）" : "") + "</option>";
+    }
+    opts += '<option value="0"' + (cur ? "" : " selected") + ">手动填写其他 QQ…</option>";
+    qqField = '<label class=field><span>机器人 QQ</span><select id=napcatAcc onchange="napcatAccPick(this.value)">' + opts + "</select></label>" +
+      '<label class=field id=napcatSelfRow' + (cur ? ' style="display:none"' : "") + '><span>机器人 QQ 号</span><input type=number min=0 id=napcatSelf value="' + h(cur || 0) + '" placeholder="未知可填 0"></label>';
+  } else {
+    qqField = '<label class=field><span>机器人 QQ（未知可填 0）</span><input type=number min=0 id=napcatSelf value="' + h(n.selfId || 0) + '"></label>';
+  }
+  var copyRow = "";
+  if (server && n.serverUrl) {
+    copyRow = '<label class="field wide npc-server"><span>服务端连接地址（复制给 NapCat 用）</span></label>' +
+      '<div class="row npc-server" style="margin:-8px 0 10px"><input type=text id=napcatServerUrl readonly value="' + h(n.serverUrl) + '" style="flex:1;min-width:0" onclick="this.select()">' +
+      '<button class="btn" onclick="napcatCopyUrl()">' + icon("database") + '复制</button></div>';
+  }
   return '<div class=form-grid>' +
-    '<label class=field><span>连接方式</span><select id=napcatMode>' +
-    '<option value=server' + (n.mode === "server" ? " selected" : "") + '>等待 NapCat 连接（server）</option>' +
-    '<option value=client' + (n.mode === "client" ? " selected" : "") + '>主动连接 NapCat（client）</option></select></label>' +
-    '<label class=field><span>机器人 QQ（未知可填 0）</span><input type=number min=0 id=napcatSelf value="' + h(n.selfId || 0) + '"></label>' +
-    '<label class="field wide"><span>WebSocket 地址</span><input type=text id=napcatWs value="' + h(n.wsUrl) + '" placeholder="ws://127.0.0.1:7631/openclaw-bind"></label>' +
-    '<label class="field wide"><span>HTTP 地址</span><input type=text id=napcatHttp value="' + h(n.httpUrl) + '" placeholder="http://127.0.0.1:7632"></label>' +
-    '<label class=field><span>监听端口（等待连接时填写）</span><input type=number min=0 max=65535 id=napcatPort value="' + h(n.reverseWsPort || 0) + '"></label>' +
+    '<label class=field><span>连接方式</span><select id=napcatMode onchange="napcatModeSwitch(this.value)">' +
+    '<option value=server' + (server ? " selected" : "") + '>等待 NapCat 连接（server）</option>' +
+    '<option value=client' + (server ? "" : " selected") + '>主动连接 NapCat（client）</option></select></label>' +
+    qqField +
+    '<label class="field npc-server"' + srv + '><span>监听端口</span><input type=number min=1 max=65535 id=napcatPort value="' + h(n.reverseWsPort || 7636) + '"></label>' +
+    '<label class="field wide npc-client"' + cli + '><span>WebSocket 地址</span><input type=text id=napcatWs value="' + h(n.wsUrl) + '" placeholder="ws://127.0.0.1:7631/deeplive-bind"></label>' +
+    '<label class="field wide npc-client"' + cli + '><span>HTTP 地址（可选）</span><input type=text id=napcatHttp value="' + h(n.httpUrl) + '" placeholder="http://127.0.0.1:7632"></label>' +
     '<label class=field><span>访问 Token</span><input type=password id=napcatToken value="" autocomplete=off placeholder="' + (n.accessToken ? "已配置，留空保持不变" : "未设置，可按需填写") + '"></label>' +
-    '<label class="field wide"><span>媒体访问地址（可选）</span><input type=text id=napcatPublic value="' + h(n.publicBaseUrl) + '" placeholder="http://服务器地址:7650"></label></div>' +
+    '</div>' +
+    copyRow +
+    '<p class="napcat-hint npc-server"' + srv + '>把上面的地址添进 NapCat 的「网络配置 → WebSocket 客户端」，Token 与上面保持一致。连上后这里会自动记住这个 QQ，下次不用再填。</p>' +
+    '<p class="napcat-hint npc-client"' + cli + '>NapCat 需开启 WebSocket 服务端；HTTP 地址用于连接断开时兜底发送。</p>' +
+    '<details class=napcat-advanced><summary>高级设置</summary><div class=napcat-advanced-body>' +
+    '<div class=form-grid><label class="field wide"><span>媒体访问地址（可选）</span><input type=text id=napcatPublic value="' + h(n.publicBaseUrl) + '" placeholder="http://服务器地址:7650"></label></div>' +
+    '<p class=help style="margin:0">用于让 QQ 能直接加载图片、语音等媒体，留空使用默认值。</p></div></details>' +
     '<div class=row><button class="btn primary" onclick="napcatSave()">' + icon("database") + '保存连接配置</button>' +
-    '<span class=dim style="font-size:12px">Token 留空不会改变；保存后重启 deeplive-bot 生效</span></div>';
+    '<span class=dim style="font-size:12px">Token 留空不会改变</span></div>';
+}
+function napcatStatusHtml(s) {
+  var connected = !!s.bot.connected;
+  var nick = s.bot.nickname && s.bot.nickname !== "（昵称待学习）" ? String(s.bot.nickname) : "";
+  return '<div class="card napcat-status" id=napcatStatus>' +
+    '<div class="napcat-id">' +
+    '<div class="napcat-avatar' + (connected ? "" : " off") + '">' + h(nick ? nick.slice(0, 1) : "Q") + '</div>' +
+    '<div class="napcat-id-copy">' +
+    '<div class="napcat-name">' + h(nick || "QQ 机器人") +
+    (connected ? '<span class="pill ok">QQ 已连接</span>' : '<span class="pill bad">QQ 未连接</span>') + '</div>' +
+    '<p class="napcat-meta">QQ ' + h(s.bot.selfId || "等待连接后获取") + '</p></div></div>' +
+    '<div class="napcat-foot">' +
+    '<span class="napcat-mode">' + (s.bot.mode === "server" ? "server 模式 · NapCat 主动连入" : "client 模式 · 主动连接 NapCat") + '</span>' +
+    '<button class="btn small" onclick="napcatRefresh()">刷新状态</button></div></div>';
+}
+function napcatRefresh() {
+  api("/api/status").then(function (s) {
+    var box = document.getElementById("napcatStatus");
+    if (box) box.outerHTML = napcatStatusHtml(s);
+  }).catch(function (e) { toast(e.message, true); });
+}
+
+// ─── 本机 NapCat 自动部署/运行 ─────────────────────────────────────────────
+var napcatRuntimeTimer = null;
+var napcatRuntimeData = null;
+var napcatRuntimeQr = null;
+
+function fmtDiskFree(n) {
+  if (n == null) return "未知";
+  return (n / 1073741824).toFixed(1) + " GB";
+}
+function napcatRuntimePill(r) {
+  if (!r.supported) return '<span class="pill bad">系统不支持</span>';
+  if (r.installing) return '<span class="pill warn">部署中…</span>';
+  if (r.installed && r.connected) return '<span class="pill ok">已连接 QQ</span>';
+  if (r.installed && r.clientConnected && !r.running) return '<span class="pill warn">本机已停 · 有外部客户端连入</span>';
+  if (r.installed && r.running) return '<span class="pill warn">运行中 · 待登录</span>';
+  if (r.installed) {
+    // activating / auto-restart 等中间态不是「已停止」，别吓小白。
+    var s = String(r.serviceState || "");
+    if (s === "activating") return '<span class="pill warn">启动中…</span>';
+    if (s === "reloading") return '<span class="pill warn">重载中…</span>';
+    if (s === "failed") return '<span class="pill bad">启动失败 · 看下方日志</span>';
+    return '<span class="pill bad">已停止</span>';
+  }
+  return '<span class="pill mute">未部署</span>';
+}
+function napcatRuntimeLogs(r) {
+  if (r.installing || r.installExit === "failed") {
+    var lines = r.installLogTail && r.installLogTail.length ? r.installLogTail.join("\\n") : "（暂无输出）";
+    return '<details open style="margin-top:12px"><summary style="cursor:pointer;color:#5c769b;font-size:12px">部署日志</summary>' +
+      '<pre class=mono style="max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;background:rgba(255,255,255,0.55);border:1px solid var(--line);border-radius:10px;padding:10px;font-size:11px;line-height:1.5;margin:8px 0 0">' + h(lines) + "</pre></details>";
+  }
+  if (r.serviceLogTail && r.serviceLogTail.length) {
+    return '<details style="margin-top:12px"><summary style="cursor:pointer;color:#5c769b;font-size:12px">运行日志</summary>' +
+      '<pre class=mono style="max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-all;background:rgba(255,255,255,0.55);border:1px solid var(--line);border-radius:10px;padding:10px;font-size:11px;line-height:1.5;margin:8px 0 0">' + h(r.serviceLogTail.join("\\n")) + "</pre></details>";
+  }
+  return "";
+}
+function napcatRuntimeHtml(r) {
+  var body = "";
+  if (!r.supported) {
+    body = '<p class=help style="margin:10px 0 0">当前服务器不是 Linux amd64/arm64，无法自动部署本机 NapCat。</p>';
+  } else if (r.mode === "client") {
+    body = '<p class=help style="margin:10px 0 0">当前是 <b>client 模式</b>（bot 主动连接外部 NapCat）。自动部署只支持 NapCat 反向连入 bot：请展开下面「方式二 · 连接别的电脑上已有的 NapCat」，把连接方式改成 server 并保存、重启 bot 后再回来部署。</p>';
+  } else if (!r.installed && !r.installing) {
+    body = '<p class=help style="margin:10px 0 0">这台服务器还没有 NapCat。一键部署会自动安装官方 Linux QQ、NapCat 和 Xvfb，并配置成开机自启、断线自动重连。</p>' +
+      '<div class=row style="margin-top:12px"><button class="btn primary" onclick="napcatRuntimeInstall()">' + icon("update") + '一键部署本机 NapCat</button>' +
+      '<span class=dim style="font-size:12px">约需 1GB 磁盘 · 安装后需用手机 QQ 扫码登录</span></div>';
+  } else {
+    if (r.installing) {
+      body += '<p class=help style="margin:10px 0 0">正在安装 QQ 与 NapCat，首次部署通常需要 3–10 分钟（取决于网速）。此页面会自动刷新。</p>';
+    } else if (r.connected) {
+      body += '<p class=help style="margin:10px 0 0">NapCat 已登录 QQ 并连上 DeepLive，可以正常收发消息了。</p>';
+    } else if (r.running) {
+      body += '<p class=help style="margin:10px 0 0">NapCat 已启动，但 QQ 还没登录。点「查看登录二维码」，用手机 QQ 扫码并在手机上确认。</p>';
+    } else {
+      body += '<p class=help style="margin:10px 0 0">NapCat 已安装但未运行，点「启动」后扫码登录。</p>';
+      if (r.clientConnected) body += '<p class=help style="margin:6px 0 0;color:var(--ok)">当前有外部客户端（方式二）连入 bot——方式一的「已连接」只看本机 NapCat，两者互不影响。</p>';
+    }
+    if (r.installError) body += '<p style="margin:8px 0 0;color:var(--bad);font-size:12px">' + h(r.installError) + "</p>";
+    if (r.connected && r.selfId) body += '<p style="margin:8px 0 0;color:var(--ok);font-size:12px">当前登录 QQ：' + h(r.selfId) + "</p>";
+    body += '<div class=row style="margin-top:12px">';
+    if (r.installing) {
+      body += '<button class="btn" disabled>部署进行中…</button>';
+    } else {
+      if (!r.running && r.serviceState !== "activating") body += '<button class="btn primary" onclick="napcatRuntimeAction(\\'start\\')">启动</button>';
+      if (r.running) body += '<button class="btn" onclick="napcatRuntimeAction(\\'restart\\')">重启</button>' +
+        '<button class="btn danger" onclick="napcatRuntimeAction(\\'stop\\')">停止</button>';
+      if (r.running && !r.connected) body += '<button class="btn primary" onclick="napcatShowQr()">' + icon("search") + '查看登录二维码</button>';
+      body += '<button class="btn small" onclick="napcatRuntimeInstall()">重新部署 / 更新</button>';
+    }
+    body += "</div>";
+    if (napcatRuntimeQr) {
+      if (napcatRuntimeQr.available) {
+        body += '<div style="margin-top:14px;padding:14px;background:rgba(255,255,255,0.7);border:1px solid var(--line);border-radius:14px;text-align:center">' +
+          '<img alt="QQ 登录二维码" src="' + h(napcatRuntimeQr.dataUrl) + '" style="width:220px;height:220px;max-width:70vw;max-height:70vw;image-rendering:pixelated">' +
+          '<p class=help style="margin:8px 0 0">用手机 QQ 扫码并确认登录；二维码约 2 分钟过期，过期后点「刷新二维码」。</p>' +
+          '<button class="btn small" onclick="napcatShowQr()">刷新二维码</button></div>';
+      } else {
+        body += '<p class=help style="margin:10px 0 0">还没有生成二维码。NapCat 启动后需要 10–30 秒连接 QQ 服务器，稍后再试。</p>';
+      }
+    }
+  }
+  body += napcatRuntimeLogs(r);
+  // 已连上 QQ 时两个方案都折叠，页面只留顶部全局状态卡；用户手动展开过的，轮询重绘不要给折回去。
+  var prev = document.getElementById("napcatWay1");
+  var open = prev && prev.open ? true : !r.clientConnected;
+  return '<details class="card npc-way2" id="napcatWay1"' + (open ? " open" : "") + '><summary>' +
+    '<span class=npc-way-num>方式一</span><b>一键部署本机 NapCat<i class=dim>（推荐）</i></b><span class=dim>自动安装托管，不依赖自己电脑常开</span>' + napcatRuntimePill(r) + '</summary>' +
+    '<div class=napcat-advanced-body>' +
+    '<p class=help style="margin:2px 0 0">在这台服务器上自动安装并托管 NapCat，QQ 不再依赖你自己的电脑常开，扫码即可登录。刚改过连接参数请先重启 bot 再部署。</p>' +
+    '<div class=row style="margin-top:12px;font-size:12px;color:var(--sub)">' +
+    '<span>NapCat <b style="color:#24456f">' + h(r.napcatVersion || "—") + '</b></span>' +
+    '<span>QQ <b style="color:#24456f">' + h(r.qqVersion || "—") + '</b></span>' +
+    '<span>systemd <b style="color:#24456f">' + h(r.serviceState || "unknown") + '</b></span>' +
+    '<span>磁盘剩余 <b style="color:#24456f">' + fmtDiskFree(r.diskFreeBytes) + '</b></span></div>' +
+    body + "</div></details>";
+}
+function paintNapcatRuntime() {
+  var box = document.getElementById("napcatRuntime");
+  if (!box || !napcatRuntimeData) return;
+  box.innerHTML = napcatRuntimeHtml(napcatRuntimeData);
+}
+function scheduleNapcatRuntimePoll() {
+  if (napcatRuntimeTimer) clearTimeout(napcatRuntimeTimer);
+  napcatRuntimeTimer = null;
+  var r = napcatRuntimeData;
+  if (!r || !document.getElementById("napcatRuntime")) return;
+  napcatRuntimeTimer = setTimeout(napcatRuntimeRefresh, r.installing ? 2500 : 10000);
+}
+function napcatRuntimeRefresh() {
+  if (!document.getElementById("napcatRuntime")) return;
+  return api("/api/napcat/runtime").then(function (r) {
+    napcatRuntimeData = r;
+    paintNapcatRuntime();
+    scheduleNapcatRuntimePoll();
+  }).catch(function () { scheduleNapcatRuntimePoll(); });
+}
+function napcatRuntimeInstall() {
+  if (!confirm("将下载并安装 Linux QQ 与 NapCat（约 1GB 磁盘），继续？")) return;
+  api("/api/napcat/runtime/install", "POST", {}).then(function () {
+    toast("已开始部署");
+    napcatRuntimeQr = null;
+    if (napcatRuntimeData) napcatRuntimeData.installing = true;
+    paintNapcatRuntime();
+    scheduleNapcatRuntimePoll();
+  }).catch(function (e) { toast(e.message, true); });
+}
+function napcatRuntimeAction(action) {
+  api("/api/napcat/runtime/action", "POST", { action: action }).then(function (r) {
+    toast(action === "stop" ? "已停止" : action === "start" ? "已启动" : "已重启");
+    setTimeout(napcatRuntimeRefresh, 1200);
+  }).catch(function (e) { toast(e.message, true); });
+}
+function napcatShowQr() {
+  api("/api/napcat/runtime/qrcode").then(function (q) {
+    napcatRuntimeQr = q;
+    paintNapcatRuntime();
+    if (!q.available) toast("二维码还没生成，请稍后再试");
+  }).catch(function (e) { toast(e.message, true); });
 }
 
 function renderNapcat(main) {
-  main.innerHTML = pageHead("NapCat 连接配置", "设置 DeepLive 如何连接 NapCat，并查看当前 QQ 状态") +
+  if (napcatRuntimeTimer) { clearTimeout(napcatRuntimeTimer); napcatRuntimeTimer = null; }
+  napcatRuntimeData = null;
+  napcatRuntimeQr = null;
+  main.innerHTML = pageHead("NapCat 连接配置", "部署或连接 NapCat，并查看当前 QQ 状态") +
     '<div id="napcatBody"><p class=dim>加载中…</p></div>';
   Promise.all([api("/api/status"), api("/api/napcat/config")]).then(function (results) {
     var s = results[0];
     var n = results[1];
     document.getElementById("napcatBody").innerHTML =
-      '<div class="card"><div class="row" style="justify-content:space-between">' +
-      '<div><div class=stat style="font-size:20px">' + (s.bot.connected ? '<span class="pill ok">QQ 已连接</span>' : '<span class="pill bad">QQ 未连接</span>') + '</div>' +
-      '<p class=dim style="margin:6px 0 0">' + h(s.bot.nickname || "还没有获取到昵称") + " · " + h(s.bot.selfId || "未知 QQ") + '</p></div>' +
-      '<div style="text-align:right"><p class=dim style="margin:0;font-size:12px">当前连接方式</p>' +
-      '<p style="margin:4px 0 0;font-weight:600;color:#21406a">' + (s.bot.mode === "server" ? "NapCat 主动连入（server 模式）" : "主动连接 NapCat（client 模式）") + '</p></div></div></div>' +
-      '<div class="card"><h2 style="margin-top:0">连接参数</h2><p class=help>按 NapCat 面板里的设置填写。保存前会自动备份，保存后需要重启 deeplive-bot 才会生效。</p>' +
-      napcatFormHtml(n) + '</div>' +
-      '<div class="card"><h2 style="margin-top:0">连接不上怎么办？</h2><p class=help style="margin-top:0">1. 确认 NapCat 已经启动并登录 QQ。<br>2. 确认 NapCat 的连接方式和这里一致，地址、端口也相同。<br>3. QQ 登录失效时，到 NapCat 面板重新扫码。</p>' +
-      '<p class=dim style="font-size:12px;margin:0">改完参数记得先保存，再重启 deeplive-bot。</p></div>';
+      napcatStatusHtml(s) +
+      '<div id="napcatRuntime"><p class=dim>正在读取本机 NapCat 状态…</p></div>' +
+      '<details class="card npc-way2" id="napcatWay2"' + (s.bot.connected ? "" : " open") + '><summary><span class=npc-way-num>方式二</span><b>连接别的电脑上已有的 NapCat<i class=dim>（进阶）</i></b><span class=dim>你自己电脑 / 别的服务器已装好 NapCat 才用这里</span>' +
+      (n.mode !== "client" ? '<span class="pill mute">未启用</span>' : (s.bot.connected ? '<span class="pill ok">使用中</span>' : '<span class="pill warn">已配置 · 未连接</span>')) + '</summary>' +
+      '<div class=napcat-advanced-body><p class=help>按 NapCat 面板里的设置填写。保存前会自动备份，保存后需要重启 deeplive-bot 才会生效。</p>' +
+      napcatFormHtml(n) +
+      '<p class=help style="margin:14px 0 0">连接不上：1. 确认那台机器上的 NapCat 已启动并登录 QQ；2. 连接方式、地址、端口与这里一致；3. QQ 登录失效时到 NapCat 面板重新扫码。</p></div></details>';
+    napcatRuntimeRefresh();
   }).catch(function (e) {
     document.getElementById("napcatBody").innerHTML = '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>";
   });
@@ -1020,16 +1289,41 @@ function paintObTab(main) {
     if (obPromptSel) obPickPrompt(obPromptSel);
   }).catch(function (e) { body().innerHTML = '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
 }
+function napcatAccPick(v) {
+  var row = document.getElementById("napcatSelfRow");
+  var input = document.getElementById("napcatSelf");
+  if (Number(v) > 0) {
+    if (input) input.value = v;
+    if (row) row.style.display = "none";
+  } else {
+    if (row) row.style.display = "";
+    if (input) { input.value = ""; input.focus(); }
+  }
+}
+function napcatCopyUrl() {
+  var input = document.getElementById("napcatServerUrl");
+  if (!input) return;
+  var done = function () { toast("已复制，去 NapCat 粘贴即可"); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(input.value).then(done, function () { input.select(); document.execCommand("copy"); done(); });
+  } else {
+    input.select();
+    document.execCommand("copy");
+    done();
+  }
+}
 function napcatSave() {
+  var acc = document.getElementById("napcatAcc");
+  var selfVal = acc && Number(acc.value) > 0 ? Number(acc.value) : Number(document.getElementById("napcatSelf").value);
   api("/api/napcat/config", "POST", {
     mode: document.getElementById("napcatMode").value,
     wsUrl: document.getElementById("napcatWs").value.trim(),
     httpUrl: document.getElementById("napcatHttp").value.trim(),
     reverseWsPort: Number(document.getElementById("napcatPort").value),
     publicBaseUrl: document.getElementById("napcatPublic").value.trim(),
-    selfId: Number(document.getElementById("napcatSelf").value),
+    selfId: selfVal,
     accessToken: document.getElementById("napcatToken").value,
-  }).then(function () { toast("连接配置已保存，重启 deeplive-bot 后生效"); })
+  }).then(function (r) { toast(r && r.restartRequired === false ? "连接配置已保存，立即生效" : "连接配置已保存，重启 deeplive-bot 后生效"); })
     .catch(function (e) { toast(e.message, true); });
 }
 function obToggleScope(type, id, enabled) {
@@ -1197,6 +1491,14 @@ function renderToolPlugin(main, name) {
         '</div>';
     }
 
+    if (name === "image") {
+      html += '<div class="card"><h2 style="margin-top:0">人设参考图</h2>' +
+        '<p class=help>上传「AI 自己长什么样」的参考图（png/jpg/webp/gif，≤8MB）。AI 画自己/自拍时会以 persona-ref://文件名 引用它们保持形象一致；参考图跟着本插件走，插件停用后 AI 也不会再引用。</p>' +
+        '<div class=row style="margin-bottom:8px"><input type=file id=personaRefFile accept=".png,.jpg,.jpeg,.webp,.gif" style="max-width:60vw">' +
+        '<button class="btn primary" onclick="personaRefUpload()">' + icon("plus") + '上传</button></div>' +
+        '<div id=personaRefs><p class=dim>加载中…</p></div></div>';
+    }
+
     html += '<div class="card"><h2 style="margin-top:0">工具清单（' + d.tools.length + '）</h2>' +
       '<p class=help>启用时 AI 在对话中可以调用这些工具。</p><table><tr><th>工具</th><th>说明</th><th>参数</th></tr>';
     for (var i = 0; i < d.tools.length; i++) {
@@ -1221,6 +1523,7 @@ function renderToolPlugin(main, name) {
 
     main.innerHTML = pageHead(title, "工具插件详情、服务状态和试玩") + html;
     tryPaintParams();
+    personaRefsLoad();
   }).catch(function (e) { main.innerHTML = pageHead(title, "") + '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
 }
 
@@ -1313,6 +1616,252 @@ function probesReset() {
 // ─── 设置 ────────────────────────────────────────────────────────────────────
 var settingsData = null;
 
+// ─── 模型配置 ────────────────────────────────────────────────────────────────
+var modelsRawContent = "";
+
+/** 只配了一个名为 deepseek 的官方上游时，就配走小白模式。 */
+function isDeepSeekSimple(content) {
+  try {
+    var cfg = JSON.parse(content);
+    return !!(cfg.upstreams && cfg.upstreams.length === 1 &&
+      cfg.upstreams[0].name === "deepseek" &&
+      String(cfg.upstreams[0].base_url || "").replace(/\\/+$/, "") === "https://api.deepseek.com");
+  } catch (e) { return false; }
+}
+function modelsTab(t) {
+  document.getElementById("dsSimple").style.display = t === "simple" ? "block" : "none";
+  document.getElementById("dsCustom").style.display = t === "custom" ? "block" : "none";
+  var tabs = document.getElementById("modelsTabs").children;
+  for (var i = 0; i < tabs.length; i++) tabs[i].className = tabs[i].getAttribute("data-t") === t ? "on" : "";
+}
+function renderModels(main) {
+  main.innerHTML = pageHead("模型配置", "模型渠道、API 密钥与用量统计");
+  api("/api/models/config").then(function (r) {
+    modelsRawContent = r.content;
+    var simple = isDeepSeekSimple(modelsRawContent);
+    var keyMasked = "";
+    if (simple) {
+      try { keyMasked = String(JSON.parse(modelsRawContent).upstreams[0].api_key || ""); } catch (e) {}
+    }
+    var html = '<div class="card"><div class="seg" id="modelsTabs">' +
+      '<button data-t="simple" class="' + (simple ? "on" : "") + '" onclick="modelsTab(\\'simple\\')">DeepSeek</button>' +
+      '<button data-t="custom" class="' + (simple ? "" : "on") + '" onclick="modelsTab(\\'custom\\')">自定义上游</button></div>';
+    // 小白模式：只露一个 key 框，其余结构保持不动。
+    html += '<div id="dsSimple" style="display:' + (simple ? "block" : "none") + '">' +
+      '<p class=help>只需要在 <a href="https://platform.deepseek.com" target=_blank rel=noopener>DeepSeek 开放平台</a> 创建一个 API Key，粘到这里保存即可，其余配置已自动就绪。</p>' +
+      '<input type=text id=dsKey placeholder="sk-…" value="' + h(keyMasked) + '" autocomplete=off spellcheck=false>' +
+      '<div class="row" style="margin-top:10px"><button class="btn primary" onclick="dsSave()">' + icon("update") + '保存并重载</button>' +
+      '<span class=dim style="font-size:12px">密钥保存后隐藏显示，只留尾 4 位</span></div></div>';
+    // 高级模式：完整 JSON。
+    html += '<div id="dsCustom" style="display:' + (simple ? "none" : "block") + '">' +
+      '<p class=help>JSON 格式：upstreams（上游与密钥）、channels（渠道与模型）、roles（哪个角色用哪条渠道）。没有改动的掩码 key 保存时自动还原。保存后立即热重载。</p>' +
+      '<textarea id=modelsText rows=16 spellcheck=false></textarea>' +
+      '<div class="row" style="margin-top:8px"><button class="btn primary" onclick="modelsSave()">' + icon("update") + '保存并重载</button>' +
+      '<button class="btn" onclick="renderModels(document.getElementById(\\'main\\'))">' + icon("refresh") + '放弃修改</button>' +
+      '<span class=dim style="font-size:12px">改坏了可从 data/models_config.json.bak-* 备份捞回</span></div></div>';
+    html += "</div>";
+    html += '<div class="card"><div class="row" style="margin-bottom:6px"><h2 style="margin:0" class=grow>用量统计</h2>' +
+      '<button class="btn small" onclick="usageRefresh()">' + icon("refresh") + '刷新</button></div>' +
+      '<p class=help>自本次启动累计（重启清零）。失败数与最近错误可以一眼看到限流/余额事故。</p><div id=modelsUsage><p class=dim>加载中…</p></div></div>';
+    main.innerHTML = pageHead("模型配置", "模型渠道、API 密钥与用量统计") + html;
+    if (!simple) document.getElementById("modelsText").value = modelsRawContent;
+    usageRefresh();
+  }).catch(function (e) { main.innerHTML = pageHead("模型配置", "") + '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
+}
+function dsSave() {
+  var key = document.getElementById("dsKey").value.trim();
+  if (key === "") { toast("Key 不能为空", true); return; }
+  var cfg;
+  try { cfg = JSON.parse(modelsRawContent); } catch (e) { toast("当前配置不是合法 JSON，请切到「自定义上游」修", true); return; }
+  cfg.upstreams[0].api_key = key;
+  api("/api/models/config", "POST", { content: JSON.stringify(cfg, null, 2) })
+    .then(function () { toast("已保存并热重载"); renderModels(document.getElementById("main")); })
+    .catch(function (e) { toast(e.message, true); });
+}
+function fmtTok(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(n);
+}
+function usageCard(name, b, sub) {
+  var looked = b.inputTokens + b.cacheReadTokens;
+  var hit = looked > 0 ? Math.round(b.cacheReadTokens / looked * 100) : 0;
+  var cell = function (v, label) { return '<div class="ucell"><b>' + v + "</b><span>" + label + "</span></div>"; };
+  return '<div class="urow"><div class="uhead">' + h(name) +
+    "<span>" + b.requests + " 次" + (b.failures > 0 ? ' · <em style="color:var(--bad)">失败 ' + b.failures + "</em>" : "") + (sub ? " · " + h(sub) : "") + "</span></div>" +
+    '<div class="ugrid">' + cell(fmtTok(b.inputTokens), "输入") + cell(fmtTok(b.outputTokens), "输出") +
+    cell(fmtTok(b.cacheReadTokens) + " · " + hit + "%", "缓存命中") + cell(fmtTok(b.cacheWriteTokens), "缓存写入") + "</div></div>";
+}
+function usageRefresh() {
+  var box = document.getElementById("modelsUsage");
+  if (!box) return;
+  api("/api/usage").then(function (u) {
+    var since = new Date(u.since);
+    var html = '<p class=dim style="font-size:12px;margin:0 0 10px">统计起点 ' + since.toLocaleString() + "（本次启动至今）</p>";
+    if (u.total.requests === 0) {
+      html += "<p class=dim>还没有任何模型请求。</p>";
+    } else {
+      html += usageCard("合计", u.total, "");
+      var roleNames = { main: "主对话", vision: "图片理解", summary: "后台总结" };
+      var roles = Object.keys(u.byRole || {});
+      if (roles.length) {
+        html += '<div class="usec">按角色</div>';
+        for (var i = 0; i < roles.length; i++) html += usageCard(roleNames[roles[i]] || roles[i], u.byRole[roles[i]], "");
+      }
+      var models = Object.keys(u.byModel || {});
+      if (models.length) {
+        html += '<div class="usec">按模型</div>';
+        for (var j = 0; j < models.length; j++) html += usageCard(models[j], u.byModel[models[j]], "");
+      }
+    }
+    if (u.lastError) html += '<p style="font-size:12px;color:var(--bad);margin:10px 0 0">最近错误：' + h(u.lastError.message) + "</p>";
+    box.innerHTML = html;
+  }).catch(function (e) { box.innerHTML = '<p style="color:var(--bad)">' + h(e.message) + "</p>"; });
+}
+function modelsSave() {
+  api("/api/models/config", "POST", { content: document.getElementById("modelsText").value })
+    .then(function () { toast("已保存并热重载"); })
+    .catch(function (e) { toast(e.message, true); });
+}
+
+// ─── 人设编辑 ────────────────────────────────────────────────────────────────
+var personaFiles = null;
+var personaPath = "char.txt";
+
+function renderPersona(main) {
+  main.innerHTML = pageHead("人设编辑", "编辑提示词文件，并可保留多个版本随时回看");
+  api("/api/prompts").then(function (r) {
+    personaFiles = r;
+    if (!personaFiles.length) {
+      main.innerHTML = pageHead("人设编辑", "") + '<div class="card"><p class=dim>没有找到提示词文件。</p></div>';
+      return;
+    }
+    var found = false;
+    for (var i = 0; i < personaFiles.length; i++) if (personaFiles[i].path === personaPath) found = true;
+    if (!found) personaPath = personaFiles[0].path;
+    var html = '<div class="card"><div class="row" style="margin-bottom:8px"><span class=grow>文件 <select id=personaFile onchange="personaPick()" style="max-width:60vw">';
+    for (var j = 0; j < personaFiles.length; j++) {
+      var f = personaFiles[j];
+      html += '<option value="' + h(f.path) + '"' + (f.path === personaPath ? " selected" : "") + ">" + h(f.path) + "</option>";
+    }
+    html += '</select></span><span class="pill mute" id=personaDirty></span></div>' +
+      '<textarea id=personaText rows=18 oninput="personaMarkDirty()"></textarea>' +
+      '<div class="row" style="margin-top:8px"><button class="btn primary" onclick="personaSave()">' + icon("send") + '保存（立即生效）</button>' +
+      '<button class="btn" onclick="personaSnapshot()">' + icon("plus") + '把当前文件存为版本</button>' +
+      '<span class=dim style="font-size:12px">保存版本会先抓磁盘上的当前内容留档</span></div></div>';
+    html += '<div class="card"><h2 style="margin-top:0">历史版本</h2>' +
+      '<p class=help>载入只是把内容放进上面的编辑框，确认后还要点「保存」才会真正生效。</p><div id=personaVersions><p class=dim>加载中…</p></div></div>';
+    main.innerHTML = pageHead("人设编辑", "编辑提示词文件，并可保留多个版本随时回看") + html;
+    personaLoad();
+  }).catch(function (e) { main.innerHTML = pageHead("人设编辑", "") + '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
+}
+
+function personaPick() {
+  personaPath = document.getElementById("personaFile").value;
+  var dirty = document.getElementById("personaDirty");
+  if (dirty) dirty.textContent = "";
+  personaLoad();
+}
+function personaLoad() {
+  api("/api/prompt?path=" + encodeURIComponent(personaPath)).then(function (r) {
+    document.getElementById("personaText").value = r.content;
+    var dirty = document.getElementById("personaDirty");
+    if (dirty) dirty.textContent = "";
+    personaVersionsLoad();
+  }).catch(function (e) { toast(e.message, true); });
+}
+function personaMarkDirty() {
+  var dirty = document.getElementById("personaDirty");
+  if (dirty && dirty.textContent === "") dirty.textContent = "有未保存修改";
+}
+function personaSave() {
+  api("/api/prompt", "POST", { path: personaPath, content: document.getElementById("personaText").value })
+    .then(function () {
+      toast("已保存，下次对话即用新人设");
+      var dirty = document.getElementById("personaDirty");
+      if (dirty) dirty.textContent = "";
+    })
+    .catch(function (e) { toast(e.message, true); });
+}
+function personaSnapshot() {
+  var label = prompt("给这个版本起个名字（可留空）：", "");
+  if (label === null) return;
+  api("/api/prompt/versions", "POST", { path: personaPath, label: label })
+    .then(function (r) { toast("已存版本（" + (r.version.bytes) + " 字节）"); personaVersionsLoad(); })
+    .catch(function (e) { toast(e.message, true); });
+}
+function personaVersionsLoad() {
+  var box = document.getElementById("personaVersions");
+  if (!box) return;
+  api("/api/prompt/versions?path=" + encodeURIComponent(personaPath)).then(function (r) {
+    if (!r.versions.length) { box.innerHTML = '<p class=dim>还没有版本。编辑后点「把当前文件存为版本」留一份底。</p>'; return; }
+    var html = "<table><tr><th>时间</th><th>名称</th><th>预览</th><th></th></tr>";
+    for (var i = 0; i < r.versions.length; i++) {
+      var v = r.versions[i];
+      html += '<tr><td class=mono style="font-size:12px;white-space:nowrap">' + new Date(v.savedAt).toLocaleString() + "</td>" +
+        "<td>" + h(v.label || "—") + ' <span class=dim style="font-size:11px">' + v.bytes + " B</span></td>" +
+        '<td class=dim style="font-size:12px;max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + h(v.preview) + "</td>" +
+        '<td style="white-space:nowrap"><button class="btn small" onclick="personaVersionLoad(\\'' + h(v.id) + '\\')">载入</button> ' +
+        '<button class="btn small danger" onclick="personaVersionDrop(\\'' + h(v.id) + '\\')">删除</button></td></tr>';
+    }
+    box.innerHTML = html + "</table>";
+  }).catch(function (e) { box.innerHTML = '<p style="color:var(--bad)">' + h(e.message) + "</p>"; });
+}
+function personaVersionLoad(id) {
+  api("/api/prompt/version?path=" + encodeURIComponent(personaPath) + "&id=" + encodeURIComponent(id))
+    .then(function (r) {
+      document.getElementById("personaText").value = r.content;
+      personaMarkDirty();
+      toast("已载入到编辑框，确认后点「保存」生效");
+    })
+    .catch(function (e) { toast(e.message, true); });
+}
+function personaVersionDrop(id) {
+  if (!confirm("删除这个版本？不可恢复。")) return;
+  api("/api/prompt/version/delete", "POST", { path: personaPath, id: id })
+    .then(function () { toast("已删除"); personaVersionsLoad(); })
+    .catch(function (e) { toast(e.message, true); });
+}
+function personaRefsLoad() {
+  var box = document.getElementById("personaRefs");
+  if (!box) return;
+  api("/api/persona-refs").then(function (r) {
+    if (!r.refs.length) { box.innerHTML = '<p class=dim>还没有参考图。上传几张 AI 的定妆照，它画自己时就能保持形象。</p>'; return; }
+    var html = '<div class=row style="flex-wrap:wrap;gap:8px">';
+    for (var i = 0; i < r.refs.length; i++) {
+      var ref = r.refs[i];
+      var u = "/api/persona-refs/file?token=" + encodeURIComponent(TOKEN) + "&name=" + encodeURIComponent(ref.name);
+      html += '<div style="width:120px;text-align:center">' +
+        '<a href="' + h(u) + '" target=_blank><img src="' + h(u) + '" style="width:120px;height:120px;object-fit:cover;border-radius:8px;display:block"></a>' +
+        '<div class=mono style="font-size:11px;margin:4px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + h("persona-ref://" + ref.name) + '">' + h(ref.name) + "</div>" +
+        '<button class="btn small danger" onclick="personaRefDrop(\\\'' + h(ref.name) + '\\\')">删除</button></div>';
+    }
+    box.innerHTML = html + "</div>";
+  }).catch(function (e) { box.innerHTML = '<p style="color:var(--bad)">' + h(e.message) + "</p>"; });
+}
+function personaRefUpload() {
+  var input = document.getElementById("personaRefFile");
+  var file = input && input.files && input.files[0];
+  if (!file) { toast("先选一张图片", true); return; }
+  var reader = new FileReader();
+  reader.onload = function () {
+    var data = String(reader.result || "");
+    var comma = data.indexOf(",");
+    if (comma < 0) { toast("读图失败", true); return; }
+    api("/api/persona-refs", "POST", { name: file.name, data: data.slice(comma + 1) })
+      .then(function () { toast("已上传 " + file.name); input.value = ""; personaRefsLoad(); })
+      .catch(function (e) { toast(e.message, true); });
+  };
+  reader.readAsDataURL(file);
+}
+function personaRefDrop(name) {
+  if (!confirm("删除参考图 " + name + "？")) return;
+  api("/api/persona-refs/delete", "POST", { name: name })
+    .then(function () { toast("已删除"); personaRefsLoad(); })
+    .catch(function (e) { toast(e.message, true); });
+}
+
+// ─── 设置 ────────────────────────────────────────────────────────────────────
 function renderSettings(main) {
   main.innerHTML = pageHead("设置", "管理自动回复、工具插件、模型和本地数据");
   api("/api/settings").then(function (s) {
@@ -1333,6 +1882,16 @@ function renderSettings(main) {
       '<p class=dim style="font-size:12px;margin:8px 0 0">主人的 QQ 私聊始终保持启用，避免无法联系主 AI。</p>' +
       '<div class="row" style="margin-top:10px;border-top:1px solid var(--line);padding-top:12px"><button class="btn" onclick="guideReplay()">' + icon("spark") + '重看新手引导</button>' +
       '<span class=dim style="font-size:12px">三步检查：QQ 连接、模型渠道、自动回复范围</span></div></div>';
+
+    var idn = s.identity || { masterQq: 0, adminQq: 0 };
+    html += '<div class="card"><h2 style="margin-top:0">身份与权限</h2>' +
+      '<p class=help>号主 QQ = 这个机器人账号的主人：享有最高信任，不会被踢出/禁言/删好友。管理员 QQ 拥有面板外的管理权限。两者不能相同。主AI 是系统内部的上级 agent（调配各子AI、在它们之间传话），没有 QQ 号——在「主 AI 对话」页直接与它交流。</p>' +
+      '<div class="row" style="margin-bottom:8px"><span style="min-width:120px">号主 QQ</span>' +
+      '<input type=text id=idMasterQq inputmode=numeric placeholder="QQ 号" value="' + h(String(idn.masterQq || "")) + '" autocomplete=off spellcheck=false class=grow></div>' +
+      '<div class="row" style="margin-bottom:8px"><span style="min-width:120px">管理员 QQ</span>' +
+      '<input type=text id=idAdminQq inputmode=numeric placeholder="QQ 号" value="' + h(String(idn.adminQq || "")) + '" autocomplete=off spellcheck=false class=grow></div>' +
+      '<div class="row"><button class="btn primary" onclick="identitySave()">' + icon("update") + '保存</button>' +
+      '<span class=dim style="font-size:12px">写入 config.json，重启 deeplive-bot 后生效（保存前自动留 .bak 备份）</span></div></div>';
 
     html += '<div class="card"><h2 style="margin-top:0">工具插件</h2><p class=help>插件为 AI 提供查天气、搜小说等额外能力，停用后不影响其他功能。</p>';
     if (s.plugins.length === 0) html += '<p class=dim>还没有安装工具插件。</p>';
@@ -1355,12 +1914,6 @@ function renderSettings(main) {
       html += "</table>";
     }
     html += "</div>";
-
-    html += '<div class="card"><h2 style="margin-top:0">模型设置（高级）</h2><p class=help>用于更换模型渠道、地址和密钥；不确定时请勿修改。</p>' +
-      '<button class="btn" onclick="modelsEdit()">' + icon("cpu") + '编辑模型配置</button> <span class=dim style="font-size:12px">保存后立即生效，密钥会隐藏显示</span>' +
-      '<div id=modelsEditor style="display:none;margin-top:10px"><textarea id=modelsText rows=16></textarea>' +
-      '<div class="row" style="margin-top:8px"><button class="btn primary" onclick="modelsSave()">保存并重载</button>' +
-      '<button class="btn" onclick="document.getElementById(\\'modelsEditor\\').style.display=\\'none\\'">收起</button></div></div></div>';
 
     html += '<div class="card"><div class="row" style="margin-bottom:6px"><h2 style="margin:0" class=grow>数据清理（谨慎操作）</h2>' +
       '<button class="btn small" onclick="loadDataDirs()">' + icon("refresh") + '刷新</button></div>' +
@@ -1385,21 +1938,20 @@ function settingsApply() {
     })
     .catch(function (e) { toast(e.message, true); });
 }
+function identitySave() {
+  var master = document.getElementById("idMasterQq").value.trim();
+  var admin = document.getElementById("idAdminQq").value.trim();
+  if (!/^\\d{5,10}$/.test(master)) { toast("号主 QQ 须为 5~10 位数字", true); return; }
+  if (!/^\\d{5,10}$/.test(admin)) { toast("管理员 QQ 须为 5~10 位数字", true); return; }
+  if (master === admin) { toast("号主与管理员不能是同一个 QQ", true); return; }
+  api("/api/settings/identity", "POST", { masterQq: Number(master), adminQq: Number(admin) })
+    .then(function () { toast("已保存，重启 deeplive-bot 后生效"); })
+    .catch(function (e) { toast(e.message, true); });
+}
 function pluginToggle(name, enabled) {
   api("/api/plugins/toggle", "POST", { name: name, enabled: enabled })
     .then(function () { toast(name + (enabled ? " 已启用" : " 已停用")); loadPlugins().then(route); })
     .catch(function (e) { toast(e.message, true); route(); });
-}
-function modelsEdit() {
-  api("/api/models/config").then(function (r) {
-    document.getElementById("modelsText").value = r.content;
-    document.getElementById("modelsEditor").style.display = "block";
-  }).catch(function (e) { toast(e.message, true); });
-}
-function modelsSave() {
-  api("/api/models/config", "POST", { content: document.getElementById("modelsText").value })
-    .then(function () { toast("已保存并热重载"); })
-    .catch(function (e) { toast(e.message, true); });
 }
 function loadDataDirs() {
   var box = document.getElementById("dataDirs");
@@ -1467,6 +2019,36 @@ function guideSkip() { document.getElementById("guide").classList.remove("show")
 function guideFinish() { localStorage.setItem("dl_guide_done", "1"); guideSkip(); toast("随时可以在「设置」里重看新手引导"); }
 function guideReplay() { localStorage.removeItem("dl_guide_done"); guideStart(); }
 function guideGo(route) { guideSkip(); location.hash = "#/" + route; }
+function guideStep2Save() {
+  var master = document.getElementById("gdMasterQq");
+  var admin = document.getElementById("gdAdminQq");
+  var keyEl = document.getElementById("gdKey");
+  var jobs = [];
+  // Key：只在小白模式且用户真改了（不是原掩码）才提交，掩码原样保存后端也能还原，但少一次写盘。
+  if (keyEl) {
+    var key = keyEl.value.trim();
+    if (key !== "" && key !== keyEl.defaultValue) {
+      jobs.push(api("/api/models/config").then(function (r) {
+        var cfg;
+        try { cfg = JSON.parse(r.content); } catch (e) { throw new Error("当前模型配置不是合法 JSON，请到「模型配置」页处理"); }
+        if (!isDeepSeekSimple(r.content)) throw new Error("模型配置已不是 DeepSeek 小白模式，请到「模型配置」页修改");
+        cfg.upstreams[0].api_key = key;
+        return api("/api/models/config", "POST", { content: JSON.stringify(cfg, null, 2) });
+      }));
+    }
+  }
+  if (master && admin) {
+    var m = master.value.trim(), a = admin.value.trim();
+    if (m !== master.defaultValue || a !== admin.defaultValue) {
+      if (!/^\\d{5,10}$/.test(m) || !/^\\d{5,10}$/.test(a)) { toast("两个 QQ 都须为 5~10 位数字", true); return; }
+      if (m === a) { toast("号主与管理员不能是同一个 QQ", true); return; }
+      jobs.push(api("/api/settings/identity", "POST", { masterQq: Number(m), adminQq: Number(a) }));
+    }
+  }
+  if (jobs.length === 0) { toast("没有改动需要保存"); return; }
+  Promise.all(jobs).then(function () { toast("已保存（QQ 变更重启 deeplive-bot 后生效）"); })
+    .catch(function (e) { toast(e.message, true); });
+}
 
 function guidePaint() {
   var card = document.getElementById("guideCard");
@@ -1492,14 +2074,30 @@ function guidePaint() {
       }
     }).catch(function () { var el = document.getElementById("guideInfo"); if (el) el.textContent = "状态获取失败，可先跳过，稍后在首页查看。"; });
   } else if (guideStep === 1) {
-    card.innerHTML = dots + '<div class="eyebrow">第 2 步 · 共 3 步</div><h2>检查模型渠道</h2>' +
-      '<p>AI 回复依赖模型渠道。下方是当前配置，若为空或报错，请到「设置」页编辑模型配置。</p><p id=guideInfo>正在读取模型配置…</p>' + foot;
-    api("/api/models").then(function (m) {
-      var el = document.getElementById("guideInfo");
+    card.innerHTML = dots + '<div class="eyebrow">第 2 步 · 共 3 步</div><h2>填 API Key 与身份 QQ</h2>' +
+      '<p>AI 回复依赖模型渠道；号主与管理员的 QQ 决定权限归属。可以直接在下面填好，也可以之后到「设置」页再配。</p><div id=guideForm><p class=dim>正在读取当前配置…</p></div>' +
+      '<div class="row" style="margin-top:10px"><button class="btn" onclick="guideStep2Save()">' + icon("update") + '保存本页填写</button>' +
+      '<span class=dim style="font-size:12px">QQ 变更需要重启 deeplive-bot 生效</span></div>' + foot;
+    Promise.all([api("/api/models/config"), api("/api/settings")]).then(function (rs) {
+      var el = document.getElementById("guideForm");
       if (!el) return;
-      var firstLine = (m.text || "").split("\\n")[0] || "";
-      el.innerHTML = firstLine ? '当前渠道：<span class="guide-ok">' + h(firstLine) + "</span>" : '还没有可用渠道，请到「设置」页配置模型。';
-    }).catch(function () { var el = document.getElementById("guideInfo"); if (el) el.textContent = "模型配置读取失败，请到「设置」页检查。"; });
+      var simple = isDeepSeekSimple(rs[0].content);
+      var keyMasked = "";
+      if (simple) { try { keyMasked = String(JSON.parse(rs[0].content).upstreams[0].api_key || ""); } catch (e) {} }
+      var idn = rs[1].identity || { masterQq: 0, adminQq: 0 };
+      var html = "";
+      if (simple) {
+        html += '<div class="row" style="margin-bottom:8px"><span style="min-width:96px">DeepSeek Key</span>' +
+          '<input type=text id=gdKey placeholder="sk-…" value="' + h(keyMasked) + '" autocomplete=off spellcheck=false class=grow></div>';
+      } else {
+        html += '<p class=help style="margin:0 0 8px">模型渠道：<span class="guide-ok">已配置自定义上游</span>（密钥请到「模型配置」页修改）。</p>';
+      }
+      html += '<div class="row" style="margin-bottom:8px"><span style="min-width:96px">号主 QQ</span>' +
+        '<input type=text id=gdMasterQq inputmode=numeric placeholder="QQ 号" value="' + h(String(idn.masterQq || "")) + '" autocomplete=off spellcheck=false class=grow></div>' +
+        '<div class="row"><span style="min-width:96px">管理员 QQ</span>' +
+        '<input type=text id=gdAdminQq inputmode=numeric placeholder="QQ 号" value="' + h(String(idn.adminQq || "")) + '" autocomplete=off spellcheck=false class=grow></div>';
+      el.innerHTML = html;
+    }).catch(function () { var el = document.getElementById("guideForm"); if (el) el.textContent = "配置读取失败，可先跳过，稍后在「设置」页填写。"; });
   } else {
     card.innerHTML = dots + '<div class="eyebrow">第 3 步 · 共 3 步</div><h2>选择自动回复范围</h2>' +
       '<p id=guideInfo>正在统计会话…</p>' + foot;

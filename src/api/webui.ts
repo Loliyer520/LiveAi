@@ -14,19 +14,23 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { join, resolve, sep } from 'node:path';
+import { mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import type { AgentRecord } from '../store/repository.js';
 import type { UsageSnapshot } from '../models/usage.js';
 import type { KbEntry, KbMount, KbPendingItem, KbPermission } from '../knowledge/kb.js';
 import type { PersonRecord, ScopeRecord } from '../relations/graph.js';
 import type { PluginInfo, PluginToolDetail, PluginTryResult } from '../chat/plugins.js';
 import { webFetch } from '../chat/net.js';
+import { listPersonaRefs, savePersonaRef, deletePersonaRef, readPersonaRef } from '../store/persona-refs.js';
 import { probeReset, probeSnapshot } from '../observability/probe.js';
+import type { NapcatActionResult, NapcatQrcode, NapcatRuntimeStatus } from '../napcat/runtime.js';
+import { isMasterScope } from '../chat/types.js';
 
 export interface WebuiDeps {
-  /** 号主 QQ：主AI会话禁止被关（防失联），同 scope_manage 的护栏。 */
+  /** 号主 QQ（号主身份；主AI 是 master:core，与此无关）：对话页区分号主消息。 */
   readonly masterQq: number;
   /** 提示词目录（data/prompt），读写都限死在里面。 */
   readonly promptDir: string;
@@ -54,7 +58,7 @@ export interface WebuiDeps {
   readonly usage: { snapshot(): UsageSnapshot };
   /** 网页主AI对话：注入主AI会话（admin_webui 来源）。 */
   readonly injectAdmin: (text: string) => void;
-  /** 主AI会话历史（private:masterQq），面板对话轮询用。 */
+  /** 主AI会话历史（master:core，上级 agent 的虚拟会话），面板对话轮询用。 */
   readonly masterHistory: () => { user_id: number; nickname: string; text: string; timestamp: number }[];
   /** models_config.json 的绝对路径与热重载。 */
   readonly modelsConfigPath: string;
@@ -85,6 +89,17 @@ export interface WebuiDeps {
     getConfig(name: string): { spec: Record<string, unknown>; values: Record<string, string | number | boolean> } | null;
     setConfig(name: string, values: Record<string, unknown>): Record<string, string | number | boolean>;
   } | null;
+
+  // ── 本机 NapCat 运行环境（NapCat 页的「一键部署」卡片） ─────────────────
+  /** 保存连接配置时热更 access_token（免重启）。 */
+  readonly napcat?: { setAccessToken(token: string): void };
+  readonly napcatRuntime: {
+    status(): Promise<NapcatRuntimeStatus>;
+    install(): Promise<{ ok: boolean; error?: string }>;
+    control(action: 'start' | 'stop' | 'restart'): Promise<NapcatActionResult>;
+    qrcode(): Promise<NapcatQrcode>;
+    logs(lines?: number): Promise<{ install: string[]; service: string[] }>;
+  };
 
   // ── 关系网（Onebot 桥 · 关系网选项卡） ─────────────────────────────────
   readonly relations: {
@@ -143,8 +158,25 @@ export async function handleWebui(
     }
     return;
   }
+  // favicon 免鉴权：浏览器拉图标不带 token/Authorization，图片本身无敏感内容。
+  if (request.method === 'GET' && url.pathname === '/favicon.png') {
+    const icon = await readFile(join(dirname(deps.configPath), 'favicon.png')).catch(() => null);
+    if (icon === null) {
+      sendJson(response, 404, { error: 'no favicon' });
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'max-age=3600' });
+    response.end(icon);
+    return;
+  }
+
   if (!authorized(request, url, deps)) {
     sendJson(response, 401, { error: 'unauthorized' });
+    return;
+  }
+  // 跨站写请求护栏：面板自身/curl 不受影响，恶意网页的表单或 fetch 会被挡。
+  if (request.method !== 'GET' && request.method !== 'HEAD' && request.method !== 'OPTIONS' && isCrossSiteRequest(request)) {
+    sendJson(response, 403, { error: 'cross-site request rejected' });
     return;
   }
 
@@ -181,10 +213,9 @@ export async function handleWebui(
     // ── 会话（Onebot 桥 · 会话管控选项卡；也供设置页总开关统计） ─────────────
     if (request.method === 'GET' && url.pathname === '/api/scopes') {
       const agents = deps.repo.listAgents();
-      const masterId = String(deps.masterQq);
       agents.sort((a, b) => {
-        const am = a.scopeType === 'private' && a.scopeId === masterId ? 0 : 1;
-        const bm = b.scopeType === 'private' && b.scopeId === masterId ? 0 : 1;
+        const am = isMasterScope(a.scopeType, a.scopeId) ? 0 : 1;
+        const bm = isMasterScope(b.scopeType, b.scopeId) ? 0 : 1;
         if (am !== bm) return am - bm;
         if (a.scopeType !== b.scopeType) return a.scopeType === 'private' ? -1 : 1;
         return a.scopeId.localeCompare(b.scopeId);
@@ -194,7 +225,7 @@ export async function handleWebui(
         scopeId: a.scopeId,
         displayName: a.displayName,
         enabled: a.enabled !== false,
-        isMaster: a.scopeType === 'private' && a.scopeId === masterId,
+        isMaster: isMasterScope(a.scopeType, a.scopeId),
         triggerRate: a.triggerRate,
         triggerWords: a.triggerWords,
         hasPersona: a.persona.trim() !== '',
@@ -213,10 +244,6 @@ export async function handleWebui(
       }
       const patch: Partial<AgentRecord> = {};
       if (body.enabled !== undefined) {
-        if (body.enabled === false && scopeType === 'private' && scopeId === String(deps.masterQq)) {
-          sendJson(response, 400, { error: '主AI会话不能关闭（防失联）' });
-          return;
-        }
         patch.enabled = body.enabled === true;
       }
       if (body.triggerRate !== undefined) {
@@ -276,6 +303,71 @@ export async function handleWebui(
       await writeFile(abs, content, 'utf-8');
       deps.invalidatePrompts();
       sendJson(response, 200, { ok: true });
+      return;
+    }
+
+    // ── 人设版本（人设编辑页）：快照/列表/回读/删除 ──────────────────────────
+    if (request.method === 'GET' && url.pathname === '/api/prompt/versions') {
+      const abs = safePromptPath(deps.promptDir, url.searchParams.get('path') ?? '');
+      if (abs === null) { sendJson(response, 400, { error: '路径不合法' }); return; }
+      sendJson(response, 200, { versions: await listPromptVersions(deps.promptDir, url.searchParams.get('path') ?? '') });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/prompt/versions') {
+      const body = (await readBody(request)) as Record<string, unknown>;
+      const rel = String(body.path ?? '');
+      const abs = safePromptPath(deps.promptDir, rel);
+      if (abs === null) { sendJson(response, 400, { error: '路径不合法' }); return; }
+      const created = await savePromptVersion(deps.promptDir, rel, String(body.label ?? ''));
+      sendJson(response, 200, { ok: true, version: created });
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/api/prompt/version') {
+      const abs = safePromptPath(deps.promptDir, url.searchParams.get('path') ?? '');
+      const id = String(url.searchParams.get('id') ?? '');
+      if (abs === null || !/^\d{13,}$/.test(id)) { sendJson(response, 400, { error: '参数不合法' }); return; }
+      const content = await readFile(versionFile(deps.promptDir, url.searchParams.get('path') ?? '', id), 'utf-8')
+        .catch(() => null);
+      if (content === null) { sendJson(response, 404, { error: '没有这个版本' }); return; }
+      sendJson(response, 200, { content });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/prompt/version/delete') {
+      const body = (await readBody(request)) as Record<string, unknown>;
+      const abs = safePromptPath(deps.promptDir, String(body.path ?? ''));
+      const id = String(body.id ?? '');
+      if (abs === null || !/^\d{13,}$/.test(id)) { sendJson(response, 400, { error: '参数不合法' }); return; }
+      await unlink(versionFile(deps.promptDir, String(body.path ?? ''), id)).catch(() => undefined);
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+
+    // ── 人设参考图（人设编辑页）：列表 / 上传 / 删除 / 预览 ─────────────────
+    if (request.method === 'GET' && url.pathname === '/api/persona-refs') {
+      sendJson(response, 200, { refs: listPersonaRefs() });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/persona-refs') {
+      try {
+        const body = (await readBody(request)) as Record<string, unknown>;
+        const ref = savePersonaRef(String(body.name ?? ''), String(body.data ?? ''));
+        sendJson(response, 200, { ok: true, ref });
+      } catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/persona-refs/delete') {
+      const body = (await readBody(request)) as Record<string, unknown>;
+      const removed = deletePersonaRef(String(body.name ?? ''));
+      sendJson(response, 200, { ok: removed });
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/api/persona-refs/file') {
+      const ref = readPersonaRef(url.searchParams.get('name') ?? '');
+      if (ref === null) { sendJson(response, 404, { error: '没有这张参考图' }); return; }
+      response.writeHead(200, { 'content-type': ref.contentType, 'cache-control': 'no-cache' });
+      response.end(ref.data);
       return;
     }
 
@@ -344,11 +436,13 @@ export async function handleWebui(
         sendJson(response, 400, { error: problem });
         return;
       }
-      // 留备份再覆盖：改坏了还能从 .bak 捞回来。
+      // 留备份（滚动保留 10 份）再原子覆盖：改坏了还能从 .bak 捞回来。
       if (previous !== '') {
-        await writeFile(`${deps.modelsConfigPath}.bak-${Date.now()}`, previous, 'utf-8');
+        await backupConfigWithRetention(deps.modelsConfigPath, previous);
       }
-      await writeFile(deps.modelsConfigPath, content, 'utf-8');
+      const modelsTmp = `${deps.modelsConfigPath}.${randomUUID().slice(0, 8)}.tmp`;
+      await writeFile(modelsTmp, content, 'utf-8');
+      await rename(modelsTmp, deps.modelsConfigPath);
       await deps.reloadModels();
       sendJson(response, 200, { ok: true });
       return;
@@ -356,6 +450,12 @@ export async function handleWebui(
 
     if (request.method === 'GET' && url.pathname === '/api/models') {
       sendJson(response, 200, { text: deps.models.summaryText() });
+      return;
+    }
+
+    // ── 用量统计（模型配置页）：完整快照，含角色/模型分解 ────────────────────
+    if (request.method === 'GET' && url.pathname === '/api/usage') {
+      sendJson(response, 200, deps.usage.snapshot());
       return;
     }
 
@@ -592,69 +692,166 @@ export async function handleWebui(
     if (request.method === 'GET' && url.pathname === '/api/napcat/config') {
       const config = await readConfigJson(deps.configPath);
       const napcat = config.napcat ?? {};
-      sendJson(response, 200, napcatSettings(napcat));
+      const settings = napcatSettings(napcat);
+      // 登录过本 bot 的账号花名册：当前连接的账号自动登记，供表单直接选号。
+      const rosterPath = resolve(deps.configPath, '..', 'napcat-accounts.json');
+      let roster: { id: number; nickname: string; lastSeen: number }[] = [];
+      try {
+        const raw = JSON.parse(await readFile(rosterPath, 'utf-8')) as { accounts?: unknown };
+        if (Array.isArray(raw.accounts)) {
+          roster = raw.accounts
+            .filter((a): a is Record<string, unknown> => typeof a === 'object' && a !== null)
+            .map((a) => ({ id: Number(a.id ?? 0), nickname: String(a.nickname ?? ''), lastSeen: Number(a.lastSeen ?? 0) || 0 }))
+            .filter((a) => Number.isSafeInteger(a.id) && a.id > 10000);
+        }
+      } catch { /* 没有花名册就从空开始 */ }
+      const connectedId = Number(deps.bot.selfId);
+      if (deps.bot.connected && Number.isSafeInteger(connectedId) && connectedId > 10000) {
+        const nick = String(deps.bot.selfNickname ?? '').trim();
+        const found = roster.find((a) => a.id === connectedId);
+        if (found) {
+          if (nick) found.nickname = nick;
+          found.lastSeen = Date.now();
+        } else {
+          roster.push({ id: connectedId, nickname: nick, lastSeen: Date.now() });
+        }
+        roster.sort((a, b) => b.lastSeen - a.lastSeen);
+        await writeFile(rosterPath, JSON.stringify({ accounts: roster.slice(0, 20) }, null, 1), 'utf-8').catch(() => undefined);
+      }
+      // 服务端连接地址：主机取浏览器访问用的 host，端口取监听端口，可直接粘进 NapCat。
+      const host = String(request.headers.host ?? '').split(':')[0] || '127.0.0.1';
+      const serverUrl = settings.mode === 'server' && settings.reverseWsPort > 0
+        ? `ws://${host}:${settings.reverseWsPort}/deeplive-bind`
+        : '';
+      sendJson(response, 200, {
+        ...settings,
+        knownAccounts: roster,
+        connectedId: deps.bot.connected ? connectedId : 0,
+        serverUrl,
+        // 服务端模式没配 WS Token：只有同机 NapCat 能连进来，远程会被拒——提前亮黄灯。
+        warn: settings.mode === 'server' && String(napcat.access_token ?? '') === ''
+          ? '未配置 WS Token，仅本机 NapCat 能连入；远程连接请先生成 token'
+          : '',
+      });
       return;
     }
 
     if (request.method === 'POST' && url.pathname === '/api/napcat/config') {
       const body = (await readBody(request)) as Record<string, unknown>;
-      const config = await readConfigJson(deps.configPath);
-      const previous = config.napcat ?? {};
-      const mode = String(body.mode ?? previous.mode ?? '').trim();
-      const reverseWsPort = Number(body.reverseWsPort ?? previous.reverse_ws_port ?? 0);
-      const selfId = Number(body.selfId ?? previous.self_id ?? 0);
-      const wsUrl = restoreUrlSecrets(
-        String(body.wsUrl ?? previous.ws_url ?? '').trim(),
-        String(previous.ws_url ?? ''),
-      );
-      const httpUrl = String(body.httpUrl ?? previous.http_url ?? '').trim();
-      const publicBaseUrl = String(body.publicBaseUrl ?? previous.public_base_url ?? '').trim().replace(/\/+$/, '');
-      if (mode !== 'server' && mode !== 'client') {
-        sendJson(response, 400, { error: '连接方式只能是 server 或 client' });
-        return;
-      }
-      if (!Number.isInteger(reverseWsPort) || reverseWsPort < 0 || reverseWsPort > 65535 || (mode === 'server' && reverseWsPort === 0)) {
-        sendJson(response, 400, { error: '监听端口须为 1–65535；主动连接模式可填 0' });
-        return;
-      }
-      if (!Number.isSafeInteger(selfId) || selfId < 0) {
-        sendJson(response, 400, { error: '机器人 QQ 必须是非负整数，未知时可填 0' });
-        return;
-      }
-      if (!validConfigUrl(wsUrl, ['ws:', 'wss:']) || !validConfigUrl(httpUrl, ['http:', 'https:']) || !validConfigUrl(publicBaseUrl, ['http:', 'https:'])) {
-        sendJson(response, 400, { error: '地址格式不正确：WS 用 ws:// 或 wss://，HTTP 用 http:// 或 https://' });
-        return;
-      }
-      if (mode === 'client' && wsUrl === '') {
-        sendJson(response, 400, { error: '主动连接 NapCat 时必须填写 WebSocket 地址' });
-        return;
-      }
-      if (wsUrl.includes(SECRET_MASK)) {
-        sendJson(response, 400, { error: 'WS 地址中的 Token 掩码无法还原，请重新填写完整地址' });
-        return;
-      }
-      const submittedToken = String(body.accessToken ?? '').trim();
-      const accessToken = submittedToken === '' || submittedToken === SECRET_MASK
-        ? String(previous.access_token ?? '')
-        : submittedToken;
-      config.napcat = {
-        ...previous,
-        mode,
-        ws_url: wsUrl,
-        http_url: httpUrl,
-        reverse_ws_port: reverseWsPort,
-        public_base_url: publicBaseUrl,
-        self_id: selfId,
-        access_token: accessToken,
+      // 校验在串行写队列内做：validation error 置 errorOut 并中止写入。
+      let errorOut: { status: number; message: string } | null = null;
+      let accessToken = '';
+      let previous: Record<string, unknown> = {};
+      let nextValues: { mode: string; wsUrl: string; httpUrl: string; reverseWsPort: number; publicBaseUrl: string; selfId: number } | null = null;
+      const fail = (status: number, message: string): false => {
+        errorOut = { status, message };
+        return false;
       };
-      const before = await readFile(deps.configPath, 'utf-8').catch(() => '');
-      if (before !== '') await writeFile(`${deps.configPath}.bak-${Date.now()}`, before, 'utf-8');
-      await writeFile(deps.configPath, JSON.stringify(config, null, 2), 'utf-8');
-      sendJson(response, 200, { ok: true, restartRequired: true });
+      try {
+        await updateConfigJson(deps.configPath, (config) => {
+          previous = config.napcat ?? {};
+          const mode = String(body.mode ?? previous.mode ?? '').trim();
+          const reverseWsPort = Number(body.reverseWsPort ?? previous.reverse_ws_port ?? 0);
+          const selfId = Number(body.selfId ?? previous.self_id ?? 0);
+          const wsUrl = restoreUrlSecrets(
+            String(body.wsUrl ?? previous.ws_url ?? '').trim(),
+            String(previous.ws_url ?? ''),
+          );
+          const httpUrl = String(body.httpUrl ?? previous.http_url ?? '').trim();
+          const publicBaseUrl = String(body.publicBaseUrl ?? previous.public_base_url ?? '').trim().replace(/\/+$/, '');
+          if (mode !== 'server' && mode !== 'client') return fail(400, '连接方式只能是 server 或 client');
+          if (!Number.isInteger(reverseWsPort) || reverseWsPort < 0 || reverseWsPort > 65535 || (mode === 'server' && reverseWsPort === 0)) {
+            return fail(400, '监听端口须为 1–65535；主动连接模式可填 0');
+          }
+          if (!Number.isSafeInteger(selfId) || selfId < 0) return fail(400, '机器人 QQ 必须是非负整数，未知时可填 0');
+          if (!validConfigUrl(wsUrl, ['ws:', 'wss:']) || !validConfigUrl(httpUrl, ['http:', 'https:']) || !validConfigUrl(publicBaseUrl, ['http:', 'https:'])) {
+            return fail(400, '地址格式不正确：WS 用 ws:// 或 wss://，HTTP 用 http:// 或 https://');
+          }
+          if (mode === 'client' && wsUrl === '') return fail(400, '主动连接 NapCat 时必须填写 WebSocket 地址');
+          if (wsUrl.includes(SECRET_MASK)) return fail(400, 'WS 地址中的 Token 掩码无法还原，请重新填写完整地址');
+          const submittedToken = String(body.accessToken ?? '').trim();
+          accessToken = body.clearToken === true
+            ? ''
+            : submittedToken === '' || submittedToken === SECRET_MASK
+              ? String(previous.access_token ?? '')
+              : submittedToken;
+          config.napcat = {
+            ...previous,
+            mode,
+            ws_url: wsUrl,
+            http_url: httpUrl,
+            reverse_ws_port: reverseWsPort,
+            public_base_url: publicBaseUrl,
+            self_id: selfId,
+            access_token: accessToken,
+          };
+          nextValues = { mode, wsUrl, httpUrl, reverseWsPort, publicBaseUrl, selfId };
+          return true;
+        });
+      } catch (error) {
+        if (error instanceof ConfigCorruptError) {
+          sendJson(response, 409, { error: error.message });
+          return;
+        }
+        throw error;
+      }
+      if (errorOut !== null) {
+        sendJson(response, (errorOut as { status: number }).status, { error: (errorOut as { message: string }).message });
+        return;
+      }
+      // token 热更：新连接立即按新值校验，其余改动（端口/模式/地址）仍需重启。
+      const tokenChanged = accessToken !== String(previous.access_token ?? '');
+      if (tokenChanged) deps.napcat?.setAccessToken(accessToken);
+      const next = nextValues as unknown as { mode: string; wsUrl: string; httpUrl: string; reverseWsPort: number; publicBaseUrl: string; selfId: number };
+      const restartRequired =
+        next.mode !== String(previous.mode ?? next.mode)
+        || next.reverseWsPort !== Number(previous.reverse_ws_port ?? next.reverseWsPort)
+        || next.wsUrl !== String(previous.ws_url ?? next.wsUrl)
+        || next.httpUrl !== String(previous.http_url ?? next.httpUrl)
+        || next.publicBaseUrl !== String(previous.public_base_url ?? next.publicBaseUrl)
+        || next.selfId !== Number(previous.self_id ?? next.selfId);
+      sendJson(response, 200, { ok: true, restartRequired });
       return;
     }
 
     // ── Onebot 桥 · 关系网 ─────────────────────────────────────────────────
+    // ── Onebot 桥 · 本机 NapCat 自动部署/运行 ───────────────────────────────
+    if (request.method === 'GET' && url.pathname === '/api/napcat/runtime') {
+      const status: NapcatRuntimeStatus = await deps.napcatRuntime.status();
+      sendJson(response, 200, status);
+      return;
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/napcat/runtime/install') {
+      const result = await deps.napcatRuntime.install();
+      sendJson(response, result.ok ? 200 : 400, result);
+      return;
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/napcat/runtime/action') {
+      const body = (await readBody(request)) as Record<string, unknown>;
+      const action = String(body.action ?? '');
+      if (action !== 'start' && action !== 'stop' && action !== 'restart') {
+        sendJson(response, 400, { error: '操作只能是 start、stop 或 restart' });
+        return;
+      }
+      const result: NapcatActionResult = await deps.napcatRuntime.control(action);
+      sendJson(response, result.ok ? 200 : 500, result);
+      return;
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/napcat/runtime/qrcode') {
+      const qrcode: NapcatQrcode = await deps.napcatRuntime.qrcode();
+      sendJson(response, 200, qrcode);
+      return;
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/napcat/runtime/logs') {
+      const lines = Number(url.searchParams.get('lines') ?? 120);
+      sendJson(response, 200, await deps.napcatRuntime.logs(Number.isFinite(lines) ? lines : 120));
+      return;
+    }
+
     if (request.method === 'GET' && url.pathname === '/api/relations') {
       const people = deps.relations.listPeople()
         .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
@@ -771,7 +968,54 @@ export async function handleWebui(
           },
         },
         plugins: deps.plugins?.listInfo() ?? [],
+        /** 号主/管理员 QQ：config.json 持久值，改完需重启生效（路由按启动时快照算）。 */
+        identity: {
+          masterQq: Number(configJson.ai?.master_qq ?? 0) || 0,
+          adminQq: Number(configJson.ai?.admin_qq ?? 0) || 0,
+        },
       });
+      return;
+    }
+
+    // 号主/管理员 QQ：写进 config.json 的 ai.master_qq / ai.admin_qq。
+    // 号主 QQ 只是「号主身份」（信任/防踢防禁言），主AI 是上级 agent，没有 QQ 号。
+    // 热态的 config 是启动快照（Object.freeze），这里只改磁盘，重启后路由才换目标。
+    if (request.method === 'POST' && url.pathname === '/api/settings/identity') {
+      const body = (await readBody(request)) as Record<string, unknown>;
+      const validQq = (value: unknown, field: string): number => {
+        const n = Number(value);
+        if (!Number.isInteger(n) || n < 10000 || n > 9999999999) {
+          throw new Error(`${field} 不是合法 QQ 号（5~10 位数字）`);
+        }
+        return n;
+      };
+      let masterQq = 0;
+      let adminQq = 0;
+      try {
+        masterQq = validQq(body.masterQq, '号主 QQ');
+        adminQq = validQq(body.adminQq, '管理员 QQ');
+      } catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
+        return;
+      }
+      if (masterQq === adminQq) {
+        sendJson(response, 400, { error: '号主与管理员不能是同一个 QQ（两种身份权限不同，2026-10-30 身份混淆事故）' });
+        return;
+      }
+      try {
+        await updateConfigJson(deps.configPath, (config) => {
+          config.ai = config.ai ?? {};
+          config.ai.master_qq = masterQq;
+          config.ai.admin_qq = adminQq;
+        });
+      } catch (error) {
+        if (error instanceof ConfigCorruptError) {
+          sendJson(response, 409, { error: error.message });
+          return;
+        }
+        throw error;
+      }
+      sendJson(response, 200, { ok: true, needsRestart: true });
       return;
     }
 
@@ -828,10 +1072,44 @@ export async function handleWebui(
 }
 
 function authorized(request: IncomingMessage, url: URL, deps: WebuiDeps): boolean {
-  if (deps.token === '') return true;
+  if (deps.token === '') {
+    // 未配 token 的免鉴权模式只对本机开放：服务默认监听 127.0.0.1 时是便利，
+    // 一旦有人把监听改成 0.0.0.0，原来的 `return true` 就是整个面板裸奔。
+    if (!isLoopbackAddress(request.socket.remoteAddress)) return false;
+    const host = String(request.headers.host ?? '').toLowerCase().replace(/:\d+$/, '');
+    return host === '' || host === 'localhost' || host.startsWith('127.') || host === '[::1]';
+  }
   const bearer = /^Bearer (.+)$/.exec(String(request.headers.authorization ?? ''));
   const presented = bearer?.[1] ?? url.searchParams.get('token') ?? '';
-  return presented === deps.token;
+  return presented !== '' && constantTimeEqual(presented, deps.token);
+}
+
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  const value = address.toLowerCase();
+  return value === '::1' || value.startsWith('127.') || value.startsWith('::ffff:127.');
+}
+
+/** 恒定时间比较（先哈希到定长，长度/前缀不泄露）。 */
+function constantTimeEqual(presented: string, expected: string): boolean {
+  const digest = (value: string): Buffer => createHash('sha256').update(value, 'utf8').digest();
+  return timingSafeEqual(digest(presented), digest(expected));
+}
+
+/**
+ * 浏览器跨站判定：Sec-Fetch-Site 优先；不支持时看 Origin 是否等于 Host。
+ * 无 Origin 的请求（curl、同源顶层导航）放行。
+ */
+function isCrossSiteRequest(request: IncomingMessage): boolean {
+  const site = String(request.headers['sec-fetch-site'] ?? '').toLowerCase();
+  if (site !== '' && site !== 'same-origin' && site !== 'none') return true;
+  const origin = String(request.headers.origin ?? '');
+  if (origin === '') return false;
+  try {
+    return new URL(origin).host.toLowerCase() !== String(request.headers.host ?? '').toLowerCase();
+  } catch {
+    return true;
+  }
 }
 
 async function listPromptFiles(promptDir: string): Promise<{ path: string; size: number }[]> {
@@ -866,6 +1144,68 @@ function safePromptPath(promptDir: string, rel: string): string | null {
   return abs;
 }
 
+// ── 人设版本存储：data/prompt/.versions/<rel 换杠>/<时间戳>.json ──────────────
+// 每个 .txt 最多留 30 份，超出按时间淘汰；文件名即 id，内容带 label。
+
+interface PromptVersionMeta { id: string; label: string; savedAt: number; bytes: number; preview: string }
+
+function versionDir(promptDir: string, rel: string): string {
+  const flat = rel.trim().replace(/[^A-Za-z0-9._-]+/g, '__');
+  return join(promptDir, '.versions', flat);
+}
+
+function versionFile(promptDir: string, rel: string, id: string): string {
+  return join(versionDir(promptDir, rel), `${id}.json`);
+}
+
+async function savePromptVersion(promptDir: string, rel: string, label: string): Promise<PromptVersionMeta | null> {
+  const abs = safePromptPath(promptDir, rel);
+  if (abs === null) return null;
+  const content = await readFile(abs, 'utf-8').catch(() => null);
+  if (content === null) return null;
+  const dir = versionDir(promptDir, rel);
+  await mkdir(dir, { recursive: true });
+  const id = String(Date.now());
+  const meta: PromptVersionMeta = {
+    id,
+    label: label.trim().slice(0, 60),
+    savedAt: Number(id),
+    bytes: Buffer.byteLength(content, 'utf-8'),
+    preview: content.trim().slice(0, 80),
+  };
+  await writeFile(join(dir, `${id}.json`), JSON.stringify({ ...meta, content }, null, 1), 'utf-8');
+  // 超出上限就按 id（即时间）从旧开始淘汰。
+  const ids = (await readdir(dir)).filter((n) => /^\d{13,}\.json$/.test(n)).sort();
+  while (ids.length > 30) {
+    await unlink(join(dir, ids.shift() as string)).catch(() => undefined);
+  }
+  return meta;
+}
+
+async function listPromptVersions(promptDir: string, rel: string): Promise<PromptVersionMeta[]> {
+  const dir = versionDir(promptDir, rel);
+  let names: string[] = [];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return [];
+  }
+  const out: PromptVersionMeta[] = [];
+  for (const name of names) {
+    if (!/^\d{13,}\.json$/.test(name)) continue;
+    const raw = JSON.parse(await readFile(join(dir, name), 'utf-8').catch(() => 'null')) as Record<string, unknown> | null;
+    if (raw === null) continue;
+    out.push({
+      id: String(raw.id ?? name.replace(/\.json$/, '')),
+      label: String(raw.label ?? ''),
+      savedAt: Number(raw.savedAt ?? 0) || 0,
+      bytes: Number(raw.bytes ?? 0) || 0,
+      preview: String(raw.preview ?? '').slice(0, 80),
+    });
+  }
+  return out.sort((a, b) => b.savedAt - a.savedAt);
+}
+
 // ── mc 账号配置 ─────────────────────────────────────────────────────────────
 
 interface McAccount {
@@ -893,17 +1233,72 @@ async function readMcAccount(mcbotDir: string): Promise<McAccount> {
 // ── 设置页辅助 ──────────────────────────────────────────────────────────────
 
 interface ConfigJson {
-  ai?: { summary_enabled?: boolean; intel_enabled?: boolean };
   napcat?: Record<string, unknown>;
   [key: string]: unknown;
+  ai?: {
+    summary_enabled?: boolean;
+    intel_enabled?: boolean;
+    master_qq?: number;
+    admin_qq?: number;
+    [key: string]: unknown;
+  };
 }
 
+/** config.json 损坏时必须中止写盘：拿 {} 继续合并会把其他配置节静默清空。 */
+class ConfigCorruptError extends Error {}
+
 async function readConfigJson(configPath: string): Promise<ConfigJson> {
+  let raw: string;
   try {
-    return JSON.parse(await readFile(configPath, 'utf-8')) as ConfigJson;
-  } catch {
-    return {};
+    raw = await readFile(configPath, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return {};
+    throw new ConfigCorruptError(`config.json 读取失败：${error instanceof Error ? error.message : String(error)}`);
   }
+  try {
+    return JSON.parse(raw) as ConfigJson;
+  } catch (error) {
+    throw new ConfigCorruptError(
+      `config.json 不是合法 JSON（${error instanceof Error ? error.message : String(error)}），`
+      + '已拒绝任何修改；请手工修复，或从同目录 config.json.bak-* 备份恢复。',
+    );
+  }
+}
+
+/**
+ * 同一配置文件的「读-改-写」串行化 + 原子落盘：并发的面板写请求排队执行，
+ * 不再出现两个请求各读旧文件、后写覆盖先写导致配置节静默丢失。
+ * mutate 返回 false 可中止本次写入（校验失败场景）。
+ */
+const configWriteQueues = new Map<string, Promise<unknown>>();
+
+async function updateConfigJson(configPath: string, mutate: (config: ConfigJson) => boolean | void): Promise<void> {
+  const queued = (configWriteQueues.get(configPath) ?? Promise.resolve())
+    .then(async () => {
+      const config = await readConfigJson(configPath);
+      if (mutate(config) === false) return;
+      const previous = await readFile(configPath, 'utf-8').catch(() => '');
+      if (previous !== '') await backupConfigWithRetention(configPath, previous);
+      const tmp = `${configPath}.${randomUUID().slice(0, 8)}.tmp`;
+      await writeFile(tmp, JSON.stringify(config, null, 2), 'utf-8');
+      await rename(tmp, configPath);
+    });
+  // 队列本身永不拒绝：一次失败不能卡死后续所有配置写入。
+  configWriteQueues.set(configPath, queued.catch(() => {}));
+  return queued;
+}
+
+/** 备份只留最近 10 份：.bak-* 里带明文密钥，无限堆积会扩大泄密面。 */
+async function backupConfigWithRetention(configPath: string, content: string, keep = 10): Promise<void> {
+  await writeFile(`${configPath}.bak-${Date.now()}`, content, 'utf-8');
+  try {
+    const dir = dirname(configPath);
+    const prefix = `${basename(configPath)}.bak-`;
+    const backups = (await readdir(dir)).filter((name) => name.startsWith(prefix)).sort();
+    for (const stale of backups.slice(0, Math.max(0, backups.length - keep))) {
+      await rm(join(dir, stale), { force: true });
+    }
+  } catch { /* 清旧失败不挡保存主流程 */ }
 }
 
 function napcatSettings(napcat: Record<string, unknown>) {
@@ -950,13 +1345,12 @@ async function persistAiFlags(
   configPath: string,
   flags: { summaryEnabled?: unknown; intelEnabled?: unknown },
 ): Promise<void> {
-  const config = await readConfigJson(configPath);
-  config.ai = config.ai ?? {};
-  if (flags.summaryEnabled !== undefined) config.ai.summary_enabled = flags.summaryEnabled === true;
-  if (flags.intelEnabled !== undefined) config.ai.intel_enabled = flags.intelEnabled === true;
-  const previous = await readFile(configPath, 'utf-8').catch(() => '');
-  if (previous !== '') await writeFile(`${configPath}.bak-${Date.now()}`, previous, 'utf-8');
-  await writeFile(configPath, JSON.stringify(config, null, 2), 'utf-8');
+  await updateConfigJson(configPath, (config) => {
+    config.ai = config.ai ?? {};
+    if (flags.summaryEnabled !== undefined) config.ai.summary_enabled = flags.summaryEnabled === true;
+    if (flags.intelEnabled !== undefined) config.ai.intel_enabled = flags.intelEnabled === true;
+    return true;
+  });
 }
 
 /** 本地数据管理：列出受管目录的体积（一层统计，够用且快）。 */

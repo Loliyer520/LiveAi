@@ -59,6 +59,10 @@ export class HealthServer implements LiveAiModule {
 
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
+      // Node's close() waits for keep-alive/media streams to end; on shutdown
+      // that can hang forever (panel polling + long video downloads). Drop
+      // them so systemd restart is prompt.
+      (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
     });
   }
 
@@ -91,7 +95,14 @@ export class HealthServer implements LiveAiModule {
     }
     const types: Record<string, string> = { '.mp4': 'video/mp4', '.flv': 'video/x-flv', '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.bin': 'application/octet-stream' };
     response.writeHead(200, { 'content-type': types[extname(file).toLowerCase()] ?? 'application/octet-stream' });
-    createReadStream(file).pipe(response);
+    const stream = createReadStream(file);
+    // TTL cleanup can delete the spool file between stat and open; without an
+    // error listener that ENOENT is an uncaughtException and kills the bot.
+    stream.on('error', () => {
+      if (!response.headersSent) response.writeHead(404);
+      response.end();
+    });
+    stream.pipe(response);
   }
 
   private handleRequest(request: IncomingMessage, response: ServerResponse): void {
@@ -114,7 +125,7 @@ export class HealthServer implements LiveAiModule {
     }
 
     // 管理面板（含 POST 写接口）走自己的处理器；/health /ready 保持裸奔给探针。
-    if (this.webui && (pathname === '/' || pathname === '/index.html' || pathname.startsWith('/api/') || pathname.startsWith('/assets/'))) {
+    if (this.webui && (pathname === '/' || pathname === '/index.html' || pathname === '/favicon.png' || pathname.startsWith('/api/') || pathname.startsWith('/assets/'))) {
       void handleWebui(request, response, this.webui).catch(() => {
         if (!response.headersSent) response.writeHead(500);
         response.end();

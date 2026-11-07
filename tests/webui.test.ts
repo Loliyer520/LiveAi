@@ -54,7 +54,7 @@ async function makeFixture(token = ''): Promise<Fixture> {
     ai: { summary_enabled: true, intel_enabled: true },
     napcat: {
       mode: 'server',
-      ws_url: 'ws://127.0.0.1:7631/openclaw-bind?access_token=ws-secret',
+      ws_url: 'ws://127.0.0.1:7631/deeplive-bind?access_token=ws-secret',
       http_url: 'http://127.0.0.1:7632',
       access_token: 'napcat-secret',
       reverse_ws_port: 7636,
@@ -85,6 +85,32 @@ async function makeFixture(token = ''): Promise<Fixture> {
     kb: new KnowledgeBase(join(dir, 'knowledge'), 'private:123456789'),
     kbMasterScope: 'private:123456789',
     plugins: null,
+    napcatRuntime: {
+      status: async () => ({
+        supported: true,
+        mode: 'server',
+        installed: true,
+        installing: false,
+        running: true,
+        serviceState: 'active',
+        serviceEnabled: true,
+        napcatVersion: '4.18.41',
+        qqVersion: '53644',
+        qrcodeUpdatedAt: null,
+        connected: true,
+        clientConnected: true,
+        selfId: 987654321,
+        diskFreeBytes: 3 * 1024 * 1024 * 1024,
+        installExit: null,
+        installError: null,
+        installLogTail: [],
+        serviceLogTail: [],
+      }),
+      install: async () => ({ ok: true }),
+      control: async () => ({ ok: true, output: '' }),
+      qrcode: async () => ({ available: false, updatedAt: null }),
+      logs: async () => ({ install: [], service: [] }),
+    },
     relations: new RelationGraph(join(dir, 'relations.json')),
     setAllScopesEnabled: (enabled) => {
       let changed = 0;
@@ -138,6 +164,7 @@ function call(
   path: string,
   body?: unknown,
   token = '',
+  extraHeaders: Record<string, string> = {},
 ): Promise<{ statusCode: number; body: string }> {
   return new Promise((resolvePromise, reject) => {
     const req = request(
@@ -149,6 +176,7 @@ function call(
         headers: {
           'content-type': 'application/json',
           ...(token ? { authorization: `Bearer ${token}` } : {}),
+          ...extraHeaders,
         },
       },
       (response) => {
@@ -175,7 +203,8 @@ test('status / scopes / models endpoints respond with live data', async () => {
     assert.equal(status.scopes.total, 2);
 
     const scopes = JSON.parse((await call(fixture.port, 'GET', '/api/scopes')).body);
-    assert.equal(scopes[0].isMaster, true, '号主会话排第一');
+    // 主AI 是上级 agent（master:core），不是 QQ 会话：会话列表里没有「主AI」行，号主私聊也只是普通会话
+    assert.ok(scopes.every((s: { isMaster: boolean }) => s.isMaster === false), '会话列表不含主AI');
     const group = scopes.find((s: { scopeId: string }) => s.scopeId === '777');
     assert.equal(group.triggerRate, 0.5);
     assert.deepEqual(group.triggerWords, ['词一']);
@@ -196,7 +225,7 @@ test('status / scopes / models endpoints respond with live data', async () => {
   }
 });
 
-test('scope update writes through, master scope refuses disable', async () => {
+test('scope update writes through; owner private chat is an ordinary scope', async () => {
   const fixture = await makeFixture();
   try {
     const off = await call(fixture.port, 'POST', '/api/scope', {
@@ -207,12 +236,14 @@ test('scope update writes through, master scope refuses disable', async () => {
     assert.equal(agent.enabled, false);
     assert.equal(agent.triggerRate, 1, 'rate 钳到 0~1');
 
-    const refused = await call(fixture.port, 'POST', '/api/scope', {
+    const owner = await call(fixture.port, 'POST', '/api/scope', {
       scopeType: 'private', scopeId: '123456789', enabled: false,
     });
-    assert.equal(refused.statusCode, 400);
-    assert.ok(JSON.parse(refused.body).error.includes('防失联'));
-    assert.equal(fixture.repo.getOrCreateAgent('private', '123456789').enabled, true);
+    assert.equal(owner.statusCode, 200);
+    assert.equal(fixture.repo.getOrCreateAgent('private', '123456789').enabled, false);
+
+    const master = await call(fixture.port, 'POST', '/api/scope', { scopeType: 'master', scopeId: 'core', enabled: false });
+    assert.equal(master.statusCode, 400, '主AI 不在会话管控范围');
 
     const bad = await call(fixture.port, 'POST', '/api/scope', { scopeType: 'dm', scopeId: '1' });
     assert.equal(bad.statusCode, 400);
@@ -290,6 +321,30 @@ test('chat: history roles mapped, admin message injected, cursor paging works', 
 
     const empty = await call(fixture.port, 'POST', '/api/chat', { text: '   ' });
     assert.equal(empty.statusCode, 400);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('cross-site POST is rejected before it reaches an endpoint', async () => {
+  const fixture = await makeFixture();
+  try {
+    const crossOrigin = await call(
+      fixture.port, 'POST', '/api/chat', { text: '恶意站点' }, '', { origin: 'https://evil.example' },
+    );
+    assert.equal(crossOrigin.statusCode, 403);
+    assert.deepEqual(fixture.adminInbox, [], '被拒请求不产生副作用');
+
+    const crossFetch = await call(
+      fixture.port, 'POST', '/api/chat', { text: '恶意站点' }, '', { 'sec-fetch-site': 'cross-site' },
+    );
+    assert.equal(crossFetch.statusCode, 403);
+
+    const sameOrigin = await call(
+      fixture.port, 'POST', '/api/chat', { text: '正常面板' }, '', { origin: `http://127.0.0.1:${fixture.port}` },
+    );
+    assert.equal(sameOrigin.statusCode, 200);
+    assert.deepEqual(fixture.adminInbox, ['正常面板']);
   } finally {
     await fixture.cleanup();
   }
