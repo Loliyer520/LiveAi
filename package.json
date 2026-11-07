@@ -1,8 +1,8 @@
 {
-  "name": "liveai",
+  "name": "deeplive",
   "version": "0.1.0",
   "private": true,
-  "description": "让 AI 活在你的社交账户上。",
+  "description": "DeepLive —— 为你的 AGI 搭建一个生命空间。参考 OpenClaw / DeepSeek Harness：长期记忆、自主生命周期、多领域可达。",
   "type": "module",
   "packageManager": "pnpm@9.15.4",
   "engines": {

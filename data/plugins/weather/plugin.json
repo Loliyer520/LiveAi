@@ -1,0 +1,26 @@
+{
+  "name": "weather",
+  "description": "天气查询（wttr.in，免 key）",
+  "enabled": true,
+  "tools": [
+    {
+      "name": "weather_query",
+      "description": "查询指定城市的天气：实时气温/体感/天气现象/湿度/风速 + 今明后三天温度区间。city 中文英文拼音都行（北京、shanghai、Tokyo）。用户问天气、问穿什么、问下不下雨时用它。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": { "type": "string", "description": "城市名" }
+        },
+        "required": ["city"]
+      },
+      "request": {
+        "method": "GET",
+        "url": "https://wttr.in/{{city}}?format=j1&lang=zh"
+      },
+      "response": {
+        "format": "json",
+        "template": "{{current_condition[0].observation_time}} 观测：{{city}} 现在 {{current_condition[0].temp_C}}℃（体感 {{current_condition[0].FeelsLikeC}}℃），{{current_condition[0].lang_zh[0].value}}，湿度 {{current_condition[0].humidity}}%，风 {{current_condition[0].winddir16Point}} {{current_condition[0].windspeedKmph}}km/h，能见度 {{current_condition[0].visibility}}km。今天 {{weather[0].mintempC}}~{{weather[0].maxtempC}}℃，明天 {{weather[1].mintempC}}~{{weather[1].maxtempC}}℃，后天 {{weather[2].mintempC}}~{{weather[2].maxtempC}}℃。"
+      }
+    }
+  ]
+}

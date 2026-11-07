@@ -1,0 +1,127 @@
+/**
+ * Layered prompt file store. Ported from legacy core/prompt_store.py.
+ *
+ * Layout under data/prompt/:
+ *   char.txt           — persona 人设
+ *   char_prefill.txt   — assistant's persona acknowledgement (fake exchange)
+ *   chat_focus.txt     — group-chat duties (watch group, report intel)
+ *   private_focus.txt  — private-chat duties and capability routing
+ *   chat_style.txt     — pre-send self check list
+ *   child_rules.txt    — always-on behavioral rules for the session AI
+ *   main.txt           — 主AI (coordinator) system prompt
+ *   agent.txt          — legacy 常驻后台 agent prompt; loaded but currently has no
+ *                        consumer (the agent/tasker subsystem was never ported to TS)
+ *   staff/10..50.txt   — layered session-AI system blocks, sorted concat
+ *
+ * staff blocks support the {{char_prompt}} placeholder.
+ */
+
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { readdir } from 'node:fs/promises';
+
+const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const PROMPT_DIR = join(PROJECT_ROOT, 'data', 'prompt');
+
+export const DEFAULT_CHAR_PROMPT = 'DeepLive，为你的 AGI 搭建一个生命空间。';
+
+async function readText(path: string, fallback: string): Promise<string> {
+  try {
+    const text = (await readFile(path, 'utf-8')).trim();
+    return text || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/** Directory-first layered read: sorted *.txt concat, else single file. */
+async function readDirOrFile(dirPath: string, filePath: string, fallback: string): Promise<string> {
+  try {
+    const names = (await readdir(dirPath)).filter((name) => name.endsWith('.txt')).sort();
+    if (names.length > 0) {
+      const chunks: string[] = [];
+      for (const name of names) {
+        const text = (await readFile(join(dirPath, name), 'utf-8')).trim();
+        if (text) chunks.push(text);
+      }
+      if (chunks.length > 0) return chunks.join('\n\n');
+    }
+  } catch {
+    // fall through to single file
+  }
+  return readText(filePath, fallback);
+}
+
+export interface PromptBundle {
+  char: string;
+  charPrefill: string;
+  chatFocus: string;
+  privateFocus: string;
+  chatStyle: string;
+  childRules: string;
+  main: string;
+  agent: string;
+  staffSystem: string;
+  /** 领域主级 AI 提示词：data/prompt/domain/<id>.txt，按 domain id 索引。 */
+  domainPrompts: Record<string, string>;
+}
+
+export class PromptStore {
+  private cache: PromptBundle | null = null;
+  private loadedAt = 0;
+  private readonly ttlMs: number;
+  private readonly promptDir: string;
+
+  constructor(promptDir: string = PROMPT_DIR, ttlMs = 30_000) {
+    this.promptDir = promptDir;
+    this.ttlMs = ttlMs;
+  }
+
+  async bundle(): Promise<PromptBundle> {
+    const now = Date.now();
+    if (this.cache !== null && now - this.loadedAt < this.ttlMs) return this.cache;
+    const char = await readText(join(this.promptDir, 'char.txt'), DEFAULT_CHAR_PROMPT);
+    const [charPrefill, chatFocus, privateFocus, chatStyle, childRules, main, agent] = await Promise.all([
+      readText(join(this.promptDir, 'char_prefill.txt'), ''),
+      readText(join(this.promptDir, 'chat_focus.txt'), ''),
+      readText(join(this.promptDir, 'private_focus.txt'), ''),
+      readText(join(this.promptDir, 'chat_style.txt'), ''),
+      readText(join(this.promptDir, 'child_rules.txt'), ''),
+      readText(join(this.promptDir, 'main.txt'), ''),
+      readText(join(this.promptDir, 'agent.txt'), ''),
+    ]);
+    const staffTemplate = await readDirOrFile(
+      join(this.promptDir, 'staff'),
+      join(this.promptDir, 'staff.txt'),
+      '',
+    );
+    const domainPrompts: Record<string, string> = {};
+    try {
+      for (const name of (await readdir(join(this.promptDir, 'domain'))).filter((n) => n.endsWith('.txt'))) {
+        const text = (await readFile(join(this.promptDir, 'domain', name), 'utf-8')).trim();
+        if (text) domainPrompts[name.slice(0, -'.txt'.length)] = text;
+      }
+    } catch {
+      // domain 提示词目录不存在 = 无领域中枢配置，正常。
+    }
+    this.cache = {
+      char,
+      charPrefill,
+      chatFocus,
+      privateFocus,
+      chatStyle,
+      childRules,
+      main,
+      agent,
+      staffSystem: staffTemplate.replaceAll('{{char_prompt}}', char),
+      domainPrompts,
+    };
+    this.loadedAt = now;
+    return this.cache;
+  }
+
+  invalidate(): void {
+    this.cache = null;
+  }
+}

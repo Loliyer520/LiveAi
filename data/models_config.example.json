@@ -1,0 +1,38 @@
+{
+  "upstreams": [
+    {
+      "name": "main-gateway",
+      "base_url": "https://api.example.com",
+      "api_key": "sk-xxxx",
+      "protocol": "anthropic"
+    },
+    {
+      "name": "backup-gateway",
+      "base_url": "https://api.backup.example.com",
+      "api_key": "sk-yyyy",
+      "protocol": "completions"
+    }
+  ],
+  "channels": [
+    {
+      "name": "main",
+      "strategy": "fallback",
+      "models": [
+        { "upstream": "main-gateway", "model_id": "claude-sonnet-5" },
+        { "upstream": "backup-gateway", "model_id": "gpt-5" }
+      ]
+    },
+    {
+      "name": "tiered",
+      "strategy": "roundrobin",
+      "models": [
+        { "upstream": "backup-gateway", "model_id": "gpt-5-mini" }
+      ]
+    }
+  ],
+  "roles": {
+    "main": "main",
+    "tiered": "tiered",
+    "summary": "tiered"
+  }
+}

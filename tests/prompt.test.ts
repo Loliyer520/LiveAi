@@ -1,0 +1,384 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  sanitizeBlockBody,
+  xmlAttrEscape,
+  normalizeRef,
+  wrapUserMsgBlock,
+  wrapUserInvisibleGroup,
+  renderPendingBlocks,
+  buildRoleBasedHistoryMessages,
+  buildTriggerUserMessage,
+} from '../src/prompt/render.js';
+import { buildChildMessages, buildChildBackgroundPrompt } from '../src/prompt/assemble.js';
+import type { AssembleInput } from '../src/prompt/assemble.js';
+import { stripThinking } from '../src/chat/thinking.js';
+import { PromptStore } from '../src/prompt/store.js';
+import type { HistoryEntry, TriggerEntry, ChatMessage } from '../src/chat/types.js';
+
+const BOT_ID = '999';
+
+function userEntry(text: string, userId = 100, ref = ''): HistoryEntry {
+  return {
+    user_id: userId,
+    nickname: `user${userId}`,
+    text,
+    raw_message: text,
+    message_id: null,
+    message_ref: ref,
+    timestamp: 1_700_000_000,
+    source_kind: 'group',
+    source_label: 'QQ群消息',
+  };
+}
+
+function botEntry(text: string): HistoryEntry {
+  return { user_id: Number(BOT_ID), nickname: '冰糖', text, timestamp: 1_700_000_000 };
+}
+
+function internalEntry(text: string): HistoryEntry {
+  return { user_id: 0, nickname: '后台任务', text, timestamp: 1_700_000_000, source_kind: 'internal_task' };
+}
+
+test('sanitizeBlockBody neutralizes colluding wrapping tags only', () => {
+  assert.equal(sanitizeBlockBody('<user_msg>hi</user_msg>'), '＜user_msg>hi＜/user_msg>');
+  assert.equal(sanitizeBlockBody('<b>bold</b>'), '<b>bold</b>');
+});
+
+test('xmlAttrEscape escapes attribute-hostile characters', () => {
+  assert.equal(xmlAttrEscape('a"b&c<d'), 'a&quot;b&amp;c&lt;d');
+});
+
+test('normalizeRef strips bracket decorations', () => {
+  assert.equal(normalizeRef('[#A1B2]'), 'A1B2');
+  assert.equal(normalizeRef('A1B2'), 'A1B2');
+});
+
+test('wrapUserMsgBlock groups consecutive user entries with short IDs', () => {
+  const block = wrapUserMsgBlock([userEntry('hello', 100, 'A1B2'), userEntry('world', 101)]);
+  assert.ok(block.startsWith('<user_msg from="user100"'));
+  assert.ok(block.includes('[#A1B2]'));
+  assert.ok(block.includes('user101'));
+  assert.ok(block.endsWith('</user_msg>'));
+});
+
+test('renderPendingBlocks interleaves user and invisible runs', () => {
+  const blocks = renderPendingBlocks([
+    userEntry('a'),
+    userEntry('b'),
+    internalEntry('task done'),
+    internalEntry('alarm fired'),
+    userEntry('c'),
+  ]);
+  assert.equal(blocks.length, 3);
+  assert.ok(blocks[0].startsWith('<user_msg'));
+  assert.ok(blocks[1].startsWith('<user_invisible><tool_report'));
+  assert.ok(blocks[1].includes('<tool_report'));
+  assert.ok(blocks[2].startsWith('<user_msg'));
+});
+
+test('buildRoleBasedHistoryMessages collapses consecutive bot entries', () => {
+  const messages = buildRoleBasedHistoryMessages([
+    userEntry('q1'),
+    botEntry('a1'),
+    botEntry('a2'),
+    userEntry('q2'),
+    internalEntry('report'),
+  ], BOT_ID);
+  const roles = messages.map((message) => message.role);
+  assert.deepEqual(roles, ['user', 'assistant', 'user']);
+  const assistant = messages[1];
+  assert.ok(assistant.role === 'assistant');
+  assert.equal((assistant as { content: string }).content, 'a1\na2');
+});
+
+test('同账号其他设备的消息不并入 assistant 回合，带 [本账号其他设备] 标签', () => {
+  const otherDevice: HistoryEntry = {
+    user_id: Number(BOT_ID),
+    nickname: '冰糖',
+    text: '小源在吗',
+    timestamp: 1_700_000_000,
+    source_kind: 'self_other_device',
+    source_label: '本账号其他设备',
+  };
+  const messages = buildRoleBasedHistoryMessages([
+    botEntry('AI 自己说的'),
+    otherDevice,
+    botEntry('AI 又说了'),
+  ], BOT_ID);
+  const roles = messages.map((message) => message.role);
+  assert.deepEqual(roles, ['assistant', 'user', 'assistant']);
+  const deviceMsg = messages[1];
+  const content = (deviceMsg as { content: string }).content;
+  assert.ok(content.includes('[本账号其他设备]'), content);
+  assert.ok(content.includes('小源在吗'), content);
+  assert.ok(content.includes('<user_msg'), content);
+  // AI 自己的两条不许把设备消息粘进去
+  assert.equal((messages[0] as { content: string }).content, 'AI 自己说的');
+  assert.equal((messages[2] as { content: string }).content, 'AI 又说了');
+});
+
+test('buildTriggerUserMessage wraps internal reports as invisible with note', () => {
+  const triggers: TriggerEntry[] = [
+    { user_id: 0, nickname: '后台任务', text: '闹钟响了', timestamp: 1, source_kind: 'internal_task' },
+  ];
+  const content = buildTriggerUserMessage(triggers);
+  assert.ok(content.includes('<user_invisible>'));
+  assert.ok(content.includes('闹钟响了'));
+  assert.ok(content.includes('系统内部异步结果'));
+});
+
+test('buildTriggerUserMessage handles empty input', () => {
+  assert.equal(buildTriggerUserMessage([]), '暂无新消息');
+});
+
+test('stripThinking removes closed and unclosed thinking blocks', () => {
+  assert.equal(stripThinking('<thinking>hidden</thinking>visible'), 'visible');
+  assert.equal(stripThinking('visible<thinking>unclosed'), 'visible');
+  assert.equal(stripThinking('plain'), 'plain');
+});
+
+// ── assemble ─────────────────────────────────────────────────────────────────
+
+const BUNDLE = {
+  char: '你是冰糖，一个内向的高中生。',
+  charPrefill: '好的，我会按照人设行动。',
+  chatFocus: '【群聊职责】观察群聊。',
+  privateFocus: '【私聊职责】回应需求并使用工具。',
+  chatStyle: '【说话检查】短句。',
+  childRules: '1. 规则一\n2. 规则二（本条群聊不适用）\n3. 规则三',
+  main: '你是主AI。',
+  agent: '你是后台agent。',
+  staffSystem: 'staff system block',
+  domainPrompts: {},
+};
+
+function makeMessage(text = '你好'): ChatMessage {
+  return {
+    chatType: 'private',
+    chatId: 123,
+    userId: 456,
+    text,
+    rawMessage: text,
+    sender: { nickname: 'tester', user_id: 456 },
+    messageId: 1,
+    mentionsSelf: false,
+    timestamp: 1_700_000_000,
+    rawData: {},
+  };
+}
+
+function assembleInput(triggerText: string): AssembleInput {
+  const trigger: TriggerEntry = {
+    user_id: 456,
+    nickname: 'tester',
+    text: triggerText,
+    timestamp: 1_700_000_000,
+    source_kind: 'friend_private',
+    source_label: 'QQ好友私聊',
+  };
+  return {
+    bundle: BUNDLE,
+    message: makeMessage(triggerText),
+    persona: BUNDLE.char,
+    impression: '喜欢聊技术',
+    historyBeforeTrigger: [userEntry('earlier')],
+    triggerMessages: [trigger],
+    background: {
+      impression: '喜欢聊技术',
+      globalIdentityContext: '',
+      groupContext: '',
+      triggerInfo: '',
+      senderCard: '',
+      scopeRelationCard: '',
+      relationOverview: '',
+      imageHint: '',
+      deferredCount: 0,
+      displayName: '',
+      overallSummary: '这是从会话开始到现在的整体梗概。',
+      diarySummaries: [{ index: 0, text: '旧摘要' }],
+      knowledgeLines: [],
+      mountedKnowledgeLines: [],
+      recentThinkNotes: ['注意他最近在考试'],
+      isMasterMessage: false,
+      isAdminMessage: false,
+      botSelfId: '987654322',
+      masterQq: '123456789',
+      nowText: '2026-09-28 星期一 12:00',
+    },
+    injectPersona: true,
+    chatMode: true,
+    modeHint: '',
+  };
+}
+
+test('production prompts explain Bilibili routing without stale tool names', async () => {
+  const bundle = await new PromptStore().bundle();
+  assert.ok(bundle.privateFocus.includes('request_type="bili"'));
+  assert.ok(bundle.privateFocus.includes('watch_video'));
+  assert.ok(bundle.staffSystem.includes('domain:bili'));
+  assert.ok(bundle.staffSystem.includes('target_scope_id="bili"'));
+  assert.ok(!bundle.chatFocus.includes('request_knowledge_base_update'));
+  assert.ok(!bundle.childRules.includes('memory_get'));
+  assert.ok(!bundle.main.includes('敏感信息无需掩码'));
+  assert.ok(!bundle.staffSystem.includes('敏感信息无需掩码'));
+});
+
+test('transcript block caps at ~60k chars, keeps the tail, notes the omission', () => {
+  // 超长会话（小说陪读型）500 条历史渲染出 20 万+ 字符短聊，占掉每轮
+  // prompt 八成且每轮全量重读。转写封顶保尾；更早的交给分段摘要 +
+  // memory_search（背景块每轮都注入摘要），不丢事实渠道。
+  const input = assembleInput('在吗');
+  const entries: HistoryEntry[] = [];
+  // user/bot 交替：连续同角色的条目会被渲染层合并成一条消息，出不来长转写
+  for (let i = 0; i < 200; i += 1) {
+    entries.push(userEntry(`line-${i} ${'字'.repeat(300)}`, 100 + i));
+    entries.push(botEntry(`回-${i} ${'答'.repeat(300)}`));
+  }
+  input.historyBeforeTrigger = entries;
+  // botEntry 的自账号是 BOT_ID；夹具默认 botSelfId 不同，对齐后 bot 条目才被认作「你」
+  input.background.botSelfId = BOT_ID;
+  const { system, messages } = buildChildMessages(input);
+  // head + personaTail + transcript（3 块）
+  assert.equal(system.length, 3);
+  const transcript = system[2].text;
+  assert.ok(transcript.includes('已省略'), 'header notes the omitted prefix');
+  assert.ok(transcript.includes('memory_search'));
+  // 保尾切头：转写中段在，最老的不在；最近 30 条不进转写、保持真消息形态
+  assert.ok(transcript.includes('line-110'));
+  assert.ok(!transcript.includes('line-0'));
+  assert.ok(!transcript.includes('line-199'), 'recent 30 stay as real messages, not transcript');
+  assert.ok(transcript.length < 80_000, `transcript ${transcript.length} chars should stay near the cap`);
+  const recentText = JSON.stringify(messages);
+  assert.ok(recentText.includes('line-199'), 'newest history line still in recent messages');
+});
+
+test('buildChildMessages orders system blocks and stamps cache on head', () => {
+  const { system, messages } = buildChildMessages(assembleInput('在吗'));
+  // system 只留稳定块：head（规则/身份）+ personaTail（人设/风格）。
+  // 易变背景（时间/印象/摘要）挪到触发消息尾部，保住历史前缀缓存。
+  assert.equal(system.length, 2);
+  assert.ok(system[0].text.includes('staff system block'));
+  assert.ok(system[0].text.includes('规则三'));
+  // Private chat keeps tooling rules and gets private—not group—focus.
+  assert.ok(system[0].text.includes('规则二（本条群聊不适用）'));
+  assert.ok(system[0].cacheControl?.type === 'ephemeral');
+  assert.ok(system[1].text.includes('冰糖'));
+  assert.ok(system[1].text.includes('【私聊职责】'));
+  assert.ok(!system[1].text.includes('【群聊职责】'));
+  assert.ok(system[1].text.includes('send_message'));
+  assert.ok(system[1].cacheControl?.type === 'ephemeral');
+
+  const roles = messages.map((entry) => entry.role);
+  // char prefill pair + tool prefill pair + history + trigger
+  assert.deepEqual(roles, ['user', 'assistant', 'user', 'assistant', 'user', 'user']);
+  const trigger = messages[messages.length - 1];
+  assert.ok(trigger.role === 'user');
+  const triggerText = String((trigger as { content: string }).content);
+  assert.ok(triggerText.includes('在吗'));
+  // 背景块随触发消息尾部下发（user_invisible 包裹），不再占 system
+  assert.ok(triggerText.includes('<user_invisible>'));
+  assert.ok(triggerText.includes('2026-09-28'));
+  assert.ok(triggerText.includes('旧摘要'));
+});
+
+test('group and domain scopes do not inherit private focus', () => {
+  const groupInput = assembleInput('群里聊什么');
+  groupInput.message = { ...groupInput.message, chatType: 'group' };
+  const group = buildChildMessages(groupInput);
+  assert.ok(group.system[1].text.includes('【群聊职责】'));
+  assert.ok(!group.system[1].text.includes('【私聊职责】'));
+  assert.ok(!group.system[0].text.includes('规则二'), 'group drops marker-tagged tooling rules');
+
+  const domainInput = assembleInput('[主AI委派] 查这个视频');
+  domainInput.message = { ...domainInput.message, chatType: 'domain' };
+  const domain = buildChildMessages(domainInput);
+  assert.ok(!domain.system[1].text.includes('【群聊职责】'));
+  assert.ok(!domain.system[1].text.includes('【私聊职责】'));
+  assert.ok(!domain.system[1].text.includes('【说话检查】'));
+  assert.ok(domain.system[0].text.includes('规则二'), 'domain keeps its tooling rules');
+});
+
+test('tool prefill pair stays short and never mentions <thinking> (apipp prose-mode poison)', () => {
+  // Regression 2026-09-29: a verbose tool-rule prefill pair containing literal
+  // <thinking>...</thinking> made the apipp relay (claude-opus-5-5, adaptive
+  // thinking) answer in prose while denying it had any tools — the bot went
+  // silently unresponsive in every chat. Keep this pair lean.
+  const { messages } = buildChildMessages(assembleInput('在吗'));
+  const pairText = messages
+    .slice(2, 4)
+    .map((entry) => String((entry as { content: unknown }).content))
+    .join('\n');
+  assert.ok(!pairText.includes('<thinking>'), 'prefill pair must not mention <thinking> tags');
+  assert.ok(pairText.includes('send_message'));
+  assert.ok(pairText.includes('stay_silent'));
+  assert.ok(pairText.length < 500, 'prefill pair should stay short');
+});
+
+test('background prompt carries deferred-count 补审提醒', () => {
+  const input = assembleInput('在吗');
+  input.background.deferredCount = 3;
+  const text = buildChildBackgroundPrompt(input);
+  assert.ok(text.includes('补审提醒'));
+  assert.ok(text.includes('3 条消息'));
+});
+
+test('background prompt shows overall summary, last-3 segments and search hint', () => {
+  const input = assembleInput('在吗');
+  input.background.overallSummary = '整体梗概：一起做了项目。';
+  input.background.diarySummaries = [0, 1, 2, 3].map((index) => ({ index, text: `第${index}段摘要` }));
+  const text = buildChildBackgroundPrompt(input);
+  assert.ok(text.includes('会话整体梗概'));
+  assert.ok(text.includes('一起做了项目'));
+  assert.ok(text.includes('【第4段】第3段摘要'), 'latest segments rendered');
+  assert.ok(!text.includes('【第1段】第0段摘要'), 'older segments folded into the primer');
+  assert.ok(text.includes('memory_search'));
+});
+
+test('master mode: coordination prefill, unfiltered rules, relation overview', () => {
+  const input = assembleInput('[子AI上报 from group:1 type=intel]\n小明说他在准备考研');
+  input.masterMode = true;
+  input.persona = BUNDLE.main;
+  input.background.relationOverview = '人物（按情报量排序）:\n- 小明(456)：3 条情报';
+  const { system, messages } = buildChildMessages(input);
+
+  // rules NOT filtered in master mode (chat-mode filter drops marker-tagged rules)
+  assert.ok(system[0].text.includes('规则二'), 'master keeps tooling rules');
+  // no chat focus/style, no chat-persona prefill acknowledgement
+  const personaTail = system[system.length - 1].text;
+  assert.ok(!personaTail.includes('【群聊职责】'));
+  assert.ok(!personaTail.includes('【私聊职责】'));
+  assert.ok(personaTail.includes('主AI职责'));
+  // 关系网络概览属于易变背景，随触发消息尾部下发
+  const triggerText = String((messages[messages.length - 1] as { content: string }).content);
+  assert.ok(triggerText.includes('全局关系网络概览'));
+  assert.ok(triggerText.includes('小明(456)：3 条情报'));
+
+  const roles = messages.map((entry) => entry.role);
+  assert.deepEqual(roles.slice(0, 2), ['user', 'assistant']);
+  const ack = messages[1];
+  assert.ok(ack.role === 'assistant');
+  assert.ok(String((ack as { content: string }).content).includes('主AI'), 'master acknowledgement, not chat persona');
+  assert.ok(String((messages[0] as { content: string }).content).includes('职责定位'));
+});
+
+test('background prompt renders sender relation card with confidentiality note', () => {
+  const input = assembleInput('在吗');
+  input.background.senderCard = '小明(456)，出现于 3 个会话\n- [preference][9-28] 喜欢猫';
+  input.background.scopeRelationCard = '常聊话题: 游戏、考试';
+  const text = buildChildBackgroundPrompt(input);
+  assert.ok(text.includes('<发送者档案'));
+  assert.ok(text.includes('喜欢猫'));
+  assert.ok(text.includes('不要说出"我在别的群看到你'), 'cross-scope confidentiality rule');
+  assert.ok(text.includes('本会话关系网络概况'));
+  assert.ok(text.includes('游戏、考试'));
+  const bare = buildChildBackgroundPrompt(assembleInput('在吗'));
+  assert.ok(!bare.includes('发送者档案'), 'no card section when empty');
+});
+
+test('background prompt marks master identity', () => {
+  const input = assembleInput('主人在吗');
+  input.background.isMasterMessage = true;
+  const text = buildChildBackgroundPrompt(input);
+  assert.ok(text.includes('发送者是你的主人'));
+});

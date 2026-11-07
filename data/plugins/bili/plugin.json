@@ -1,0 +1,125 @@
+{
+  "name": "bili",
+  "description": "哔哩哔哩视频：搜索/详情/取直链。用户想看 B 站视频、找视频、发视频时用：bili_search 找到 bvid → bili_url 取直链 → send_video 发给用户（插件+send_video 三步，搜索结果也可以只发链接不加视频）",
+  "enabled": true,
+  "tools": [
+    {
+      "name": "bili_search",
+      "description": "搜索 B 站视频：返回 bvid/标题/UP主/时长/播放量/简介。找到想要的 bvid 后用 bili_url 取播放直链，再用 send_video 把视频发给用户。",
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "keyword": {
+            "type": "string",
+            "description": "搜索关键词"
+          },
+          "page": {
+            "type": "number",
+            "description": "页码，默认 1",
+            "default": 1
+          }
+        },
+        "required": [
+          "keyword"
+        ]
+      },
+      "request": {
+        "method": "POST",
+        "url": "http://127.0.0.1:7810/bili/search",
+        "body": "{\"keyword\":\"{{keyword}}\",\"page\":{{page}},\"page_size\":8}"
+      },
+      "response": {
+        "format": "json",
+        "code_path": "code",
+        "ok_value": 1,
+        "msg_path": "error",
+        "list": {
+          "from": "data.videos",
+          "max": 8,
+          "separator": "\n\n",
+          "item": "《{{title}}》｜UP:{{author}}｜{{duration}}｜播放{{play}}\n{{description}}\nbvid: {{bvid}}"
+        }
+      },
+      "scopes": [
+        "domain:bili",
+        "bili"
+      ]
+    },
+    {
+      "name": "bili_detail",
+      "description": "看 B 站视频详情：标题/简介/UP主/数据/分P列表。用户问某个视频讲什么、有几个分P时用它；只要发视频可以跳过直接 bili_url。",
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "bvid": {
+            "type": "string",
+            "description": "视频 bvid（BV 开头）"
+          }
+        },
+        "required": [
+          "bvid"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7810/bili/video/detail/{{bvid}}"
+      },
+      "response": {
+        "format": "json",
+        "code_path": "code",
+        "ok_value": 1,
+        "msg_path": "error",
+        "list": {
+          "from": "data.pages",
+          "max": 15,
+          "separator": "\n",
+          "item": "P{{page}} {{title}}（{{duration}}秒）"
+        },
+        "template": "《{{data.title}}》\nUP:{{data.author.name}}｜分区:{{data.tname}}｜时长:{{data.duration}}秒｜播放:{{data.stat.view}} 点赞:{{data.stat.like}} 弹幕:{{data.stat.danmaku}}\n简介:{{data.description}}\n分P："
+      },
+      "scopes": [
+        "domain:bili",
+        "bili"
+      ]
+    },
+    {
+      "name": "bili_url",
+      "description": "取 B 站视频播放直链（默认 360P 单文件，含音轨，适合直接发 QQ 视频消息）。拿到 play_url 后立刻调 send_video 发给用户，别把长直链发给用户自己点（有 Referer 校验点不开）。默认第 1 个分P，多P 视频用 page_index 指定。",
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "bvid": {
+            "type": "string",
+            "description": "视频 bvid（BV 开头）"
+          },
+          "page_index": {
+            "type": "number",
+            "description": "第几个分P，从 0 开始，默认 0",
+            "default": 0
+          }
+        },
+        "required": [
+          "bvid"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7810/bili/video/single/{{bvid}}?quality=16&page_index={{page_index}}"
+      },
+      "response": {
+        "format": "json",
+        "code_path": "code",
+        "ok_value": 1,
+        "msg_path": "error",
+        "template": "已取到直链：画质 {{data.quality_name}}（{{data.format}}，{{data.size}} 字节，约 {{data.length}}ms）\nplay_url: {{data.play_url}}\n下一步马上调 send_video（url=这条 play_url）把视频发给用户。"
+      },
+      "scopes": [
+        "domain:bili",
+        "bili"
+      ]
+    }
+  ]
+}

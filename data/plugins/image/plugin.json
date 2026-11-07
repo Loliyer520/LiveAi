@@ -1,0 +1,104 @@
+{
+  "name": "image",
+  "description": "图片生成/编辑（OpenAI 格式中转）：AI 可以给自己生成照片、画图、改图，再通过 send_image 发给用户",
+  "version": "1.0.0",
+  "enabled": true,
+  "config": {
+    "BASE_URL": {
+      "title": "中转站基址",
+      "description": "OpenAI 格式图片中转站，不含 /v1",
+      "type": "string",
+      "default": "https://apiapipp.com"
+    }
+  },
+  "tools": [
+    {
+      "name": "image_generate",
+      "description": "用文字生成一张图片。想给用户发「自己的照片/自拍」、画个东西、做表情包时用它：prompt 里用英文或中文详细描述画面（自拍就描述自己的外形+场景+镜头感，参照人设），size 常用 1024x1024（竖版自拍可用 1024x1536）。返回图片 URL，拿到后立刻用 send_image(file=URL) 发出去，不要只发链接文字。同一 prompt 不要重复生成。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "description": "画面描述，越具体越好：主体、外貌、穿着、场景、光线、镜头（如 selfie, front camera）"
+          },
+          "size": {
+            "type": "string",
+            "description": "尺寸：1024x1024 / 1024x1536（竖）/ 1536x1024（横），默认 1024x1024",
+            "default": "1024x1024"
+          },
+          "model": {
+            "type": "string",
+            "description": "生图模型，默认 gpt-image-2.5；高清可换 gpt-image-2.5-flare-2k / gpt-image-2.5-sunburst-2k",
+            "default": "gpt-image-2.5"
+          }
+        },
+        "required": [
+          "prompt"
+        ]
+      },
+      "request": {
+        "method": "POST",
+        "url": "{{config.BASE_URL}}/v1/images/generations",
+        "headers": {
+          "Authorization": "Bearer {{secrets.IMAGE_API_KEY}}",
+          "Content-Type": "application/json"
+        },
+        "body": "{\"model\": \"{{model}}\", \"prompt\": \"{{prompt}}\", \"size\": \"{{size}}\", \"n\": 1}",
+        "timeout_ms": 180000
+      },
+      "response": {
+        "format": "json",
+        "template": "图片已生成（{{model}}）：{{data[0].url}}\nrevised_prompt: {{data[0].revised_prompt}}\n→ 下一步：调 send_image(file=上面的URL) 把图发给用户。"
+      }
+    },
+    {
+      "name": "image_edit",
+      "description": "编辑/修改一张已有图片：换装、加东西、改背景、去背景/镂空、改风格、抹掉图中文字、把聊天里的图变成别的样子、把自己画进照片里。用户要求改图时直接调用本工具，不必先 view_image；prompt 必须完整保留并同时执行用户的全部修改要求（例如「镂空调像素」=去背景+像素化），明确指令不要反问。编辑用户刚发的图：image 省略即可（自动用本轮最新那张）；编辑历史某条消息的图：image 只能传那条消息实际标出的短ID，禁止编造；也可直接传 http 链接（系统自动下载转码，QQ 链接过期就让它重发）。要把自己画进用户的照片/保持自己形象：persona_ref 传人设参考图（persona-ref://名字 或裸名字，见全局身份卡列表），和 image 一起传，两张图都会给模型（用户图为主、参考图定你的长相）。prompt 必填，描述要改什么。返回新图 URL，拿到后立即用 send_image 发给用户，不要只发链接。同一报错不要连续重试。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "type": "string",
+            "description": "可选：消息短ID（如 CF23）或 http(s) 原图链接；省略=自动用本轮消息里最新的图"
+          },
+          "persona_ref": {
+            "type": "string",
+            "description": "可选：人设参考图 persona-ref://名字 或裸名字（面板 image 插件页上传）。把「自己」画进用户照片/生成自拍时传它，与 image 同时给模型"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "要做的修改，具体描述"
+          },
+          "size": {
+            "type": "string",
+            "description": "输出尺寸，默认 1024x1024，可填 1024x1536（竖）/ 1536x1024（横）",
+            "default": "1024x1024"
+          }
+        },
+        "required": [
+          "prompt"
+        ]
+      },
+      "request": {
+        "method": "POST",
+        "url": "{{config.BASE_URL}}/v1/images/edits",
+        "headers": {
+          "Authorization": "Bearer {{secrets.IMAGE_API_KEY}}",
+          "Content-Type": "application/json"
+        },
+        "body": "{\"model\": \"gpt-image-2.5\", \"prompt\": \"{{prompt}}\", \"image\": {{image}}, \"size\": \"{{size}}\"}",
+        "timeout_ms": 180000
+      },
+      "response": {
+        "format": "json",
+        "template": "新图已生成（{{model}}）：{{data[0].url}}\nrevised_prompt: {{data[0].revised_prompt}}\n→ 下一步：调 send_image(file=上面的URL) 把图发出去。"
+      },
+      "inline_data_uri": [
+        "image",
+        "persona_ref"
+      ],
+      "inline_data_uri_array": "image"
+    }
+  ]
+}
