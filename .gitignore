@@ -11,6 +11,9 @@ data/*
 !data/plugins/
 data/plugins/secrets.json
 data/plugins/_state.json
+# 插件运行时素材（缓存图/构建备份），只入库清单本身
+data/plugins/*/refs/
+data/plugins/**/*.bak*
 
 # 示例配置是发布物，豁免 data/* 排除
 !data/config.example.json
