@@ -653,6 +653,7 @@ var FIXED_NAV = [
   { route: "models", title: "模型配置", icon: "cpu", render: renderModels },
   { route: "persona", title: "人设编辑", icon: "users", render: renderPersona },
   { route: "probes", title: "性能", icon: "activity", render: renderProbes },
+  { route: "logs", title: "回合日志", icon: "activity", render: renderLogs },
 ];
 
 function toggleDrawer() {
@@ -1611,6 +1612,89 @@ function renderProbes(main) {
 }
 function probesReset() {
   api("/api/probes/reset", "POST", {}).then(function () { renderProbes(document.getElementById("main")); toast("已清空"); });
+}
+
+// ─── 回合日志 ────────────────────────────────────────────────────────────────
+var logScope = { type: "group", id: "" };
+
+function renderLogs(main) {
+  main.innerHTML = pageHead("回合日志", "每个会话的工具调用与回合摘要");
+  api("/api/scopes").then(function (scopes) {
+    var opts = "";
+    for (var i = 0; i < scopes.length; i++) {
+      var s = scopes[i];
+      var key = s.scopeType + ":" + s.scopeId;
+      opts += '<option value="' + h(key) + '"' + (logScope.type === s.scopeType && logScope.id === s.scopeId ? " selected" : "") + ">" +
+        h((s.displayName || key) + "（" + key + "）") + "</option>";
+    }
+    var html = '<div class="card"><div class="row" style="gap:10px;align-items:center">' +
+      '<select id="logScopeSel" style="flex:1;min-width:220px">' + opts + "</select>" +
+      '<button class="btn" onclick="logsReload()">' + icon("refresh") + '刷新</button></div>' +
+      '<p class=help>每个会话最多保留 500 条工具调用日志和 20 条回合摘要，重启后依然在。</p></div>';
+    main.innerHTML = pageHead("回合日志", "每个会话的工具调用与回合摘要") + html +
+      '<div id="logBody"><div class="loading-state"><span class="loader"></span><p>加载中…</p></div></div>';
+    var sel = document.getElementById("logScopeSel");
+    if (sel) {
+      sel.onchange = function () {
+        var v = String(sel.value).split(":");
+        logScope = { type: v[0] || "group", id: v.slice(1).join(":") };
+        logsReload();
+      };
+      if (!logScope.id && scopes.length) {
+        var first = scopes[0];
+        logScope = { type: first.scopeType, id: first.scopeId };
+        sel.value = first.scopeType + ":" + first.scopeId;
+      }
+    }
+    logsReload();
+  }).catch(function (e) { main.innerHTML = pageHead("回合日志", "") + '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
+}
+
+function logsReload() {
+  if (!logScope.id) return;
+  api("/api/turn-logs?scopeType=" + encodeURIComponent(logScope.type) + "&scopeId=" + encodeURIComponent(logScope.id))
+    .then(function (d) {
+      var body = document.getElementById("logBody");
+      if (!body) return;
+      var html = "";
+      var turns = d.turns || [];
+      html += '<div class="card"><h2 style="margin-top:0">' + icon("activity") + '回合摘要（最近 ' + turns.length + ' 条）</h2>';
+      if (!turns.length) html += '<p class=dim>还没有回合记录——发一条消息让 AI 回话后再回来。</p>';
+      else {
+        html += '<table><tr><th>时间</th><th>触发</th><th>工具</th><th>已回复</th><th>耗时</th></tr>';
+        for (var i = turns.length - 1; i >= 0; i--) {
+          var t = turns[i];
+          html += '<tr><td class=dim style="font-size:12px">' + fmtTime(Math.floor(t.at / 1000)) + '</td>' +
+            '<td>' + h(t.triggerPreview || "—") + '</td>' +
+            '<td class=mono style="font-size:12px">' + h((t.toolsUsed || []).join(", ") || "—") + '</td>' +
+            '<td>' + (t.sent ? '<span class="pill ok">是</span>' : '<span class="pill">否</span>') + '</td>' +
+            '<td class=mono>' + Math.round((t.durationMs || 0) / 100) / 10 + 's</td></tr>';
+        }
+        html += "</table>";
+      }
+      html += '</div>';
+
+      var tools = d.tools || [];
+      html += '<div class="card"><h2 style="margin-top:0">' + icon("cpu") + '工具调用（最近 ' + tools.length + ' 条）</h2>';
+      if (!tools.length) html += '<p class=dim>还没有工具调用记录。</p>';
+      else {
+        html += '<table><tr><th>时间</th><th>工具</th><th>参数</th><th>结果</th><th>结果</th></tr>';
+        for (var j = tools.length - 1; j >= 0; j--) {
+          var tl = tools[j];
+          html += '<tr><td class=dim style="font-size:12px">' + fmtTime(Math.floor(tl.at / 1000)) + '</td>' +
+            '<td class=mono style="font-size:12px">' + h(tl.name) + '</td>' +
+            '<td class=mono style="font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis">' + h(tl.argsPreview || "") + '</td>' +
+            '<td class=mono style="font-size:12px;max-width:320px;overflow:hidden;text-overflow:ellipsis">' + h(tl.resultPreview || "") + '</td>' +
+            '<td>' + (tl.ok ? '<span class="pill ok">ok</span>' : '<span class="pill bad">失败</span>') + '</td></tr>';
+        }
+        html += "</table>";
+      }
+      html += '</div>';
+      body.innerHTML = html;
+    }).catch(function (e) {
+      var body = document.getElementById("logBody");
+      if (body) body.innerHTML = '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>";
+    });
 }
 
 // ─── 设置 ────────────────────────────────────────────────────────────────────

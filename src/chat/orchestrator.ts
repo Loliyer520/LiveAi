@@ -23,6 +23,7 @@ import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { ScopeRepository } from '../store/repository.js';
 import type { MessageArchive } from '../store/archive.js';
 import type { DiarySummarizer } from '../store/summarizer.js';
+import { TurnLogStore } from '../store/turn-log.js';
 import type { RelationGraph } from '../relations/graph.js';
 import type { KnowledgeBase } from '../knowledge/kb.js';
 import { domainDefForScope, hubForScope } from './domains.js';
@@ -86,6 +87,8 @@ export class AiOrchestrator {
   private readonly groupRoles: GroupRolesCache;
   /** 小说阅读指令机（不走模型；null = 未配置启用 scope）。 */
   private readonly novelCmd: NovelCommandHandler | null;
+  /** Per-scope tool-call and turn-summary logs (browsable in WebUI). */
+  private readonly turnLog: TurnLogStore;
 
   private messageEpoch = 0;
   private readonly recentMessageKeys = new Map<string, number>();
@@ -127,6 +130,7 @@ export class AiOrchestrator {
     this.tasks = new TaskScheduler(deps.tasksPath, (task) => this.fireTask(task));
     this.novelCmd = deps.novelCmd ?? null;
     this.workspaceDir = deps.workspaceDir ?? join(dirname(deps.tasksPath), 'workspace');
+    this.turnLog = new TurnLogStore(join(dirname(deps.tasksPath), 'turn-logs'));
     this.groupRoles = new GroupRolesCache(deps.bot);
     this.sessions = new CharacterSessionRegistry(this.mailbox);
     this.coordinator = new AtomicTurnBatchCoordinator(this.mailbox);
@@ -149,6 +153,11 @@ export class AiOrchestrator {
     this.tasks.start(); // recovers persisted alarms/recurring tasks (fires overdue)
   }
 
+  /** Per-scope tool-call / turn-summary logs (panel reads these). */
+  get logs(): TurnLogStore {
+    return this.turnLog;
+  }
+
   async stop(): Promise<void> {
     this.running = false;
     this.bumpEpoch();
@@ -162,6 +171,7 @@ export class AiOrchestrator {
     await this.intel.drain();
     await this.relations.flush();
     await this.kb.flush();
+    await this.turnLog.flush();
   }
 
   // ── inbound ───────────────────────────────────────────────────────────────
@@ -411,6 +421,10 @@ export class AiOrchestrator {
     let cleaned = item.cleaned || message.text;
     this.models.beginRequest('main');
     const executedTools: string[] = [];
+    /** 回合开始时间（用于回合摘要的耗时统计）。 */
+    const turnStartedAt = Date.now();
+    /** 本回合触发消息文本（摘要日志用）。 */
+    const triggerTexts: string[] = [];
     const sentImageKeys = new Set<string>();
     // 生图/改图同回合同参数只执行一次：模型遇错爱原样连试，既烧钱又刷屏。
     const imageToolCalls = new Map<string, ToolResult>();
@@ -450,6 +464,8 @@ export class AiOrchestrator {
         ? [...item.historySeed]
         : stripTriggerEntries(historyAll, item.triggerMessages);
       let triggerMessages = dedupeEntries(item.triggerMessages);
+      triggerTexts.length = 0;
+      triggerTexts.push(...triggerMessages.map((entry) => String(entry.text ?? '')));
       if (isMasterScope) {
         relayFromScope = latestRelaySource(triggerMessages);
       }
@@ -546,6 +562,10 @@ export class AiOrchestrator {
 
         let reply;
         try {
+          // 首 token 计时：流式下能看出模型"多久才开始说话"。
+          // legacy 运行时把这个数打在日志里，用来判断上游是否半死。
+          const startedAt = Date.now();
+          let firstTokenMs: number | null = null;
           reply = await completeChatTracked('main', model, {
             system,
             messages: [...messages, ...extension],
@@ -553,7 +573,13 @@ export class AiOrchestrator {
             temperature: 0.85,
             maxTokens: 2048,
             thinkingLevel: 'off',
+            onDelta: () => {
+              if (firstTokenMs === null) firstTokenMs = Date.now() - startedAt;
+            },
           });
+          console.info(
+            `[orchestrator] llm scope=${scopeKey} first_token=${firstTokenMs ?? '-'}ms total=${Date.now() - startedAt}ms`,
+          );
         } catch (error) {
           this.models.notifyFailure('main');
           throw error;
@@ -704,6 +730,15 @@ export class AiOrchestrator {
               }
             : await executeChatTool(call, toolContext);
           if (imageToolKey !== '' && previousImageResult === undefined) imageToolCalls.set(imageToolKey, result);
+          // 工具调用日志
+          this.turnLog.appendToolLog(scopeType, scopeId, {
+            at: Date.now(),
+            name: call.name,
+            argsPreview: JSON.stringify(call.arguments ?? {}).slice(0, 200),
+            resultPreview: result.output.slice(0, 300),
+            ok: result.ok,
+            durationMs: Date.now() - turnStartedAt,
+          });
           // 请示回执：主级回话/委派/直达工具命中来源会话即算已回执。
           if (result.ok && pendingAcks.size > 0) {
             const ackTarget = this.ackTargetOfCall(call);
@@ -798,6 +833,16 @@ export class AiOrchestrator {
     // next 5s lull doesn't immediately invite her to "continue" — that
     // re-prompt made her re-answer her own last reply verbatim (2026-09-29).
     if (sentThisTurn && scopeType === 'group') this.groupWindows.cancel(scopeKey);
+
+    // 回合摘要日志
+    this.turnLog.appendTurnLog(scopeType, scopeId, {
+      at: Date.now(),
+      scopeKey,
+      triggerPreview: (triggerTexts[0] ?? '').slice(0, 240),
+      toolsUsed: executedTools.slice(),
+      sent: sentThisTurn,
+      durationMs: Date.now() - turnStartedAt,
+    });
 
     // 主AI回传闭环: master's plain-text conclusion goes back to the child that
     // reported, as an internal intel note (legacy "直接输出普通文本回传"语义).

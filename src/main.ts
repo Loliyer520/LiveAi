@@ -61,6 +61,8 @@ export async function createApplication(env: NodeJS.ProcessEnv = process.env): P
       masterHistory: () => chat.repo.getMessages(MASTER_SCOPE_TYPE, MASTER_SCOPE_ID),
       modelsConfigPath: config.storage.modelsConfigPath,
       reloadModels: () => chat.models.load(),
+      // 回合/工具日志（可观测页）
+      turnLog: chat.orchestrator.logs,
       // 知识库：面板以中枢身份复核待审
       kb: chat.kb,
       kbMasterScope: MASTER_SCOPE_KEY,

@@ -292,6 +292,38 @@ test('master-only tools are gated by scope, relation_write edits the graph', asy
     assert.equal(impression.ok, true);
     assert.equal(graph.person(100)!.impression, '沉默但靠谱');
 
+    // 好感度：set 绝对值 / nudge 增减量，都夹在 0–100。
+    const setAffinity = await executeChatTool(
+      { name: 'relation_write', arguments: { action: 'set_affinity', user_id: 100, affinity: 78 } },
+      master,
+    );
+    assert.equal(setAffinity.ok, true);
+    assert.equal(graph.person(100)!.affinity, 78);
+
+    const nudge = await executeChatTool(
+      { name: 'relation_write', arguments: { action: 'nudge_affinity', user_id: 100, delta: 10 } },
+      master,
+    );
+    assert.equal(nudge.ok, true);
+    assert.equal(graph.person(100)!.affinity, 88);
+
+    // 上限夹紧
+    await executeChatTool(
+      { name: 'relation_write', arguments: { action: 'nudge_affinity', user_id: 100, delta: 100 } },
+      master,
+    );
+    assert.equal(graph.person(100)!.affinity, 100);
+    // 下限夹紧
+    await executeChatTool(
+      { name: 'relation_write', arguments: { action: 'nudge_affinity', user_id: 100, delta: -500 } },
+      master,
+    );
+    assert.equal(graph.person(100)!.affinity, 0);
+
+    // personCard 带上好感度
+    const card = graph.personCard(100);
+    assert.ok(card.includes('好感度 0/100'), card);
+
     const added = await executeChatTool(
       { name: 'relation_write', arguments: { action: 'add_fact', user_id: 100, category: 'identity', text: '山东人' } },
       master,

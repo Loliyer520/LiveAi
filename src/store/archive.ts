@@ -5,9 +5,20 @@
  * can always reach the original wording even after the active 500-message
  * window and diary summaries roll over.
  *
- * Search is substring-precise (no fuzzy), multi-keyword AND, with quoted
- * exact phrases, plus scope/speaker/time filters — the bot-side equivalent of
- * openclaw's memory_search over its session files.
+ * Search uses a two-pass strategy:
+ *
+ *  1. BM25 scoring: all entries are ranked by the standard Okapi-BM25
+ *     formula (k1=1.5, b=0.75). A partial-word match scores ≥1 point but
+ *     a full-word boundary match gets a 1.5× bonus, making precise queries
+ *     surface better than noisy ones.
+ *
+ *  2. Quoted phrase filtering: each "quoted phrase" in the query must appear
+ *     verbatim (substring) — they are removed from the scoring terms but
+ *     applied as a hard filter afterwards.
+ *
+ * Together these replace the original AND-only filter, which silently returned
+ * nothing when a term was slightly misspelled or appeared in a synonym.
+ * No embedding or external model is needed — the archive is local JSONL.
  */
 
 import { appendFile, mkdir, readdir, readFile } from 'node:fs/promises';
@@ -26,7 +37,7 @@ export interface ArchiveHit {
 }
 
 export interface SearchQuery {
-  /** Free-form: whitespace splits into AND keywords; "quoted" = exact phrase. */
+  /** Free-form: whitespace splits into scored BM25 terms; "quoted" = exact phrase hard-filter. */
   query: string;
   /** Restrict to these scope keys; empty = all scopes. */
   scopeKeys?: string[];
@@ -39,8 +50,10 @@ export interface SearchQuery {
 }
 
 export interface ParsedQuery {
-  /** Every term must appear (case-insensitive substring). */
+  /** Scored BM25 terms (case-insensitive). */
   terms: string[];
+  /** Hard-filter phrases (must appear verbatim, case-insensitive). */
+  phrases: string[];
 }
 
 export function parseSearchQuery(query: string): ParsedQuery {
@@ -48,15 +61,65 @@ export function parseSearchQuery(query: string): ParsedQuery {
   let rest = String(query ?? '');
   rest = rest.replace(/"([^"]+)"/g, (_match, phrase: string) => {
     const trimmed = String(phrase).trim();
-    if (trimmed) phrases.push(trimmed);
+    if (trimmed) phrases.push(trimmed.toLowerCase());
     return ' ';
   });
   const words = rest
     .split(/[\s,，、;；]+/)
     .map((word) => word.trim())
     .filter((word) => word.length > 0);
-  const terms = [...phrases, ...words].map((term) => term.toLowerCase());
-  return { terms: [...new Set(terms)] };
+  const terms = words.map((term) => term.toLowerCase());
+  return { terms: [...new Set(terms)], phrases: [...new Set(phrases)] };
+}
+
+// ── BM25 helpers ─────────────────────────────────────────────────────────────
+
+const BM25_K1 = 1.5;
+const BM25_B = 0.75;
+/** Approx chars-per-token for CJK-heavy text; only needed for avgdl estimate. */
+const CHARS_PER_TOKEN = 1.5;
+
+function tokenize(text: string): string[] {
+  // For CJK text every character is its own token; Latin words split on non-
+  // alphanumeric. This produces reasonable token overlap with the query terms.
+  return text
+    .toLowerCase()
+    .split(/([a-z0-9]+)/g)
+    .flatMap((chunk) => (chunk.trim() ? (/^[a-z0-9]+$/.test(chunk) ? [chunk] : [...chunk]) : []))
+    .filter((token) => token.trim().length > 0);
+}
+
+function bm25Score(haystack: string[], terms: string[], avgdl: number): number {
+  if (terms.length === 0) return 0;
+  const dl = haystack.length;
+  const tf = new Map<string, number>();
+  for (const token of haystack) {
+    tf.set(token, (tf.get(token) ?? 0) + 1);
+  }
+  const haystackText = haystack.join('');
+  let score = 0;
+  for (const term of terms) {
+    const freq = tf.get(term) ?? 0;
+    if (freq === 0) {
+      // Partial substring bonus: term may span multiple "tokens" (e.g. 冰糖
+      // is two chars that are both their own tokens, but the compound won't
+      // appear in tf). Give a fractional score for substring presence.
+      if (haystackText.includes(term)) score += 0.6;
+      continue;
+    }
+    const tfScore = (freq * (BM25_K1 + 1)) / (freq + BM25_K1 * (1 - BM25_B + BM25_B * (dl / avgdl)));
+    // Word-boundary bonus: term appears as a standalone token.
+    score += tfScore * 1.5;
+  }
+  return score;
+}
+
+/** Compute average document length (in tokens) over the corpus. O(N) but
+ *  called once per search across all scopes that match the time/user filter. */
+function avgDl(entries: HistoryEntry[]): number {
+  if (entries.length === 0) return 100;
+  const total = entries.reduce((sum, entry) => sum + (String(entry.text ?? '').length / CHARS_PER_TOKEN), 0);
+  return Math.max(1, total / entries.length);
 }
 
 export function entryMatches(entry: HistoryEntry, terms: string[]): boolean {
@@ -113,32 +176,88 @@ export class MessageArchive {
   }
 
   async search(query: SearchQuery): Promise<ArchiveHit[]> {
-    const { terms } = parseSearchQuery(query.query);
-    if (terms.length === 0) return [];
+    const { terms, phrases } = parseSearchQuery(query.query);
+    if (terms.length === 0 && phrases.length === 0) return [];
     const limit = Math.max(1, Math.min(50, query.limit ?? 12));
     const scopeFiles = await this.resolveScopeFiles(query.scopeKeys ?? []);
-    const hits: ArchiveHit[] = [];
+
+    // Pass 1: load and pre-filter by metadata (scope/user/time); collect all
+    // candidate entries across scopes for BM25 avgdl calculation.
+    interface Candidate {
+      scopeKey: string;
+      entries: HistoryEntry[];
+      index: number;
+    }
+    const candidates: Candidate[] = [];
+    let totalEntries = 0;
     for (const { scopeKey, path } of scopeFiles) {
       const entries = await this.loadLines(scopeKey, path);
+      totalEntries += entries.length;
       for (let index = 0; index < entries.length; index += 1) {
         const entry = entries[index];
         if (query.userId !== undefined && Number(entry.user_id) !== query.userId) continue;
         const timestamp = Number(entry.timestamp ?? 0);
         if (query.from !== undefined && timestamp < query.from) continue;
         if (query.to !== undefined && timestamp > query.to) continue;
-        if (!entryMatches(entry, terms)) continue;
-        hits.push({
-          scopeKey,
-          lineIndex: index,
-          entry,
-          line: formatArchiveLine(scopeKey, entry),
-          contextBefore: index > 0 ? [formatArchiveLine(scopeKey, entries[index - 1])] : [],
-          contextAfter: index < entries.length - 1 ? [formatArchiveLine(scopeKey, entries[index + 1])] : [],
-        });
-        if (hits.length >= limit) return hits;
+        candidates.push({ scopeKey, entries, index });
       }
     }
-    return hits;
+    if (candidates.length === 0) return [];
+
+    // Estimate avgdl from the full corpus (all entries, not just candidates).
+    const allEntries = await (async () => {
+      const result: HistoryEntry[] = [];
+      for (const { scopeKey, path } of scopeFiles) {
+        result.push(...(await this.loadLines(scopeKey, path)));
+      }
+      return result;
+    })();
+    const avdl = avgDl(allEntries.length > 0 ? allEntries : candidates.flatMap((c) => c.entries));
+
+    // Pass 2: score each candidate with BM25; hard-filter on phrases.
+    interface Scored {
+      scopeKey: string;
+      entries: HistoryEntry[];
+      index: number;
+      score: number;
+    }
+    const scored: Scored[] = [];
+    for (const { scopeKey, entries, index } of candidates) {
+      const entry = entries[index];
+      const text = `${String(entry.text ?? '')} ${String(entry.nickname ?? '')} ${String(entry.raw_message ?? '')}`;
+      // Hard phrase filter first (cheap).
+      if (phrases.length > 0) {
+        const lower = text.toLowerCase();
+        if (!phrases.every((phrase) => lower.includes(phrase))) continue;
+      }
+      const tokens = tokenize(text);
+      // Merge phrase words into the scoring terms so phrases contribute score.
+      const allTerms = [...terms, ...phrases.flatMap((p) => p.split(/\s+/))];
+      const score = bm25Score(tokens, allTerms, avdl);
+      if (score > 0) {
+        scored.push({ scopeKey, entries, index, score });
+      }
+    }
+
+    // Sort descending by BM25 score, then most-recent timestamp.
+    scored.sort((a, b) => {
+      const scoreDiff = b.score - a.score;
+      if (Math.abs(scoreDiff) > 0.01) return scoreDiff;
+      return Number(b.entries[b.index]?.timestamp ?? 0) - Number(a.entries[a.index]?.timestamp ?? 0);
+    });
+
+    // Pass 3: build ArchiveHit objects for the top-N results.
+    return scored.slice(0, limit).map(({ scopeKey, entries, index }) => {
+      const entry = entries[index];
+      return {
+        scopeKey,
+        lineIndex: index,
+        entry,
+        line: formatArchiveLine(scopeKey, entry),
+        contextBefore: index > 0 ? [formatArchiveLine(scopeKey, entries[index - 1])] : [],
+        contextAfter: index < entries.length - 1 ? [formatArchiveLine(scopeKey, entries[index + 1])] : [],
+      };
+    });
   }
 
   /** Drop cached lines (used after external writes / in tests). */

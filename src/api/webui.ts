@@ -29,6 +29,8 @@ import { probeReset, probeSnapshot } from '../observability/probe.js';
 import type { NapcatActionResult, NapcatQrcode, NapcatRuntimeStatus } from '../napcat/runtime.js';
 import { isMasterScope } from '../chat/types.js';
 
+import type { ToolLogEntry, TurnLogEntry } from '../store/turn-log.js';
+
 export interface WebuiDeps {
   /** 号主 QQ（号主身份；主AI 是 master:core，与此无关）：对话页区分号主消息。 */
   readonly masterQq: number;
@@ -63,6 +65,12 @@ export interface WebuiDeps {
   /** models_config.json 的绝对路径与热重载。 */
   readonly modelsConfigPath: string;
   readonly reloadModels: () => Promise<void>;
+
+  // ── 回合/工具日志（可观测页） ───────────────────────────────────────────
+  readonly turnLog?: {
+    readToolLogs(scopeType: string, scopeId: string, limit?: number): Promise<ToolLogEntry[]>;
+    readTurnLogs(scopeType: string, scopeId: string, limit?: number): Promise<TurnLogEntry[]>;
+  };
 
   // ── 知识库（知识页） ──────────────────────────────────────────────────────
   readonly kb: {
@@ -456,6 +464,23 @@ export async function handleWebui(
     // ── 用量统计（模型配置页）：完整快照，含角色/模型分解 ────────────────────
     if (request.method === 'GET' && url.pathname === '/api/usage') {
       sendJson(response, 200, deps.usage.snapshot());
+      return;
+    }
+
+    // ── 回合/工具日志（可观测页） ───────────────────────────────────────────
+    if (request.method === 'GET' && url.pathname === '/api/turn-logs') {
+      const scopeType = (url.searchParams.get('scopeType') ?? '').trim();
+      const scopeId = (url.searchParams.get('scopeId') ?? '').trim();
+      if (deps.turnLog === undefined || scopeType === '' || scopeId === '') {
+        sendJson(response, 200, { turns: [], tools: [] });
+        return;
+      }
+      const limit = Math.max(1, Math.min(200, Math.trunc(Number(url.searchParams.get('limit') ?? 50)) || 50));
+      const [turns, tools] = await Promise.all([
+        deps.turnLog.readTurnLogs(scopeType, scopeId, 20),
+        deps.turnLog.readToolLogs(scopeType, scopeId, limit),
+      ]);
+      sendJson(response, 200, { turns, tools });
       return;
     }
 

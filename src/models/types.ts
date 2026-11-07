@@ -62,6 +62,17 @@ export interface ChatRequest {
   maxTokens: number;
   thinkingLevel: 'off' | 'low' | 'medium' | 'high';
   signal?: AbortSignal;
+  /**
+   * 流式开关。协议层改用 SSE 逐块解析，调用方能拿到首 token 时间，
+   * 且中转挂起时能提前发现（而非等满 180s 超时）。
+   * 默认由上游配置 `stream` 决定；显式置 false 可关。
+   */
+  stream?: boolean;
+  /**
+   * 流式增量回调。每收到一段正文调用一次（仅正文，不含工具参数）。
+   * 用于首 token 计时与增量输出；不实现则退化为非流式行为。
+   */
+  onDelta?: (delta: string) => void;
 }
 
 export interface ToolSchema {

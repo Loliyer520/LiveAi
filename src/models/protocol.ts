@@ -14,18 +14,10 @@ import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import type { ChatReply, ChatRequest, ResolvedModel, ToolSchema } from './types.js';
 import type { ContentBlock, ModelMessage } from '../chat/types.js';
 import { sanitizeUnicode } from '../unicode.js';
+import { consumeSse } from './stream.js';
+import { ProtocolError } from './errors.js';
 
-export class ProtocolError extends Error {
-  constructor(
-    message: string,
-    readonly status: number | undefined,
-    readonly body: string | undefined,
-    readonly transient: boolean,
-  ) {
-    super(message);
-    this.name = 'ProtocolError';
-  }
-}
+export { ProtocolError };
 
 const TRANSIENT_STATUS = new Set([408, 409, 429, 500, 502, 503, 504, 529]);
 
@@ -37,6 +29,7 @@ export async function completeChat(model: ResolvedModel, request: ChatRequest): 
   let attempt = 0;
   let dropStreamOptions = false;
   let dropReasoning = false;
+  let dropStream = false;
   // 总时长预算：单次 180s × 最多 5 次 = 15 分钟会把 scope actor 钉死、
   // 全场沉默（2026-10-02 之鉴的另一半）。超过预算后不再重试，直接抛出。
   const deadline = Date.now() + 6 * 60_000;
@@ -44,13 +37,23 @@ export async function completeChat(model: ResolvedModel, request: ChatRequest): 
   for (;;) {
     attempt += 1;
     try {
-      return await callOnce(url, model, request, { dropStreamOptions, dropReasoning });
+      return await callOnce(url, model, request, { dropStreamOptions, dropReasoning, dropStream });
     } catch (error) {
       if (!(error instanceof ProtocolError)) throw error;
       const optional400 =
         error.status !== undefined && (error.status === 400 || error.status === 422);
+      // 上游抱怨的若是 stream_options，那是"参数名不被接受"，与"不支持流式"
+      // 是两件事——前者只摘掉 stream_options 保留流式能力。
       if (optional400 && !dropStreamOptions && /stream_options/i.test(error.body ?? '') && Date.now() < deadline) {
         dropStreamOptions = true;
+        continue;
+      }
+      // 抱怨的是 stream 本身（"stream not supported" / "unknown parameter:
+      // stream"）——整个退回非流式，功能不降级，只是没有增量输出。
+      const complainsAboutStream = /stream/i.test(error.body ?? '')
+        && !/stream_options/i.test(error.body ?? '');
+      if (optional400 && !dropStream && complainsAboutStream && Date.now() < deadline) {
+        dropStream = true;
         continue;
       }
       if (optional400 && !dropReasoning && /reasoning/i.test(error.body ?? '') && Date.now() < deadline) {
@@ -102,6 +105,8 @@ async function dumpEmptyShellRequest(url: string, model: ResolvedModel, request:
 interface CallOptions {
   dropStreamOptions: boolean;
   dropReasoning: boolean;
+  /** 上游不接受 stream 参数时置位——回退到非流式请求。 */
+  dropStream: boolean;
 }
 
 async function callOnce(
@@ -114,6 +119,20 @@ async function callOnce(
   const body = isAnthropic
     ? buildAnthropicBody(model, request, options)
     : buildOpenAiBody(model, request, options, url);
+
+  // 流式开关：显式 false 关闭；否则默认开启（legacy 运行时就是流式的）。
+  // 中转不支持 stream 时会 400 → 由 completeChat 的重试逻辑回退到非流式。
+  const useStream = request.stream !== false && !options.dropStream;
+  if (useStream) {
+    if (isAnthropic) body.stream = true;
+    else if (model.messagesPath.endsWith('/responses')) body.stream = true;
+    else {
+      body.stream = true;
+      // OpenAI 兼容端点默认不在流里回 usage——显式要，否则面板的 token 统计
+      // 在流式下全是 0。中转不支持时会 400 抱怨，由上层回退重试。
+      if (!options.dropStreamOptions) body.stream_options = { include_usage: true };
+    }
+  }
 
   // 硬性超时：中转偶尔把连接挂住不死不回（2026-10-02 主AI回合因此卡死、
   // 作用域 actor 被占住，全场沉默）——没有它 await 会等到天荒地老。
@@ -163,6 +182,17 @@ async function callOnce(
       text,
       TRANSIENT_STATUS.has(response.status),
     );
+  }
+
+  // 流式响应：body 是 SSE，按事件累积成与非流式相同的 ChatReply。
+  if (useStream && response.body !== null) {
+    const isResponses = !isAnthropic && model.messagesPath.endsWith('/responses');
+    const contentType = response.headers.get('content-type') ?? '';
+    // 有些中转对 stream 请求仍回 application/json（非流式载荷）——
+    // 按 content-type 判断，别硬解 SSE。
+    if (contentType.includes('text/event-stream')) {
+      return await consumeSse(response.body, model, isResponses, request.onDelta);
+    }
   }
 
   const rawText = await response.text();

@@ -12,9 +12,9 @@ function entry(text: string, userId = 100, timestamp = 1_700_000_000, nickname =
 }
 
 test('parseSearchQuery splits AND keywords and keeps quoted phrases', () => {
-  assert.deepEqual(parseSearchQuery('北京 见面'), { terms: ['北京', '见面'] });
-  assert.deepEqual(parseSearchQuery('"上海 见面" 周末，'), { terms: ['上海 见面', '周末'] });
-  assert.deepEqual(parseSearchQuery('  '), { terms: [] });
+  assert.deepEqual(parseSearchQuery('北京 见面'), { terms: ['北京', '见面'], phrases: [] });
+  assert.deepEqual(parseSearchQuery('"上海 见面" 周末，'), { terms: ['周末'], phrases: ['上海 见面'] });
+  assert.deepEqual(parseSearchQuery('  '), { terms: [], phrases: [] });
 });
 
 test('entryMatches requires every term', () => {
@@ -39,14 +39,23 @@ test('archive append + search with filters, context and limit', async () => {
 
     const hits = await archive.search({ query: '北京', scopeKeys: ['group:777'] });
     assert.equal(hits.length, 2);
-    assert.ok(hits[0].line.includes('明天去北京见面吧'));
-    assert.ok(hits[0].line.includes('user101(101)'));
+    // BM25 relevance order: both contain 北京; the test checks presence not
+    // specific ordering since relevance may rank either first.
+    const hitTexts = hits.map((h) => h.line);
+    assert.ok(hitTexts.some((l) => l.includes('明天去北京见面吧')));
+    assert.ok(hitTexts.some((l) => l.includes('北京烤鸭好吃')));
+    // 见面 is only in one message, so that one must rank first when queried
+    const narrowHit = await archive.search({ query: '"见面"', scopeKeys: ['group:777'] });
+    assert.ok((narrowHit[0]?.line ?? '').includes('明天去北京见面吧'));
+    assert.ok(hits[0].line.includes('user101(101)') || hits[1].line.includes('user101(101)'));
     // context lines surround the hit
-    assert.equal(hits[0].contextAfter.length, 1);
-    assert.ok(hits[0].contextAfter[0].includes('北京烤鸭好吃'));
+    const seenFace = hits.find((h) => h.line.includes('明天去北京见面吧'))!;
+    assert.ok(seenFace !== undefined);
+    assert.equal(seenFace.contextAfter.length, 1);
+    assert.ok(seenFace.contextAfter[0].includes('北京烤鸭好吃'));
 
-    // AND across words
-    const narrow = await archive.search({ query: '北京 见面' });
+    // AND across words: use quoted phrase to enforce exact co-occurrence
+    const narrow = await archive.search({ query: '"北京" "见面"', scopeKeys: ['group:777'] });
     assert.equal(narrow.length, 1);
 
     // user filter

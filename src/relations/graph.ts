@@ -46,6 +46,13 @@ export interface PersonRecord {
   scopes: string[];
   /** Free-text overall impression of this person (master/curated). */
   impression: string;
+  /**
+   * 好感度（0–100）。
+   * - 0–30：冷淡/戒备  31–50：普通  51–70：友好  71–85：亲近  86–100：亲密
+   * - 默认 50；工具/面板可写；自动情报采集不修改此值（防乱飘）。
+   * - 仅供参考，模型根据真实对话氛围自行判断态度，不要机械照搬数值。
+   */
+  affinity: number;
   facts: RelationFact[];
   firstSeenAt: number;
   lastSeenAt: number;
@@ -148,6 +155,28 @@ export class RelationGraph {
     if (person.impression === cleaned) return;
     person.impression = cleaned;
     this.persist();
+  }
+
+  setPersonAffinity(userId: number, affinity: number): void {
+    if (!Number.isFinite(userId) || userId <= 0) return;
+    const clamped = Math.round(Math.min(100, Math.max(0, Number.isFinite(affinity) ? affinity : 50)));
+    const person = this.ensurePerson(this.load(), userId);
+    if (person.affinity === clamped) return;
+    person.affinity = clamped;
+    this.persist();
+  }
+
+  /** Nudge affinity by delta (+/-), clamped to 0–100. */
+  nudgePersonAffinity(userId: number, delta: number): number {
+    if (!Number.isFinite(userId) || userId <= 0) return 50;
+    const person = this.ensurePerson(this.load(), userId);
+    const current = person.affinity ?? 50;
+    const next = Math.round(Math.min(100, Math.max(0, current + (Number.isFinite(delta) ? delta : 0))));
+    if (next !== person.affinity) {
+      person.affinity = next;
+      this.persist();
+    }
+    return next;
   }
 
   // ── facts ─────────────────────────────────────────────────────────────────
@@ -285,7 +314,12 @@ export class RelationGraph {
       .slice(0, 3);
     const lines: string[] = [];
     const seen = person.scopes.length;
-    lines.push(`${person.canonicalName}(${userId})，出现于 ${seen} 个会话${aliasScopes.length > 0 ? `，又名：${aliasScopes.map((entry) => entry.name).join('/')}` : ''}`);
+    const affinity = person.affinity ?? 50;
+    const affinityLabel = affinity >= 86 ? '亲密' : affinity >= 71 ? '亲近' : affinity >= 51 ? '友好' : affinity >= 31 ? '普通' : '冷淡';
+    lines.push(
+      `${person.canonicalName}(${userId})，出现于 ${seen} 个会话，好感度 ${affinity}/100（${affinityLabel}）`
+      + (aliasScopes.length > 0 ? `，又名：${aliasScopes.map((entry) => entry.name).join('/')}` : ''),
+    );
     if (person.impression) lines.push(`印象：${person.impression}`);
     for (const fact of activeFacts) {
       const date = new Date(fact.createdAt * 1000);
@@ -404,8 +438,11 @@ export class RelationGraph {
       }
       this.state = { people: {}, scopes: {}, updatedAt: 0 };
     }
-    // Records persisted before impressions existed default to ''.
-    for (const person of Object.values(this.state.people)) person.impression ??= '';
+    // Records persisted before impressions/affinity existed default gracefully.
+    for (const person of Object.values(this.state.people)) {
+      person.impression ??= '';
+      person.affinity ??= 50;
+    }
     for (const scope of Object.values(this.state.scopes)) scope.impression ??= '';
     return this.state;
   }
@@ -420,6 +457,7 @@ export class RelationGraph {
         aliases: {},
         scopes: [],
         impression: '',
+        affinity: 50,
         facts: [],
         firstSeenAt: Date.now() / 1000,
         lastSeenAt: Date.now() / 1000,
@@ -479,7 +517,10 @@ export class RelationGraph {
       }
       this.state = { people: {}, scopes: {}, updatedAt: 0 };
     }
-    for (const person of Object.values(this.state.people)) person.impression ??= '';
+    for (const person of Object.values(this.state.people)) {
+      person.impression ??= '';
+      person.affinity ??= 50;
+    }
     for (const scope of Object.values(this.state.scopes)) scope.impression ??= '';
   }
 }

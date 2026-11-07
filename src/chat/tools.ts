@@ -777,16 +777,20 @@ const MASTER_ONLY_TOOL_SCHEMAS: ToolSchema[] = [
       + 'add_fact=给某人追加一条事实（user_id + category + text，confidence 可选）；'
       + 'supersede_fact=用新表述取代一条旧情报（fact_id + text）；'
       + 'retract_fact=撤回一条错误情报（fact_id）；'
-      + 'set_scope_impression=修订某会话的印象（target_scope_type + target_scope_id + text）。'
+      + 'set_scope_impression=修订某会话的印象（target_scope_type + target_scope_id + text）；'
+      + 'set_affinity=设置某人的好感度 0–100（user_id + affinity）；'
+      + 'nudge_affinity=微调好感度（user_id + delta，正数加负数减）。'
       + '写入前先用 relation_query 查已有档案做增量更新，避免重复和覆盖。',
     parameters: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          description: 'set_person_impression / add_fact / supersede_fact / retract_fact / set_scope_impression',
+          description: 'set_person_impression / add_fact / supersede_fact / retract_fact / set_scope_impression / set_affinity / nudge_affinity',
         },
         user_id: { type: 'number', description: '目标人物 QQ 号（人物类 action 必填）' },
+        affinity: { type: 'number', description: 'set_affinity 的好感度，0–100' },
+        delta: { type: 'number', description: 'nudge_affinity 的增减量，正数加负数减' },
         category: { type: 'string', description: 'add_fact 分类：identity/preference/event/relationship/emotion/other' },
         text: { type: 'string', description: '印象/事实/新表述的内容' },
         confidence: { type: 'number', description: 'add_fact 把握 0~1，默认 1（主AI亲自录入）' },
@@ -2317,6 +2321,24 @@ function executeRelationWrite(args: Record<string, unknown>, context: ToolContex
       if (!relations.retractFact(factId)) return { ok: false, output: `没有找到情报 ${factId}。` };
       return { ok: true, output: `已撤回情报 ${factId}。` };
     }
+    case 'set_affinity': {
+      const userId = Number(args.user_id);
+      const affinity = Number(args.affinity);
+      if (!Number.isFinite(userId) || userId <= 0) return { ok: false, output: 'user_id 不合法。' };
+      if (!Number.isFinite(affinity)) return { ok: false, output: 'affinity 必须是 0–100 的数字。' };
+      relations.setPersonAffinity(userId, affinity);
+      const person = relations.person(userId);
+      const saved = person?.affinity ?? Math.round(Math.min(100, Math.max(0, affinity)));
+      return { ok: true, output: `已将 ${userId} 的好感度设为 ${saved}/100。` };
+    }
+    case 'nudge_affinity': {
+      const userId = Number(args.user_id);
+      const delta = Number(args.delta);
+      if (!Number.isFinite(userId) || userId <= 0) return { ok: false, output: 'user_id 不合法。' };
+      if (!Number.isFinite(delta)) return { ok: false, output: 'delta 必须是数字（正数加，负数减）。' };
+      const next = relations.nudgePersonAffinity(userId, delta);
+      return { ok: true, output: `已调整 ${userId} 的好感度到 ${next}/100（变化量 ${delta > 0 ? `+${delta}` : delta}）。` };
+    }
     case 'set_scope_impression': {
       const targetType = String(args.target_scope_type ?? '').trim();
       const targetId = String(args.target_scope_id ?? '').trim();
@@ -2326,7 +2348,7 @@ function executeRelationWrite(args: Record<string, unknown>, context: ToolContex
       return { ok: true, output: `已更新会话 ${targetType}:${targetId} 的印象。` };
     }
     default:
-      return { ok: false, output: `未知 action: ${action || '(空)'}，可用: set_person_impression / add_fact / supersede_fact / retract_fact / set_scope_impression` };
+      return { ok: false, output: `未知 action: ${action || '(空)'}，可用: set_person_impression / add_fact / supersede_fact / retract_fact / set_scope_impression / set_affinity / nudge_affinity` };
   }
 }
 
