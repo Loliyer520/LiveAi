@@ -1,6 +1,6 @@
 {
   "napcat": {
-    "ws_url": "ws://127.0.0.1:7821/openclaw-bind",
+    "ws_url": "ws://127.0.0.1:7821/deeplive-bind",
     "http_url": "http://127.0.0.1:7822",
     "self_id": 0,
     "access_token": "",

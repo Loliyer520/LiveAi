@@ -9,6 +9,7 @@
  *  - friend/group request events cached for later approval tools
  */
 
+import { createHash, timingSafeEqual } from 'node:crypto';
 import type { ChatMessage } from '../chat/types.js';
 import type { BridgeWatchdog } from './bridge-watchdog.js';
 import { WsServer, type WsServerConnection } from './ws-server.js';
@@ -35,6 +36,12 @@ export interface NapcatOptions {
   wsUrl: string;
   httpUrl: string;
   selfId: number;
+  /**
+   * 允许接管反向 WS 连接的账号白名单。非空时，自报不在名单里的 NapCat
+   * 连接一律拒绝（防换号后旧 NapCat 还在跑、或陌生人拿到 token 顶号）。
+   * 缺省为空 = 不限制，谁先连上谁是现役。
+   */
+  allowedSelfIds?: readonly number[];
   /** Accounts this bot ran on before; their history lines still count as self. */
   legacySelfIds?: readonly number[];
   accessToken?: string;
@@ -64,10 +71,16 @@ export class NapcatBot {
   private reconnectAttempt = 0;
   private pendingSelfSent = new Map<string, PendingSelfSent>();
   private recentSelfSentIds = new Map<string, number>();
-  private readonly pendingRequestEvents = new Map<string, Record<string, unknown>>();
+  private readonly pendingRequestEvents = new Map<string, { event: Record<string, unknown>; receivedAt: number }>();
   // 反向 WS 模式：NapCat 主动连进来的那条连接 + 在途动作的 echo 匹配表。
   private wsServer: WsServer | null = null;
   private reverseConn: WsServerConnection | null = null;
+  /** 现役连接自报的账号；null=还没问到。 */
+  private reverseConnSelfId: number | null = null;
+  /** 正在做身份握手的连接。握手期间不挤掉现役连接。 */
+  private pendingConn: WsServerConnection | null = null;
+  /** 连接序号：握手期间又来了新连接时，旧握手作废。 */
+  private connectSeq = 0;
   private actionSeq = 0;
   private readonly pendingActions = new Map<
     string,
@@ -76,6 +89,15 @@ export class NapcatBot {
 
   constructor(private readonly options: NapcatOptions) {
     this.selfIdValue = options.selfId;
+  }
+
+  /**
+   * 面板保存连接配置时热更 access_token，免重启：鉴权每次连入都读
+   * options.accessToken，换成新值后下一条连接立即按新 token 校验；
+   * 已建立的连接是升级时验过的，不受影响。
+   */
+  setAccessToken(token: string): void {
+    (this.options as { accessToken?: string }).accessToken = token || undefined;
   }
 
   /** Bot QQ; if unconfigured, adopted from the first event that carries self_id. */
@@ -119,6 +141,17 @@ export class NapcatBot {
     return this.legacySelfIds.some((legacy) => String(legacy) === value);
   }
 
+  /**
+   * 只认「现役登录账号」。入站闸/自聊闸必须用这个而不是 isSelfId：legacy
+   * 旧号可能已被真人（号主）拿回来当自己的人在用——按 legacy 丢弃会把号主
+   * 从旧号发来的私聊全部静默吞掉（2026-11-03 换号回滚实测踩中）。legacy
+   * 集合只服务于历史渲染（旧号发言=自己说的），不参与入站过滤。
+   */
+  isCurrentSelfId(id: unknown): boolean {
+    const value = String(id ?? '');
+    return value !== '' && value !== '0' && value === String(this.selfIdValue);
+  }
+
   /** 探 QQ 宿主状态（看门狗用）：反向模式下动作也走双工连接。 */
   async fetchStatus(): Promise<{ online: boolean; phase: string }> {
     const data = (await this.post('get_status', {})) as { online?: boolean; stat?: { bridge?: { phase?: string } } };
@@ -146,27 +179,43 @@ export class NapcatBot {
     void this.wsServer?.stop();
     this.wsServer = null;
     this.reverseConn = null;
+    this.reverseConnSelfId = null;
+    this.pendingConn = null;
+  }
+
+  /**
+   * 反向 WS 鉴权。配置了 access_token 就恒定时间比对；没配则只放行本机
+   * NapCat——反向端口默认监听 0.0.0.0，空 token 全放行等于让任何能连上
+   * 端口的人以 bot 身份收发消息。
+   */
+  private authorizeReverseConnection(token: string | null, remoteAddress: string | null): boolean {
+    const expected = this.options.accessToken ?? '';
+    if (expected === '') return isLoopbackAddress(remoteAddress);
+    if (token === null) return false;
+    return constantTimeEqual(token, expected);
   }
 
   private startReverseServer(): void {
     const host = this.options.reverseWsHost ?? '0.0.0.0';
     const port = this.options.reverseWsPort as number;
     const server = new WsServer({
-      authorize: (token) => this.options.accessToken === undefined || this.options.accessToken === '' || token === this.options.accessToken,
+      authorize: (token, _url, remoteAddress) => this.authorizeReverseConnection(token, remoteAddress),
       onConnection: (conn) => {
-        // 新连接优先：旧连接可能已半死（NapCat 重连场景），挤掉防僵尸。
-        if (this.reverseConn !== null && this.reverseConn.id !== conn.id) {
-          try { this.reverseConn.close(1000); } catch { /* already gone */ }
-        }
-        this.reverseConn = conn;
         this.reconnectAttempt = 0;
-        this.connectedValue = true;
-        this.options.handlers.onConnected?.();
-        void this.refreshLoginInfo();
+        // 关闭动作不能立即做：先问这条连接是哪个号，退役账号（封号换号后
+        // 仍在跑的旧 NapCat）只许兜底，不许把现役账号挤下线。
+        const previousPending = this.pendingConn;
+        this.pendingConn = conn;
+        if (previousPending !== null && previousPending.id !== conn.id) {
+          try { previousPending.close(1000); } catch { /* already gone */ }
+        }
+        void this.adoptReverseConnection(conn);
       },
       onText: (conn, data) => {
-        // 先看是不是动作响应（带 echo），不是才当事件分发。
+        // 切换窗口里可能同时挂着两条连接：动作响应照常匹配，事件只认现役
+        // 连接，免得退役账号的心跳把 self_id 又翻回去、消息重复触发。
         if (this.resolveActionResponse(data)) return;
+        if (this.reverseConn?.id !== conn.id) return;
         try {
           this.handleEvent(data);
         } catch (error) {
@@ -174,8 +223,10 @@ export class NapcatBot {
         }
       },
       onClose: (conn) => {
+        if (this.pendingConn?.id === conn.id) this.pendingConn = null;
         if (this.reverseConn?.id !== conn.id) return;
         this.reverseConn = null;
+        this.reverseConnSelfId = null;
         this.connectedValue = false;
         this.options.handlers.onDisconnected?.('reverse ws closed');
         this.failPendingActions('NapCat reverse connection closed');
@@ -203,7 +254,10 @@ export class NapcatBot {
     clearTimeout(entry.timer);
     this.pendingActions.delete(echo);
     const accepted = data.status === 'ok' || data.status === 'async';
-    if (!accepted || data.retcode !== 0) {
+    // Older/other OneBot implementations omit retcode on success; only a
+    // present non-zero value means failure.
+    const retcode = data.retcode;
+    if (!accepted || (retcode !== undefined && retcode !== null && retcode !== 0)) {
       entry.reject(new Error(`NapCat action failed: ${String(data.status)}/${String(data.retcode)} ${String(data.message ?? '')}`));
     } else {
       entry.resolve((data.data as Record<string, unknown>) ?? {});
@@ -297,7 +351,8 @@ export class NapcatBot {
     if (postType === 'request') {
       const requestType = String(data.request_type ?? '');
       const cacheKey = `${requestType}:${String(data.user_id ?? '')}:${String(data.flag ?? '')}`;
-      this.pendingRequestEvents.set(cacheKey, data);
+      this.purgeOldRequests();
+      this.pendingRequestEvents.set(cacheKey, { event: data, receivedAt: Date.now() });
       if (requestType === 'friend') this.options.handlers.onFriendRequest?.(data);
       else if (requestType === 'group') this.options.handlers.onGroupRequest?.(data);
       return;
@@ -305,20 +360,158 @@ export class NapcatBot {
     // notices (group_increase, recall, …) — reserved for later modules.
   }
 
+  /**
+   * 从事件/心跳里学习当前账号。封号换号后 NapCat 可能不重连同一条 WS，
+   * 但心跳会带新的 self_id——跟着它走，换号无需重启 bot。
+   */
   private adoptSelfId(data: Record<string, unknown>): void {
-    if (this.selfIdValue !== 0) return;
     const candidate = Number(data.self_id);
-    if (Number.isFinite(candidate) && candidate > 10000) this.selfIdValue = candidate;
+    if (!Number.isFinite(candidate) || candidate <= 10000) return;
+    if (this.selfIdValue === candidate) return;
+    // 配了账号白名单时，名单外的 self_id 不认——旧 NapCat 的心跳不能把
+    // 身份翻回未配置的号。
+    if (!this.isAllowedSelfId(candidate)) return;
+    if (this.selfIdValue !== 0) {
+      console.info(`[napcat] 登录账号切换：${this.selfIdValue} → ${candidate}`);
+    }
+    this.selfIdValue = candidate;
   }
 
-  /** 拉 get_login_info：同时校正 selfId 并学习真实昵称（替代历史里写死的人设昵称）。 */
-  private async refreshLoginInfo(): Promise<void> {
+  /**
+   * 账号白名单：allowedSelfIds（配置里明确允许接管连接的号）。为空 =
+   * 不限制（谁先连上谁是现役，兼容没配白名单的部署）。
+   */
+  private allowedSelfIdList(): number[] {
+    const ids: number[] = [];
+    for (const id of this.options.allowedSelfIds ?? []) {
+      if (Number.isFinite(id) && id > 10000 && !ids.includes(id)) ids.push(id);
+    }
+    return ids;
+  }
+
+  /** 白名单非空时只认名单里的号；名单为空一律放行。 */
+  private isAllowedSelfId(id: number | null): boolean {
+    if (id === null) return false;
+    const allow = this.allowedSelfIdList();
+    return allow.length === 0 || allow.includes(id);
+  }
+
+  /** 学会当前账号：selfId 跟着现役连接走，昵称用于展示/历史渲染。 */
+  private applyIdentity(userId: number, nickname: string): void {
+    if (this.selfIdValue !== 0 && this.selfIdValue !== userId) {
+      console.info(`[napcat] 登录账号切换：${this.selfIdValue} → ${userId}`);
+    }
+    this.selfIdValue = userId;
+    if (nickname !== '') this.selfNicknameValue = nickname;
+  }
+
+  /**
+   * 反向连接接管：先问这条连接自报哪个号，再决定是否顶掉现役连接。
+   * 配了账号白名单（allowedSelfIds）时，自报不在名单里的连接一律拒绝；
+   * 换号后旧 NapCat 若还在跑，会每 30 秒重连一次反向 WS——不设防会把
+   * 现役账号挤掉，两个号来回切换，bot 回复从错误的号发出必然失败。
+   */
+  private async adoptReverseConnection(conn: WsServerConnection): Promise<void> {
+    // 没有现役连接：立即接管（事件不能被身份探测拖住），身份随后补学；
+    // 补学发现是白名单外的号会立刻断开它。
+    if (this.reverseConn === null) {
+      if (this.pendingConn?.id === conn.id) this.pendingConn = null;
+      if (this.closed) {
+        try { conn.close(1000); } catch { /* already gone */ }
+        return;
+      }
+      this.reconnectAttempt = 0;
+      this.reverseConn = conn;
+      this.reverseConnSelfId = null;
+      this.connectedValue = true;
+      this.options.handlers.onConnected?.();
+      void this.refreshLoginInfo(conn);
+      return;
+    }
+    const seq = ++this.connectSeq;
+    const identity = await this.probeLoginInfo(conn);
+    if (seq !== this.connectSeq) {
+      // 握手期间又来了一条更新的连接，这条交给后者处理。
+      try { conn.close(1000); } catch { /* already gone */ }
+      return;
+    }
+    if (this.pendingConn?.id === conn.id) this.pendingConn = null;
+    if (this.closed) {
+      try { conn.close(1000); } catch { /* already gone */ }
+      return;
+    }
+    const current = this.reverseConn;
+    if (identity !== null && !this.isAllowedSelfId(identity.userId)) {
+      console.info(`[napcat] 拒绝未配置账号连接（${identity.userId}），白名单=${JSON.stringify(this.allowedSelfIdList())}`);
+      try { conn.close(1000); } catch { /* already gone */ }
+      return;
+    }
+    if (identity === null && current !== null && current.id !== conn.id) {
+      // 新连接问不出身份（NapCat 忙/连接半死）：保留现役，别把好连接换掉。
+      console.warn('[napcat] 新连接 5s 内未自报账号，保留现役连接');
+      try { conn.close(1000); } catch { /* already gone */ }
+      return;
+    }
+    if (current !== null && current.id !== conn.id) {
+      try { current.close(1000); } catch { /* already gone */ }
+    }
+    this.reverseConn = conn;
+    this.reverseConnSelfId = identity?.userId ?? null;
+    this.connectedValue = true;
+    if (identity !== null) this.applyIdentity(identity.userId, identity.nickname);
+    this.options.handlers.onConnected?.();
+    if (identity === null) void this.refreshLoginInfo(conn);
+  }
+
+  /** 在指定连接上问 get_login_info；短超时，失败返回 null（不作为看门狗失败计）。 */
+  private async probeLoginInfo(conn: WsServerConnection, timeoutMs = 5000): Promise<{ userId: number; nickname: string } | null> {
     try {
-      const info = (await this.post('get_login_info', {})) as { user_id?: number; nickname?: string };
+      const info = (await this.postOverWs(
+        'get_login_info',
+        {},
+        timeoutMs,
+        (payload) => conn.send(payload),
+        'REVERSE_WS_NOT_CONNECTED',
+        false,
+      )) as { user_id?: number; nickname?: string };
+      const userId = Number(info.user_id);
+      if (!Number.isFinite(userId) || userId <= 10000) return null;
+      return { userId, nickname: String(info.nickname ?? '').trim() };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 拉 get_login_info：同时校正 selfId 并学习真实昵称（替代历史里写死的人设昵称）。
+   * selfId 一律跟随当前登录账号更新——封号换号后 NapCat 重新登录，不需要重启 bot
+   * 就能把新号学成自己，否则新号自己的回声会被当成用户消息。
+   */
+  private async refreshLoginInfo(conn: WsServerConnection | null = this.reverseConn): Promise<void> {
+    try {
+      const info = (conn === null
+        ? await this.post('get_login_info', {})
+        : await this.postOverWs(
+          'get_login_info',
+          {},
+          30000,
+          (payload) => conn.send(payload),
+          'REVERSE_WS_NOT_CONNECTED',
+        )) as { user_id?: number; nickname?: string };
       const uid = Number(info.user_id);
-      if (Number.isFinite(uid) && uid > 10000 && this.selfIdValue === 0) this.selfIdValue = uid;
-      const nick = String(info.nickname ?? '').trim();
-      if (nick) this.selfNicknameValue = nick;
+      // 迟到的响应可能来自已被换掉的连接：只认现役连接的账号，别把 selfId
+      // 翻到别的号。
+      if (Number.isFinite(uid) && uid > 10000 && (conn === null || conn.id === this.reverseConn?.id)) {
+        if (!this.isAllowedSelfId(uid)) {
+          console.info(`[napcat] 现役连接自报白名单外账号（${uid}），断开`);
+          if (conn !== null) {
+            try { conn.close(1000); } catch { /* already gone */ }
+          }
+          return;
+        }
+        this.applyIdentity(uid, String(info.nickname ?? '').trim());
+        this.reverseConnSelfId = uid;
+      }
     } catch (error) {
       console.warn('[napcat] get_login_info failed:', error);
     }
@@ -328,6 +521,15 @@ export class NapcatBot {
     const messageType = String(data.message_type ?? '');
     if (messageType !== 'group' && messageType !== 'private') return;
     const chatType = messageType as 'group' | 'private';
+    // 入站私聊跟踪（排查丢事件用，LIVEAI_TRACE_INBOUND=1 开）：每条私聊事件一行，
+    // 与是否触发无关。
+    if (chatType === 'private' && process.env.LIVEAI_TRACE_INBOUND === '1') {
+      console.info(
+        `[napcat] inbound private self_sent=${selfSent} user=${String(data.user_id ?? '')}`
+          + ` target=${String(data.target_id ?? '')} sub=${String(data.sub_type ?? '')}`
+          + ` mid=${String(data.message_id ?? '')} text=${String(data.raw_message ?? '').slice(0, 30).replace(/\n/g, ' ')}`,
+      );
+    }
     // message_sent 私聊回声里 user_id 是机器人自己，真正的会话对象在 target_id——
     // 不用它的话回声去重键永远对不上 sendText 登记的 private:<对方QQ>:<内容>。
     const targetId =
@@ -337,6 +539,33 @@ export class NapcatBot {
           ? Number(data.target_id ?? data.user_id)
           : Number(data.user_id);
     const message = buildChatMessage(data, chatType, targetId);
+
+    // B 站小程序分享卡（CQ:json，b23.tv 短链）：异步解析出 BV 号再分发，
+    // 让 AI 直接拿到可喂 bili 插件的 bvid。解析失败/超时按原文放行。
+    if (message.text.includes('b23.tv/')) {
+      void this.dispatchWithBiliResolve(message, data, selfSent);
+      return;
+    }
+    this.dispatchMessage(message, data, selfSent);
+  }
+
+  private async dispatchWithBiliResolve(
+    message: ChatMessage,
+    data: Record<string, unknown>,
+    selfSent: boolean,
+  ): Promise<void> {
+    const short = message.text.match(/https?:\/\/b23\.tv\/[A-Za-z0-9]+/)?.[0];
+    if (short) {
+      const bvid = await resolveB23(short);
+      if (bvid) message.text = `${message.text}\n（${bvid}）`;
+    }
+    this.dispatchMessage(message, data, selfSent);
+  }
+
+  private dispatchMessage(message: ChatMessage, data: Record<string, unknown>, selfSent: boolean): void {
+    // 入口已保证只有 group/private，ChatMessage.chatType 类型更宽，这里收窄。
+    const chatType = message.chatType as 'group' | 'private';
+    const targetId = Number(message.chatId);
 
     // QQ 数据线（我的电脑/我的手机）：sender 永远是自己（手机端同账号发的也算
     // self-sent），所以必须在下面的 self 丢弃逻辑之前单独分流。回声（机器人自己
@@ -444,10 +673,11 @@ export class NapcatBot {
     timeoutMs: number,
     sender: ((payload: string) => void) | null,
     offlineError: string,
+    report = true,
   ): Promise<Record<string, unknown>> {
     if (sender === null) {
       const error = new Error(`NapCat ${action} failed: failed/0 ${offlineError}`);
-      this.options.watchdog?.recordFailure(error);
+      if (report) this.options.watchdog?.recordFailure(error);
       return Promise.reject(error);
     }
     const echo = `act${++this.actionSeq}`;
@@ -455,16 +685,16 @@ export class NapcatBot {
       const timer = setTimeout(() => {
         this.pendingActions.delete(echo);
         const error = new Error(`NapCat ${action} failed: timeout after ${timeoutMs}ms`);
-        this.options.watchdog?.recordFailure(error);
+        if (report) this.options.watchdog?.recordFailure(error);
         reject(error);
       }, timeoutMs);
       this.pendingActions.set(echo, {
         resolve: (value) => {
-          this.options.watchdog?.recordSuccess();
+          if (report) this.options.watchdog?.recordSuccess();
           resolve(value);
         },
         reject: (error) => {
-          this.options.watchdog?.recordFailure(error);
+          if (report) this.options.watchdog?.recordFailure(error);
           reject(error);
         },
         timer,
@@ -491,9 +721,10 @@ export class NapcatBot {
         body: JSON.stringify(params),
         signal: controller.signal,
       });
-      const payload = (await response.json()) as { status: string; retcode: number; data?: unknown; message?: string };
+      const payload = (await response.json()) as { status: string; retcode?: number | null; data?: unknown; message?: string };
       const accepted = payload.status === 'ok' || payload.status === 'async';
-      if (!accepted || payload.retcode !== 0) {
+      const retcode = payload.retcode;
+      if (!accepted || (retcode !== undefined && retcode !== null && retcode !== 0)) {
         const error = new Error(`NapCat ${action} failed: ${payload.status}/${payload.retcode} ${payload.message ?? ''}`);
         this.options.watchdog?.recordFailure(error);
         throw error;
@@ -503,6 +734,11 @@ export class NapcatBot {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /** Public OneBot action entry for dedicated QQ tools and the guarded napcat_call tool. */
+  async callApi(action: string, params: Record<string, unknown>, timeoutMs = 30000): Promise<Record<string, unknown>> {
+    return this.post(action, params, timeoutMs);
   }
 
   async sendText(chatType: 'group' | 'private', targetId: number, text: string): Promise<Record<string, unknown>> {
@@ -657,9 +893,13 @@ export class NapcatBot {
     return this.post('delete_msg', { message_id: messageId });
   }
 
-  async getGroupInfo(groupId: number): Promise<{ group_name?: string }> {
+  async getGroupInfo(groupId: number): Promise<{ group_name?: string; member_count?: number; max_member_count?: number }> {
     try {
-      return (await this.post('get_group_info', { group_id: groupId })) as { group_name?: string };
+      return (await this.post('get_group_info', { group_id: groupId })) as {
+        group_name?: string;
+        member_count?: number;
+        max_member_count?: number;
+      };
     } catch {
       return {};
     }
@@ -684,6 +924,12 @@ export class NapcatBot {
     }
   }
 
+  /** OneBot get_image: resolve an inbound image file id through NapCat itself. */
+  async getImage(file: string): Promise<{ file?: string; path?: string; url?: string; file_size?: number }> {
+    const result = await this.post('get_image', { file }, 30000);
+    return result as { file?: string; path?: string; url?: string; file_size?: number };
+  }
+
   /** OneBot get_file: resolve a received file_id to a downloadable URL. */
   async getFile(fileId: string): Promise<{ url?: string; file_name?: string; file_size?: number }> {
     const result = await this.post('get_file', { file_id: fileId }, 30000);
@@ -691,15 +937,24 @@ export class NapcatBot {
   }
 
   cachedRequests(requestType: 'friend' | 'group'): Record<string, unknown>[] {
-    return [...this.pendingRequestEvents.values()].filter(
-      (event) => String(event.request_type) === requestType,
-    );
+    this.purgeOldRequests();
+    return [...this.pendingRequestEvents.values()]
+      .map((entry) => entry.event)
+      .filter((event) => String(event.request_type) === requestType);
   }
 
   consumeRequest(cacheKey: string): Record<string, unknown> | undefined {
-    const event = this.pendingRequestEvents.get(cacheKey);
+    const entry = this.pendingRequestEvents.get(cacheKey);
     this.pendingRequestEvents.delete(cacheKey);
-    return event;
+    return entry?.event;
+  }
+
+  /** Friend/group requests are actionable for 24h, then forgotten. */
+  private purgeOldRequests(): void {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [key, entry] of this.pendingRequestEvents) {
+      if (entry.receivedAt < cutoff) this.pendingRequestEvents.delete(key);
+    }
   }
 
   private markPendingSelfSent(chatType: 'group' | 'private', targetId: number, rawMessage: string): void {
@@ -739,12 +994,66 @@ function extractText(data: Record<string, unknown>): string {
     return rawSegments
       .map((segment) => {
         if (typeof segment === 'string') return segment;
-        const entry = segment as { type?: string; data?: { text?: string } };
-        return entry.type === 'text' ? String(entry.data?.text ?? '') : '';
+        if (typeof segment !== 'object' || segment === null) return '';
+        const entry = segment as { type?: string; data?: { text?: string; data?: string } };
+        if (entry.type === 'text') return String(entry.data?.text ?? '');
+        if (entry.type === 'json') return describeJsonCard(String(entry.data?.data ?? ''));
+        return '';
       })
       .join('');
   }
-  return String(data.raw_message ?? '');
+  const rawText = String(data.raw_message ?? '');
+  if (rawText.includes('[CQ:json,')) {
+    return rawText.replace(/\[CQ:json,data=(.*)\]/g, (_m, d: string) => describeJsonCard(d)).trim();
+  }
+  return rawText;
+}
+
+/**
+ * QQ 小程序/分享卡片（json 段）转成 AI 看得懂的一行文字。
+ * B 站分享（appid 1109937557 或链接含 b23.tv/bilibili.com）带标题+链接；
+ * 其他卡片给 prompt 摘要，解析不了就空着（不挡消息）。
+ */
+function describeJsonCard(raw: string): string {
+  if (!raw) return '';
+  let card: Record<string, unknown> | null = null;
+  try {
+    card = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    try {
+      // CQ 码字符串形态会把 JSON 实体转义（&#44; 等），兜底解一层再试
+      const unescaped = raw.replace(/&#(\d+);/g, (_, code: string) => String.fromCharCode(Number(code)));
+      card = JSON.parse(unescaped) as Record<string, unknown>;
+    } catch {
+      return '';
+    }
+  }
+  if (card === null || typeof card !== 'object') return '';
+  const meta = (card.meta as Record<string, unknown> | undefined) ?? {};
+  const detail = (meta.detail_1 as Record<string, unknown> | undefined) ?? {};
+  const url = String(detail.qqdocurl ?? detail.jumpUrl ?? '');
+  const title = String(detail.desc ?? detail.title ?? '').trim();
+  if (/b23\.tv|bilibili\.com/.test(url) || String(detail.appid ?? '') === '1109937557') {
+    return `[分享B站视频]《${title || '未知标题'}》 ${url}`.trim();
+  }
+  const prompt = String(card.prompt ?? '').replace(/^\[.+?\]/, '').trim();
+  const appName = String(detail.title ?? '').trim();
+  return `[分享卡片${appName ? `·${appName}` : ''}]${prompt || title}`.trim() || '';
+}
+
+/** b23.tv 短链 HEAD 跟随一次重定向拿 BV 号；失败/超时（5s）返回 null。 */
+async function resolveB23(shortUrl: string): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const resp = await fetch(shortUrl, { method: 'HEAD', redirect: 'manual', signal: controller.signal });
+    const location = resp.headers.get('location') ?? '';
+    return location.match(/BV[0-9A-Za-z]+/)?.[0] ?? null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function messageMentionsSelf(data: Record<string, unknown>, selfIds: Set<string>): boolean {
@@ -761,4 +1070,17 @@ function messageMentionsSelf(data: Record<string, unknown>, selfIds: Set<string>
     });
   }
   return false;
+}
+
+/** 127.0.0.0/8 与 ::1 / ::ffff:127.x —— 反向 WS 未配 token 时只信本机。 */
+function isLoopbackAddress(address: string | null): boolean {
+  if (address === null) return false;
+  const value = address.toLowerCase();
+  return value === '::1' || value.startsWith('127.') || value.startsWith('::ffff:127.');
+}
+
+/** 长度无关的恒定时间比较（先哈希到定长，避免提前返回泄露长度/前缀）。 */
+function constantTimeEqual(presented: string, expected: string): boolean {
+  const digest = (value: string): Buffer => createHash('sha256').update(value, 'utf8').digest();
+  return timingSafeEqual(digest(presented), digest(expected));
 }

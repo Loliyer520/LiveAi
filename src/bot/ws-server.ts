@@ -12,6 +12,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { Duplex } from 'node:stream';
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+/** 单帧载荷上限：NapCat 事件远小于此；超限按 1009（消息过大）断开。 */
+const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+/** 分片合并后的单条消息上限。 */
+const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+/** 未解析完的接收缓冲上限（正常一条连接最多攒一帧多一点）。 */
+const MAX_BUFFER_BYTES = MAX_MESSAGE_BYTES + 1024 * 1024;
+const HEARTBEAT_INTERVAL_MS = 45_000;
+const PONG_TIMEOUT_MS = 15_000;
 
 export interface WsServerConnection {
   readonly id: string;
@@ -26,8 +34,8 @@ export interface WsServerConnection {
 }
 
 export interface WsServerHandlers {
-  /** token 校验；false 拒绝升级（401）。 */
-  authorize?: (token: string | null, requestUrl: string) => boolean;
+  /** token 校验；false 拒绝升级（401）。remoteAddress 供「未配 token 只放行本机」类策略使用。 */
+  authorize?: (token: string | null, requestUrl: string, remoteAddress: string | null) => boolean;
   onConnection: (conn: WsServerConnection) => void;
   onText: (conn: WsServerConnection, data: string) => void;
   onClose: (conn: WsServerConnection) => void;
@@ -44,6 +52,7 @@ export class WsServer {
   private boundPort: number | null = null;
   private readonly conns = new Map<string, Conn>();
   private readonly handlers: WsServerHandlers;
+  private heartbeat: NodeJS.Timeout | null = null;
 
   /** 实际监听端口（port 0 = OS 分配，listen 后可查）；未启动为 null。 */
   get port(): number | null {
@@ -70,12 +79,21 @@ export class WsServer {
       http.listen(port, host, () => {
         const addr = http.address();
         this.boundPort = typeof addr === 'object' && addr !== null ? addr.port : port;
+        // 心跳：半死连接（NapCat 进程卡住/链路黑洞）不会触发 close，主动探活。
+        this.heartbeat = setInterval(() => {
+          for (const conn of this.conns.values()) conn.ping();
+        }, HEARTBEAT_INTERVAL_MS);
+        this.heartbeat.unref();
         resolve();
       });
     });
   }
 
   async stop(): Promise<void> {
+    if (this.heartbeat !== null) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = null;
+    }
     for (const conn of this.conns.values()) conn.close(1001);
     this.conns.clear();
     const http = this.http;
@@ -88,6 +106,17 @@ export class WsServer {
   // ── handshake ─────────────────────────────────────────────────────────────
 
   private handleUpgrade(req: IncomingMessage, socket: Duplex): void {
+    // 握手阶段客户端随时可能断开：没有 error 监听时一次 EPIPE 就是未捕获异常。
+    socket.on('error', () => {});
+    try {
+      this.handleUpgradeInner(req, socket);
+    } catch (error) {
+      console.error('[ws] upgrade failed:', error);
+      try { socket.destroy(); } catch { /* already gone */ }
+    }
+  }
+
+  private handleUpgradeInner(req: IncomingMessage, socket: Duplex): void {
     const key = String(req.headers['sec-websocket-key'] ?? '');
     if (!key || String(req.headers.upgrade ?? '').toLowerCase() !== 'websocket') {
       socket.destroy();
@@ -95,7 +124,8 @@ export class WsServer {
     }
     const url = req.url ?? '/';
     const token = extractToken(url, req.headers.authorization);
-    if (this.handlers.authorize && !this.handlers.authorize(token, url)) {
+    const remoteAddress = (socket as Duplex & { remoteAddress?: string }).remoteAddress ?? null;
+    if (this.handlers.authorize && !this.handlers.authorize(token, url, remoteAddress)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
@@ -122,7 +152,14 @@ function extractToken(url: string, authorization: string | string[] | undefined)
   const query = url.split('?')[1] ?? '';
   for (const part of query.split('&')) {
     const [k, v] = part.split('=');
-    if (k === 'access_token' && v !== undefined) return decodeURIComponent(v);
+    // 畸形百分号编码会抛 URIError；这里在 HTTP upgrade 回调里，不兜住就是整进程崩溃。
+    if (k === 'access_token' && v !== undefined) {
+      try {
+        return decodeURIComponent(v);
+      } catch {
+        return v;
+      }
+    }
   }
   const header = Array.isArray(authorization) ? authorization[0] : authorization;
   if (typeof header === 'string') {
@@ -139,9 +176,12 @@ class Conn implements WsServerConnection {
   readonly token: string | null;
   private socket: Duplex | null;
   private buffer = Buffer.alloc(0);
-  private fragment: { opcode: number; chunks: Buffer[] } | null = null;
+  private fragment: { opcode: number; chunks: Buffer[]; size: number } | null = null;
   private disposed = false;
+  /** close 帧已发出、等对端收尾：期间不再处理入站数据。 */
+  private closing = false;
   private awaitingPong = false;
+  private pongTimer: NodeJS.Timeout | null = null;
 
   constructor(
     socket: Duplex,
@@ -163,19 +203,44 @@ class Conn implements WsServerConnection {
   }
 
   close(code = 1000): void {
+    if (this.disposed || this.closing) return;
     const payload = Buffer.alloc(2);
     payload.writeUInt16BE(code);
     this.writeFrame(0x8, payload);
-    this.dispose();
+    this.closing = true;
+    const socket = this.socket;
+    if (socket === null) {
+      this.dispose();
+      return;
+    }
+    // 先半关把 close 帧刷出去；对端不配合时由定时器兜底销毁。
+    socket.end();
+    const timer = setTimeout(() => this.dispose(), 250);
+    timer.unref();
   }
 
   ping(): void {
+    if (this.disposed || this.closing) return;
+    // 上一轮 ping 还没回 pong：对端已失联，直接收连接（NapCat 会重连）。
+    if (this.awaitingPong) {
+      this.close(1001);
+      return;
+    }
+    this.awaitingPong = true;
+    this.pongTimer = setTimeout(() => {
+      if (this.awaitingPong) this.close(1001);
+    }, PONG_TIMEOUT_MS);
+    this.pongTimer.unref();
     this.writeFrame(0x9, Buffer.alloc(0));
   }
 
   private dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.pongTimer !== null) {
+      clearTimeout(this.pongTimer);
+      this.pongTimer = null;
+    }
     this.socket?.destroy();
     this.socket = null;
     this.server.internalRemove(this.id);
@@ -183,7 +248,7 @@ class Conn implements WsServerConnection {
   }
 
   private writeFrame(opcode: number, payload: Buffer): void {
-    if (this.disposed) return;
+    if (this.disposed || this.closing) return;
     const socket = this.socket;
     if (socket === null) return;
     const len = payload.length;
@@ -205,12 +270,17 @@ class Conn implements WsServerConnection {
   }
 
   private onData(chunk: Buffer): void {
+    if (this.closing || this.disposed) return;
+    if (this.buffer.length + chunk.length > MAX_BUFFER_BYTES) {
+      this.close(1009);
+      return;
+    }
     this.buffer = this.buffer.length === 0 ? Buffer.from(chunk) : Buffer.concat([this.buffer, chunk]);
     for (;;) {
       const frame = this.tryParseFrame();
       if (frame === null) return;
       this.handleFrame(frame);
-      if (this.disposed) return;
+      if (this.disposed || this.closing) return;
     }
   }
 
@@ -236,6 +306,11 @@ class Conn implements WsServerConnection {
       len = Number(big);
       offset += 8;
     }
+    // 超大帧必须在等数据之前拒绝：否则声明 1GB 长度、慢慢发字节就能把内存拖穿。
+    if (len > MAX_FRAME_BYTES) {
+      this.close(1009);
+      return null;
+    }
     let mask: Buffer | null = null;
     if (masked) {
       if (buf.length < offset + 4) return null;
@@ -256,14 +331,28 @@ class Conn implements WsServerConnection {
     switch (frame.opcode) {
       case 0x1: // text
       case 0x2: // binary
+        if (this.fragment !== null) {
+          // 新数据帧打断未完成的分片：协议错误。
+          this.close(1002);
+          return;
+        }
         if (!frame.final) {
-          this.fragment = { opcode: frame.opcode, chunks: [frame.payload] };
+          this.fragment = { opcode: frame.opcode, chunks: [frame.payload], size: frame.payload.length };
           return;
         }
         this.deliverText(frame.payload);
         return;
       case 0x0: { // continuation
-        if (this.fragment === null) return;
+        if (this.fragment === null) {
+          this.close(1002);
+          return;
+        }
+        this.fragment.size += frame.payload.length;
+        if (this.fragment.size > MAX_MESSAGE_BYTES) {
+          this.fragment = null;
+          this.close(1009);
+          return;
+        }
         this.fragment.chunks.push(frame.payload);
         if (!frame.final) return;
         const assembled = Buffer.concat(this.fragment.chunks);
@@ -279,6 +368,10 @@ class Conn implements WsServerConnection {
         return;
       case 0xa: // pong
         this.awaitingPong = false;
+        if (this.pongTimer !== null) {
+          clearTimeout(this.pongTimer);
+          this.pongTimer = null;
+        }
         return;
       default:
         return;
@@ -287,6 +380,11 @@ class Conn implements WsServerConnection {
 
   private deliverText(payload: Buffer): void {
     const text = payload.toString('utf8');
-    this.handlers.onText(this, text);
+    try {
+      this.handlers.onText(this, text);
+    } catch (error) {
+      // 单条事件处理异常不应带崩整个 WS 服务端。
+      console.error('[ws] onText handler failed:', error);
+    }
   }
 }

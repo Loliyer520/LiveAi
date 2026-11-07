@@ -124,3 +124,132 @@ test('NapcatBot 反向模式未连接时动作直接失败', async () => {
   await assert.rejects(bot.sendText('private', 123, 'x'), /REVERSE_WS_NOT_CONNECTED/);
   bot.stop();
 });
+
+test('畸形 access_token 不崩服务端，后续正常连接不受影响', async () => {
+  const texts: string[] = [];
+  const { server, port } = await startOnEphemeralPort({
+    authorize: (token) => token === 't0k',
+    onConnection: () => {},
+    onText: (_conn, data) => texts.push(data),
+    onClose: () => {},
+  });
+  try {
+    // %E0%A4%A 是非法 UTF-8 百分号序列：decodeURIComponent 会抛 URIError。
+    await assert.rejects(connect(port, '/?access_token=%E0%A4%A'));
+    const ws = await connect(port);
+    ws.send('still-alive');
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(texts, ['still-alive']);
+    ws.close();
+  } finally {
+    await server.stop();
+  }
+});
+
+test('超大帧按 1009 关闭连接', async () => {
+  const closed: number[] = [];
+  const { server, port } = await startOnEphemeralPort({
+    onConnection: () => {},
+    onText: () => {},
+    onClose: () => {},
+  });
+  try {
+    const ws = await connect(port, '/');
+    const code = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('server did not close oversized frame')), 5000);
+      ws.addEventListener('close', (ev) => {
+        clearTimeout(timer);
+        resolve(ev.code);
+      });
+      // 单帧上限 8MB，发 9MB 必被拒。
+      ws.send('x'.repeat(9 * 1024 * 1024));
+    });
+    closed.push(code);
+    assert.equal(closed[0], 1009);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('NapcatBot 反向模式未配 token：本机仍可连入', async () => {
+  const bot = new NapcatBot({
+    wsUrl: 'ws://127.0.0.1:1/unused',
+    httpUrl: 'http://127.0.0.1:1/unused',
+    selfId: 0,
+    handlers: {},
+    reverseWsPort: 0,
+    reverseWsHost: HOST,
+  });
+  bot.start();
+  await new Promise((r) => setTimeout(r, 50));
+  const port = (bot as unknown as { wsServer: WsServer | null }).wsServer?.port;
+  assert.ok(typeof port === 'number' && port > 0);
+  const ws = await connect(port as number, '/');
+  ws.close();
+  bot.stop();
+});
+
+test('NapcatBot 反向模式：白名单外账号不许接管连接', async () => {
+  const bot = new NapcatBot({
+    wsUrl: 'ws://127.0.0.1:1/unused',
+    httpUrl: 'http://127.0.0.1:1/unused',
+    selfId: 1059681169,
+    allowedSelfIds: [1059681169],
+    accessToken: 't0k',
+    handlers: {},
+    reverseWsPort: 0,
+    reverseWsHost: HOST,
+  });
+  bot.start();
+  await new Promise((r) => setTimeout(r, 50));
+  const port = (bot as unknown as { wsServer: WsServer | null }).wsServer?.port as number;
+
+  // 连接到 bot 的假 NapCat：自动回 get_login_info（带上自己的账号）和其余动作。
+  const open = (identity: number): Promise<{ ws: WebSocket; closed: Promise<number> }> =>
+    new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://${HOST}:${port}/?access_token=t0k`);
+      const closed = new Promise<number>((res) => {
+        ws.addEventListener('close', (ev) => res(ev.code), { once: true });
+      });
+      ws.addEventListener('message', (ev) => {
+        const req = JSON.parse(String(ev.data)) as { action?: string; echo?: string };
+        if (typeof req.echo !== 'string') return;
+        const data = req.action === 'get_login_info' ? { user_id: identity, nickname: `号${identity}` } : { message_id: 1 };
+        ws.send(JSON.stringify({ status: 'ok', retcode: 0, echo: req.echo, data }));
+      });
+      ws.onopen = () => resolve({ ws, closed });
+      ws.addEventListener('error', () => reject(new Error('connect failed')));
+    });
+
+  const good = await open(1059681169);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(bot.selfId, 1059681169);
+
+  // 换号前旧账号的 NapCat 若还在跑，自报白名单外账号：直接拒绝，
+  // 现役连接和 selfId 都不能变。
+  const retired = await open(3592217365);
+  assert.equal(await retired.closed, 1000);
+  assert.equal(bot.selfId, 1059681169);
+  assert.equal(bot.connected, true);
+
+  // 白名单外账号抢先连（无现役连接时）：先接管再补学身份，发现不在名单
+  // 也必须立刻断开、不学它的号。
+  good.ws.close();
+  await good.closed;
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(bot.connected, false);
+  const stranger = await open(2440000000);
+  await stranger.closed;
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(bot.selfId, 1059681169);
+  assert.equal(bot.connected, false);
+
+  // 现役账号重连（旧连接可能半死）仍正常接管。
+  const again = await open(1059681169);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(bot.selfId, 1059681169);
+  assert.equal(bot.connected, true);
+
+  bot.stop();
+  again.ws.close();
+});
