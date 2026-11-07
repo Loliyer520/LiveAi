@@ -11,9 +11,9 @@ import { join } from 'node:path';
 const FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
 const FRAME_WIDTH = 480;
 
-function run(bin: string, args: string[]): Promise<void> {
+function run(bin: string, args: string[], timeoutMs = 45_000): Promise<void> {
   return new Promise((resolve, reject) => {
-    execFile(bin, args, { timeout: 120_000 }, (error, _stdout, stderr) => {
+    execFile(bin, args, { timeout: timeoutMs }, (error, _stdout, stderr) => {
       if (error !== null) reject(new Error(`${bin} 失败: ${String(stderr).slice(-300) || error.message}`));
       else resolve();
     });
@@ -38,7 +38,12 @@ export async function extractFrameTiled(videoAbs: string, moments: number[], wor
   await rm(workDir, { recursive: true, force: true }).catch(() => {});
   await mkdir(workDir, { recursive: true });
   const frames: string[] = [];
+  // 总预算：10 帧 × 120s 串行曾能把回合钉死 20 分钟——单帧 45s、
+  // 全程 180s 封顶，超时就拿已抽到的帧继续贴图。
+  const deadline = Date.now() + 180_000;
   for (const [index, t] of moments.entries()) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 5_000) break;
     const frame = join(workDir, `f${index}.png`);
     // drawtext 的 text 里 '=' 要转义；scale 宽 480 高自适应偶数（yuv420p 要求）
     await run('ffmpeg', [
@@ -47,9 +52,10 @@ export async function extractFrameTiled(videoAbs: string, moments: number[], wor
       '-frames:v', '1',
       '-vf', `scale=${FRAME_WIDTH}:-2,drawtext=fontfile=${FONT}:text='t\\=${Math.round(t)}s':x=8:y=8:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.6`,
       frame,
-    ]);
+    ], Math.min(45_000, remaining));
     frames.push(frame);
   }
+  if (frames.length === 0) throw new Error('一帧都没抽出来（ffmpeg 超时或视频损坏）');
   const tiled = join(workDir, 'tiled.jpg');
   if (frames.length === 1) {
     await run('ffmpeg', ['-y', '-loglevel', 'error', '-i', frames[0], '-q:v', '4', tiled]);

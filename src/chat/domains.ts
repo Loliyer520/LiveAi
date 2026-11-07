@@ -180,7 +180,7 @@ function hubRouting(): Record<string, string> {
 
 /**
  * 某 scope 的汇报应送达哪个中枢 scopeKey；返回 null = 直报最高级中枢（主AI）。
- * 主AI 自己的 scope（private:masterQq）永远直报自身之外——它不发汇报。
+ * 主AI 自己的 scope（master:core）永远直报自身之外——它不发汇报。
  */
 export function hubForScope(scopeKey: string, masterScopeKey: string): string | null {
   if (scopeKey === masterScopeKey) return null;

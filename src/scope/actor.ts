@@ -112,6 +112,18 @@ export class ScopeActorDispatcher {
       (error) => {
         console.error(`[actor] scope=${scopeKey} 消费循环异常退出:`, error);
         if (this.actors.get(scopeKey) === record) this.actors.delete(scopeKey);
+        // The item that threw is gone (its history is already persisted), but
+        // anything still queued behind it must not wait for the next inbound
+        // event — that could be hours. Retry once after a short pause; if the
+        // failure is deterministic the retry drains what it can and stops.
+        if (this.mailbox.pendingCount(scopeKey) > 0) {
+          const timer = setTimeout(() => {
+            if (this.actors.has(scopeKey)) return;
+            this.ensureActor(scopeKey);
+            this.wake(scopeKey);
+          }, 2_000);
+          timer.unref?.();
+        }
       },
     );
   }

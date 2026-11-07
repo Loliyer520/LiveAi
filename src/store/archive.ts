@@ -176,11 +176,19 @@ export class MessageArchive {
     let entries: HistoryEntry[] = [];
     try {
       const raw = await readFile(path, 'utf-8');
-      entries = raw
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0)
-        .map((line) => JSON.parse(line) as HistoryEntry);
+      // A single truncated/corrupt line (crash mid-append) must not blank the
+      // whole scope's searchable archive — skip bad lines, keep the rest.
+      let skipped = 0;
+      for (const line of raw.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed.length === 0) continue;
+        try {
+          entries.push(JSON.parse(trimmed) as HistoryEntry);
+        } catch {
+          skipped += 1;
+        }
+      }
+      if (skipped > 0) console.warn(`[archive] skipped ${skipped} corrupt line(s) in ${path}`);
     } catch {
       entries = [];
     }

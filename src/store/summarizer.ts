@@ -20,6 +20,7 @@ import type { ModelManager } from '../models/manager.js';
 import { completeChatTracked } from '../models/usage.js';
 import { formatArchiveLine } from './archive.js';
 import type { HistoryEntry } from '../chat/types.js';
+import { truncateUnicode } from '../unicode.js';
 
 const OVERALL_REFRESH_SEGMENTS = 3;
 const SUMMARY_MAX_CHARS = 360;
@@ -108,10 +109,10 @@ export class DiarySummarizer {
         '- 不要流水账逐条复述，不要对话原文',
         '',
         '聊天记录：',
-        transcript.slice(0, 24_000),
+        truncateUnicode(transcript, 24_000),
       ].join('\n'),
     );
-    return reply.slice(0, SUMMARY_MAX_CHARS);
+    return truncateUnicode(reply, SUMMARY_MAX_CHARS);
   }
 
   private async summarizeOverall(previous: string, segmentSummaries: string[]): Promise<string> {
@@ -129,10 +130,10 @@ export class DiarySummarizer {
           : '旧整体梗概：（暂无，这是第一次生成）',
         '',
         '分段摘要（从旧到新）：',
-        segmentSummaries.map((text, index) => `【段${index + 1}】${text}`).join('\n').slice(0, 20_000),
+        truncateUnicode(segmentSummaries.map((text, index) => `【段${index + 1}】${text}`).join('\n'), 20_000),
       ].join('\n'),
     );
-    return reply.slice(0, SUMMARY_MAX_CHARS * 1.5);
+    return truncateUnicode(reply, SUMMARY_MAX_CHARS * 1.5);
   }
 
   private async callModel(prompt: string): Promise<string> {

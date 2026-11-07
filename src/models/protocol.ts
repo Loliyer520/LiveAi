@@ -10,9 +10,10 @@
  *  - Anthropic extended thinking forces temperature=1.0.
  */
 
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import type { ChatReply, ChatRequest, ResolvedModel, ToolSchema } from './types.js';
 import type { ContentBlock, ModelMessage } from '../chat/types.js';
+import { sanitizeUnicode } from '../unicode.js';
 
 export class ProtocolError extends Error {
   constructor(
@@ -36,6 +37,9 @@ export async function completeChat(model: ResolvedModel, request: ChatRequest): 
   let attempt = 0;
   let dropStreamOptions = false;
   let dropReasoning = false;
+  // 总时长预算：单次 180s × 最多 5 次 = 15 分钟会把 scope actor 钉死、
+  // 全场沉默（2026-10-02 之鉴的另一半）。超过预算后不再重试，直接抛出。
+  const deadline = Date.now() + 6 * 60_000;
 
   for (;;) {
     attempt += 1;
@@ -45,27 +49,33 @@ export async function completeChat(model: ResolvedModel, request: ChatRequest): 
       if (!(error instanceof ProtocolError)) throw error;
       const optional400 =
         error.status !== undefined && (error.status === 400 || error.status === 422);
-      if (optional400 && !dropStreamOptions && /stream_options/i.test(error.body ?? '')) {
+      if (optional400 && !dropStreamOptions && /stream_options/i.test(error.body ?? '') && Date.now() < deadline) {
         dropStreamOptions = true;
         continue;
       }
-      if (optional400 && !dropReasoning && /reasoning/i.test(error.body ?? '')) {
+      if (optional400 && !dropReasoning && /reasoning/i.test(error.body ?? '') && Date.now() < deadline) {
         dropReasoning = true;
         continue;
       }
       // 空壳回复（无 status）比真限流更常见地一次性抽风——多给它两次机会，
       // 不然主AI回合会死在「连续 3 个空壳」上（gpt-6-sol 经中转实测会间歇吐空）。
       const maxAttempts = error.status === undefined ? 5 : 3;
-      if (error.transient && attempt < maxAttempts) continue;
+      if (error.transient && attempt < maxAttempts && Date.now() < deadline) continue;
       // 空壳重试耗尽 = 粘滞故障（中转可能对同 payload 吐缓存空壳）——
       // 把原始请求落盘，事后可以 curl 重放定位（2026-10-02 雪球回合连崩之鉴）。
-      if (error.status === undefined) void dumpEmptyShellRequest(url, model, request);
+      // 只给真·空壳落盘：普通网络错误（超时/断连）没有重放价值，曾经把
+      // data/state/debug 堆到 95MB/400 个文件，所以要带轮换上限。
+      if (error.status === undefined && error.message.startsWith('empty content') && request.signal?.aborted !== true) {
+        void dumpEmptyShellRequest(url, model, request);
+      }
       throw error;
     }
   }
 }
 
 /** 空壳故障的原始请求落盘（best-effort，绝不阻塞/影响主流程）。 */
+const EMPTY_SHELL_DUMP_KEEP = 50;
+
 async function dumpEmptyShellRequest(url: string, model: ResolvedModel, request: ChatRequest): Promise<void> {
   try {
     const dir = 'data/state/debug';
@@ -77,6 +87,13 @@ async function dumpEmptyShellRequest(url: string, model: ResolvedModel, request:
       request: { ...request, signal: undefined },
     };
     await writeFile(`${dir}/empty-shell-${Date.now()}.json`, JSON.stringify(body), 'utf-8');
+    // 轮换：只留最近 50 份，多余的从旧到新删——转中长期抽风时曾堆出 400 个文件。
+    const dumps = (await readdir(dir))
+      .filter((name) => /^empty-shell-\d+\.json$/.test(name))
+      .sort();
+    for (const stale of dumps.slice(0, Math.max(0, dumps.length - EMPTY_SHELL_DUMP_KEEP))) {
+      await rm(`${dir}/${stale}`, { force: true });
+    }
   } catch {
     // 调试落盘失败不值得任何动静
   }
@@ -119,15 +136,22 @@ async function callOnce(
             'content-type': 'application/json',
             authorization: `Bearer ${model.apiKey}`,
           },
-      body: JSON.stringify(body),
+      // A persisted prompt may contain a lone UTF-16 surrogate (for example
+      // from an older truncation). Escaping it as \uD800 makes some upstream
+      // JSON parsers reject the whole request, so sanitize every outbound string.
+      body: JSON.stringify(body, (_key, value) => typeof value === 'string' ? sanitizeUnicode(value) : value),
       signal,
     });
   } catch (error) {
+    // Caller aborts (shutdown / reload / superseded turn) must never be
+    // retried: retrying can take minutes and the result is already unwanted.
+    // Our own 180s timeout stays transient — a fresh attempt may succeed.
+    const abortedByCaller = request.signal?.aborted === true;
     throw new ProtocolError(
       `network error: ${error instanceof Error ? error.message : String(error)}`,
       undefined,
       undefined,
-      true,
+      !abortedByCaller,
     );
   }
 
@@ -148,7 +172,7 @@ async function callOnce(
   } catch {
     throw new ProtocolError('invalid JSON response', undefined, rawText.slice(0, 400), true);
   }
-  return parseReply(data, url, request.tools);
+  return parseReply(data, model, request.tools);
 }
 
 // ── Anthropic Messages ──────────────────────────────────────────────────────
@@ -160,10 +184,19 @@ const ANTHROPIC_THINKING_BUDGET: Record<string, number> = {
 };
 
 function buildAnthropicBody(model: ResolvedModel, request: ChatRequest, options: CallOptions): Record<string, unknown> {
+  const maxTokens = Math.max(1, Math.trunc(Number(request.maxTokens) || 0));
   const thinkingEnabled = request.thinkingLevel !== 'off' && !options.dropReasoning;
+  // budget 必须严格小于 max_tokens；且 anthropic 的最小预算是 1024。
+  // max_tokens 太小时（例如 1024 以下的短任务）无法同时满足两条 → 直接关思考，
+  // 否则请求会被上游 400 拒绝。
+  const thinkingBudget = Math.min(
+    ANTHROPIC_THINKING_BUDGET[request.thinkingLevel] ?? 4096,
+    maxTokens - 1,
+  );
+  const useThinking = thinkingEnabled && thinkingBudget >= 1024;
   const body: Record<string, unknown> = {
     model: model.modelName,
-    max_tokens: request.maxTokens,
+    max_tokens: maxTokens,
     messages: renderAnthropicMessages(request.messages),
     tools: request.tools.map((tool) => ({
       name: tool.name,
@@ -171,11 +204,10 @@ function buildAnthropicBody(model: ResolvedModel, request: ChatRequest, options:
       input_schema: tool.parameters,
     })),
   };
-  if (thinkingEnabled) {
+  if (useThinking) {
     body.thinking = {
       type: 'enabled',
-      // budget 必须严格小于 max_tokens，否则 API 直接 400；floor 1024 是 anthropic 的最小预算。
-      budget_tokens: Math.max(1024, Math.min(ANTHROPIC_THINKING_BUDGET[request.thinkingLevel] ?? 4096, request.maxTokens - 1)),
+      budget_tokens: thinkingBudget,
     };
     if (!model.dropTemperature) body.temperature = 1.0; // required with extended thinking
   } else {
@@ -411,10 +443,16 @@ function renderCompletionsContent(content: string | ContentBlock[]): string | Re
   );
 }
 
-function parseReply(data: unknown, url: string, tools: ToolSchema[]): ChatReply {
-  if (String(url).includes('/responses')) return parseResponsesReply(data as Record<string, unknown>);
-  if (String(url).includes('/chat/completions')) return parseCompletionsReply(data as Record<string, unknown>);
-  return parseAnthropicReply(data as Record<string, unknown>);
+function parseReply(data: unknown, model: ResolvedModel, tools: ToolSchema[]): ChatReply {
+  // Dispatch on the configured protocol, not URL substrings: a custom
+  // messages_path (e.g. bigmodel /api/paas/v4, relays with /v1/messages)
+  // can contain neither '/chat/completions' nor '/responses', and a wrong
+  // fallback parsed OpenAI payloads as Anthropic (empty text → retries).
+  if (model.protocol === 'anthropic') return parseAnthropicReply(data as Record<string, unknown>);
+  // Must match buildOpenAiBody's detection exactly, or request/response
+  // formats diverge for paths like "/responses/" (misparsed as completions).
+  if (model.messagesPath.endsWith('/responses')) return parseResponsesReply(data as Record<string, unknown>);
+  return parseCompletionsReply(data as Record<string, unknown>);
 }
 
 function parseCompletionsReply(data: Record<string, unknown>): ChatReply {

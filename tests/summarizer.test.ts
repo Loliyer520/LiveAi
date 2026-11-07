@@ -173,6 +173,25 @@ test('overall primer keeps refreshing after the 20-summary cap (no freeze)', asy
   }
 });
 
+test('summary truncation never persists half of a surrogate pair', async () => {
+  const fixture = await makeFixture();
+  try {
+    fixture.replyTexts.push(`${'甲'.repeat(359)}𝕄尾`);
+    for (let index = 0; index < 50; index += 1) {
+      fixture.repo.appendMessage('group', 'unicode', entry(index));
+    }
+    fixture.summarizer.notify('group', 'unicode');
+    await waitFor(() => fixture.repo.getDiarySummaries('group', 'unicode').length === 1);
+
+    const summary = fixture.repo.getDiarySummaries('group', 'unicode')[0];
+    assert.equal(summary.text, '甲'.repeat(359), 'cut before the split emoji instead of retaining its high surrogate');
+    assert.equal(fixture.repo.getOrCreateAgent('group', 'unicode').overallSummary.includes('𝕄尾'), true);
+    await fixture.repo.flush();
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

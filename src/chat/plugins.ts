@@ -20,18 +20,26 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import type { ToolSchema } from '../models/types.js';
 import type { ToolContext, ToolResult } from './tools.js';
-import { webFetch } from './net.js';
+import { webFetch, downloadToFile } from './net.js';
 import { spendNetworkBudget, sendLinesVerbatim, SEND_FILE_MAX_LINES } from './actions.js';
 import { probeRecord } from '../observability/probe.js';
+import { isPersonaRefUrl, personaRefDataUri } from '../store/persona-refs.js';
+import { cachedImageUri, qqImageHeaders } from './image-cache.js';
+import { normalizeMessageRef } from '../message-ref.js';
 
 export interface PluginToolRequest {
   method?: string;
   url: string;
   headers?: Record<string, string>;
   body?: string;
+  /** 整条请求的超时 ms（默认 20s）；生图/编辑这类慢接口在清单里声明长超时。 */
+  timeout_ms?: number;
 }
 
 export interface PluginToolResponse {
@@ -91,6 +99,15 @@ export interface PluginToolDef {
    * model input — so it stays a master decision (e.g. local novel API).
    */
   allow_internal?: boolean;
+  /**
+   * 参数名列表：这些参数的值若是 http(s) 链接，请求前自动下载（走 SSRF
+   * 校验 + 网络预算）并替换为 data:<mime>;base64,<…> 再插值——用于
+   * "图片编辑"类接口：QQ 图床带 rkey 鉴权且会过期，上游取不到，必须
+   * 本机代取后内联进请求体。
+   */
+  inline_data_uri?: string[];
+  /** inline_data_uri 的增强模式：全部内联图合并成 JSON 数组塞进这个参数（多图编辑）。 */
+  inline_data_uri_array?: string;
   request: PluginToolRequest;
   response?: PluginToolResponse;
 }
@@ -434,6 +451,7 @@ export class PluginRegistry {
   /** Tool schemas exposed to the model; reservedNames (builtin) win collisions. */
   toolSchemas(scopeKey: string, includeMaster: boolean, reservedNames: Set<string>): ToolSchema[] {
     const schemas: ToolSchema[] = [];
+    const claimed = new Set<string>();
     for (const manifest of this.manifests.values()) {
       if (!this.isEnabled(manifest)) continue;
       for (const tool of manifest.tools) {
@@ -447,6 +465,13 @@ export class PluginRegistry {
           this.errors.set(manifest.name, `工具名 ${tool.name} 与内置工具冲突，已跳过`);
           continue;
         }
+        // Two plugins exporting the same name would give the model two
+        // identical schemas while execute() can only ever reach the first.
+        if (claimed.has(tool.name)) {
+          this.errors.set(manifest.name, `工具名 ${tool.name} 已被其他插件占用，已跳过`);
+          continue;
+        }
+        claimed.add(tool.name);
         schemas.push({
           name: tool.name,
           description: `${tool.description}（插件 ${manifest.name}）`,
@@ -496,18 +521,124 @@ export class PluginRegistry {
     }
 
     try {
-      spendNetworkBudget(context);
-
-      // Required-parameter check (models occasionally drop them).
+      // Required-parameter check (models occasionally drop them) must run BEFORE
+      // spending budget — a malformed call the plugin never saw shouldn't burn quota.
       const required = (def.parameters as { required?: string[] }).required ?? [];
       const missing = required.filter((key) => args[key] === undefined || args[key] === null || String(args[key]).trim() === '');
       if (missing.length > 0) return { ok: false, output: `${toolName}: 缺少必填参数 ${missing.join('、')}。` };
+      spendNetworkBudget(context);
 
       // Fill JSON-schema defaults for omitted optional params.
       const properties = (def.parameters as { properties?: Record<string, { default?: unknown }> }).properties ?? {};
       args = { ...args };
       for (const [key, spec] of Object.entries(properties)) {
         if (args[key] === undefined && spec && typeof spec === 'object' && 'default' in spec) args[key] = spec.default;
+      }
+
+      // inline_data_uri：把声明的 URL 参数本机取回并转成 data URI 内联。
+      // QQ 图链带 rkey 且上游取不到，编辑类接口必须这样代取。
+      if (Array.isArray(def.inline_data_uri) && def.inline_data_uri.length > 0) {
+        // inline_data_uri_array：声明的图全部内联后合并成 JSON 数组塞回这个参数——
+        // 编辑接口可同时吃「用户图 + 人设参考图」多张输入（gpt-image 系列）。
+        const arrayKey = def.inline_data_uri_array;
+        const inlined: string[] = [];
+        // 成功内联的参数名（主图解析失败检测用）。
+        const resolvedKeys = new Set<string>();
+        let downloadError = '';
+        for (const key of def.inline_data_uri) {
+          let value = args[key];
+          const isAuxRef = arrayKey !== undefined && key !== arrayKey;
+          // persona-ref://<名字> 或裸名字：面板上传的人设参考图，直接内联。
+          let refName: string | null = null;
+          if (typeof value === 'string' && isPersonaRefUrl(value.trim())) refName = value.trim().slice('persona-ref://'.length);
+          else if (isAuxRef && typeof value === 'string' && value.trim() !== '' && !/^https?:\/\//i.test(value.trim())) refName = value.trim();
+          if (refName !== null) {
+            const refUri = personaRefDataUri(`persona-ref://${refName}`);
+            if (refUri === null) {
+              return { ok: false, output: `${toolName}: 没有找到人设参考图 ${refName}（可在面板 image 插件页「人设参考图」上传）。` };
+            }
+            if (arrayKey !== undefined) inlined.push(refUri);
+            else args[key] = refUri;
+            resolvedKeys.add(key);
+            continue;
+          }
+          // 参数省略/非 URL：先试消息短ID 反查历史图，再回落到本轮最新一张图。
+          if (typeof value === 'string' && value.trim() !== '' && !/^https?:\/\//i.test(value.trim())) {
+            const normalized = normalizeMessageRef(value);
+            const entry = context.repo.findEntryByRef(context.scopeType, context.scopeId, normalized);
+            const entryRefs = Array.isArray(entry?.image_refs) ? (entry!.image_refs as string[]) : [];
+            if (entryRefs.length > 0) value = entryRefs[entryRefs.length - 1];
+            else {
+              const hint = context.repo.recentImageRefs(context.scopeType, context.scopeId, 5)
+                .map((item) => `[#${item.ref}]`).join('、');
+              return {
+                ok: false,
+                output: `${toolName}: 短ID ${normalized || value} 没有对应图片，已停止，不能偷偷改用本轮其他图片。`
+                  + (hint ? `可用带图消息：${hint}。` : '本会话近期没有可用图片。')
+                  + '请按用户目标传真实短ID，或让用户重新发图。',
+              };
+            }
+          }
+          if (typeof value !== 'string' || !/^https?:\/\//i.test(value.trim())) {
+            const triggerRefs = context.triggerImageRefs ?? [];
+            if (triggerRefs.length > 0) value = triggerRefs[triggerRefs.length - 1];
+          }
+          if (typeof value !== 'string' || !/^https?:\/\//i.test(value.trim())) continue;
+          // 入站缓存优先：QQ 图链 rkey 时效极短，短ID 回看的图经常链接已死——
+          // 进站时抓的本地副本才是可靠来源（2026-10-31 HTTP 400 连败之鉴）。
+          const cachedUri = await cachedImageUri(value.trim());
+          if (cachedUri !== null) {
+            if (arrayKey !== undefined) inlined.push(cachedUri);
+            else args[key] = cachedUri;
+            resolvedKeys.add(key);
+            continue;
+          }
+          args[key] = value;
+          spendNetworkBudget(context);
+          const tempPath = join(tmpdir(), `dl-plugin-${randomUUID()}`);
+          try {
+            const { contentType } = await downloadToFile(value.trim(), tempPath, 12 * 1024 * 1024, {
+              allowInternal: def.allow_internal === true,
+              timeoutMs: 60_000,
+              headers: qqImageHeaders(value.trim()),
+            });
+            const buffer = await readFile(tempPath);
+            const mime = contentType.startsWith('image/') ? contentType : 'image/png';
+            const dataUri = `data:${mime};base64,${buffer.toString('base64')}`;
+            if (arrayKey !== undefined) inlined.push(dataUri);
+            else args[key] = dataUri;
+            resolvedKeys.add(key);
+          } catch (error) {
+            // 下载失败不再整跳炸出（外面只有干巴巴的"调用失败"）：记下真实原因，
+            // 让主图缺失的硬报错把病因+可用短ID 一起告诉模型，一次纠偏。
+            downloadError = error instanceof Error ? error.message : String(error);
+          } finally {
+            void rm(tempPath, { force: true }).catch(() => {});
+          }
+        }
+        if (arrayKey !== undefined) {
+          // 主图（声明列表第一个）没解析到时绝不静默只传参考图——那会让模型以为
+          // 「用户照片+参考图」都上去了，实际只有参考图，成品自然不对，模型就会
+          // 反复重发。直接报错指路（2026-10-30 私聊重发 4 次之鉴）。
+          const primaryKey = def.inline_data_uri[0];
+          if (!resolvedKeys.has(primaryKey)) {
+            const hint = context.repo.recentImageRefs(context.scopeType, context.scopeId, 5)
+              .map((entry) => `${entry.ref}（${entry.ageMinutes} 分钟前）`).join('、');
+            return {
+              ok: false,
+              output: `${toolName}: 取不到要编辑的原图。` +
+                (downloadError !== '' ? `最后一次尝试的失败原因：${downloadError}。` : '')
+                + (hint !== '' ? `本会话最近带图的消息短ID：${hint}——把对应短ID 传给 image 参数再试一次（注意挑用户说的那张）。` : '本轮和近期消息里都没有图。')
+                + '都不对就让用户重新发一张图；只有参考图没有原图时不该硬编。',
+            };
+          }
+          if (inlined.length === 0) {
+            return { ok: false, output: `${toolName}: 没有可用的输入图片——让用户发一张图，或改用 image_generate 直接生成。` };
+          }
+          for (const key of def.inline_data_uri) delete args[key];
+          // body 模板里这个参数不再带引号（{{image}}），值本身就是合法 JSON。
+          args[arrayKey] = JSON.stringify(inlined);
+        }
       }
 
       const secretValues = this.secretValuesForScrub();
@@ -518,7 +649,17 @@ export class PluginRegistry {
       }
       const body = def.request.body === undefined
         ? undefined
-        : interpolate(def.request.body, (key) => this.resolveValue(key, owner.name, args, context, false));
+        : interpolateJsonBody(def.request.body, (key) => this.resolveValue(key, owner.name, args, context, false));
+      if (body !== undefined) {
+        try {
+          JSON.parse(body);
+        } catch (error) {
+          return {
+            ok: false,
+            output: `${toolName}: 请求体 JSON 构造失败（${error instanceof Error ? error.message : String(error)}）。这是插件模板/参数转义问题，原样重试不会成功，请检查参数或改用其他工具。`,
+          };
+        }
+      }
 
       // displayLimit ≥ maxBytes: plugins must parse the FULL JSON body;
       // the model-facing truncation happens after extract/template below.
@@ -531,6 +672,7 @@ export class PluginRegistry {
         maxBytes: 2 * 1024 * 1024,
         displayLimit: 2 * 1024 * 1024,
         allowInternal: def.allow_internal === true,
+        timeoutMs: def.request.timeout_ms,
       });
       let output: string;
       let saveNote = '';
@@ -556,6 +698,23 @@ export class PluginRegistry {
               output: this.scrub(`接口返回失败（${response.code_path}=${String(code)}）：${String(msg ?? '未知错误')}`, secretValues),
             };
           }
+        }
+        // HTTP 错误先按状态分类：4xx 多半是请求/参数问题，原样重试只会烧钱；
+        // 429/5xx 才值得稍后重试。不要落进 response.template 缺字段分支，
+        // 把真实的上游错误包装成「临时抖动」让模型连试好几次。
+        if (result.status >= 400) {
+          const parsedError = parsed as { error?: { message?: unknown }; message?: unknown; msg?: unknown };
+          const why = [parsedError?.error?.message, parsedError?.message, parsedError?.msg]
+            .find((value): value is string => typeof value === 'string' && value.trim() !== '');
+          const transient = result.status === 429 || result.status >= 500;
+          return {
+            ok: false,
+            output: this.scrub(
+              `接口请求失败 HTTP ${result.status}${why ? `：${why}` : ''}。`
+                + (transient ? '这是临时性错误，可稍后原样重试一次；仍失败就停止并如实说明。' : '这是请求/参数或权限错误，原样重试不会成功，请根据报错修正；无法修正就停止，不要连续硬试。'),
+              secretValues,
+            ),
+          };
         }
         if (response.save_each) {
           const batched = await this.saveEachToWorkspace(response.save_each, owner.name, parsed, args, context);
@@ -847,6 +1006,50 @@ export function extractPath(value: unknown, path: string): unknown {
 
 function interpolate(template: string, resolveKey: (key: string) => string): string {
   return template.replace(PLACEHOLDER, (_match, key: string) => resolveKey(key));
+}
+
+/**
+ * JSON 请求体专用插值：字符串里的占位符必须做 JSON 转义，否则 prompt 里的
+ * 引号/换行会直接把请求体拼坏（2026-10-31 image_edit「去字幕」连续 400 之鉴）。
+ * 字符串外的占位符保持原样，供已 JSON.stringify 的数组/数字/布尔值使用。
+ */
+export function interpolateJsonBody(template: string, resolveKey: (key: string) => string): string {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < template.length; i += 1) {
+    const char = template[i];
+    if (inString) {
+      if (escaped) {
+        out += char;
+        escaped = false;
+        continue;
+      }
+      if (char === '\\') {
+        out += char;
+        escaped = true;
+        continue;
+      }
+      if (char === '"') {
+        out += char;
+        inString = false;
+        continue;
+      }
+    } else if (char === '"') {
+      out += char;
+      inString = true;
+      continue;
+    }
+    const match = /^\{\{([^{}]+)\}\}/.exec(template.slice(i));
+    if (match) {
+      const value = resolveKey(match[1].trim());
+      out += inString ? JSON.stringify(value).slice(1, -1) : value;
+      i += match[0].length - 1;
+      continue;
+    }
+    out += char;
+  }
+  return out;
 }
 
 /** Resolve a list path, flattening `[]` segments: `data.volumes[].chapters` walks every volume. */

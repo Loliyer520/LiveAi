@@ -13,6 +13,7 @@ import {
 import { buildChildMessages, buildChildBackgroundPrompt } from '../src/prompt/assemble.js';
 import type { AssembleInput } from '../src/prompt/assemble.js';
 import { stripThinking } from '../src/chat/thinking.js';
+import { PromptStore } from '../src/prompt/store.js';
 import type { HistoryEntry, TriggerEntry, ChatMessage } from '../src/chat/types.js';
 
 const BOT_ID = '999';
@@ -142,9 +143,10 @@ test('stripThinking removes closed and unclosed thinking blocks', () => {
 const BUNDLE = {
   char: '你是冰糖，一个内向的高中生。',
   charPrefill: '好的，我会按照人设行动。',
-  chatFocus: '【聊天职责】观察群聊。',
+  chatFocus: '【群聊职责】观察群聊。',
+  privateFocus: '【私聊职责】回应需求并使用工具。',
   chatStyle: '【说话检查】短句。',
-  childRules: '1. 规则一\n2. 规则二\n23. 规则二十三\n24. 规则二十四\n25. 规则二十五',
+  childRules: '1. 规则一\n2. 规则二（本条群聊不适用）\n3. 规则三',
   main: '你是主AI。',
   agent: '你是后台agent。',
   staffSystem: 'staff system block',
@@ -210,6 +212,18 @@ function assembleInput(triggerText: string): AssembleInput {
   };
 }
 
+test('production prompts explain Bilibili routing without stale tool names', async () => {
+  const bundle = await new PromptStore().bundle();
+  assert.ok(bundle.privateFocus.includes('request_type="bili"'));
+  assert.ok(bundle.privateFocus.includes('watch_video'));
+  assert.ok(bundle.staffSystem.includes('domain:bili'));
+  assert.ok(bundle.staffSystem.includes('target_scope_id="bili"'));
+  assert.ok(!bundle.chatFocus.includes('request_knowledge_base_update'));
+  assert.ok(!bundle.childRules.includes('memory_get'));
+  assert.ok(!bundle.main.includes('敏感信息无需掩码'));
+  assert.ok(!bundle.staffSystem.includes('敏感信息无需掩码'));
+});
+
 test('transcript block caps at ~60k chars, keeps the tail, notes the omission', () => {
   // 超长会话（小说陪读型）500 条历史渲染出 20 万+ 字符短聊，占掉每轮
   // prompt 八成且每轮全量重读。转写封顶保尾；更早的交给分段摘要 +
@@ -245,11 +259,13 @@ test('buildChildMessages orders system blocks and stamps cache on head', () => {
   // 易变背景（时间/印象/摘要）挪到触发消息尾部，保住历史前缀缓存。
   assert.equal(system.length, 2);
   assert.ok(system[0].text.includes('staff system block'));
-  assert.ok(system[0].text.includes('规则二十五'));
-  // chat mode drops tooling-only rules 2/23/24
-  assert.ok(!system[0].text.includes('规则二十三'));
+  assert.ok(system[0].text.includes('规则三'));
+  // Private chat keeps tooling rules and gets private—not group—focus.
+  assert.ok(system[0].text.includes('规则二（本条群聊不适用）'));
   assert.ok(system[0].cacheControl?.type === 'ephemeral');
   assert.ok(system[1].text.includes('冰糖'));
+  assert.ok(system[1].text.includes('【私聊职责】'));
+  assert.ok(!system[1].text.includes('【群聊职责】'));
   assert.ok(system[1].text.includes('send_message'));
   assert.ok(system[1].cacheControl?.type === 'ephemeral');
 
@@ -264,6 +280,23 @@ test('buildChildMessages orders system blocks and stamps cache on head', () => {
   assert.ok(triggerText.includes('<user_invisible>'));
   assert.ok(triggerText.includes('2026-09-28'));
   assert.ok(triggerText.includes('旧摘要'));
+});
+
+test('group and domain scopes do not inherit private focus', () => {
+  const groupInput = assembleInput('群里聊什么');
+  groupInput.message = { ...groupInput.message, chatType: 'group' };
+  const group = buildChildMessages(groupInput);
+  assert.ok(group.system[1].text.includes('【群聊职责】'));
+  assert.ok(!group.system[1].text.includes('【私聊职责】'));
+  assert.ok(!group.system[0].text.includes('规则二'), 'group drops marker-tagged tooling rules');
+
+  const domainInput = assembleInput('[主AI委派] 查这个视频');
+  domainInput.message = { ...domainInput.message, chatType: 'domain' };
+  const domain = buildChildMessages(domainInput);
+  assert.ok(!domain.system[1].text.includes('【群聊职责】'));
+  assert.ok(!domain.system[1].text.includes('【私聊职责】'));
+  assert.ok(!domain.system[1].text.includes('【说话检查】'));
+  assert.ok(domain.system[0].text.includes('规则二'), 'domain keeps its tooling rules');
 });
 
 test('tool prefill pair stays short and never mentions <thinking> (apipp prose-mode poison)', () => {
@@ -309,11 +342,12 @@ test('master mode: coordination prefill, unfiltered rules, relation overview', (
   input.background.relationOverview = '人物（按情报量排序）:\n- 小明(456)：3 条情报';
   const { system, messages } = buildChildMessages(input);
 
-  // rules NOT filtered in master mode (chat-mode filter drops 2/23/24)
-  assert.ok(system[0].text.includes('规则二十三'), 'master keeps tooling rules');
+  // rules NOT filtered in master mode (chat-mode filter drops marker-tagged rules)
+  assert.ok(system[0].text.includes('规则二'), 'master keeps tooling rules');
   // no chat focus/style, no chat-persona prefill acknowledgement
   const personaTail = system[system.length - 1].text;
-  assert.ok(!personaTail.includes('【聊天职责】'));
+  assert.ok(!personaTail.includes('【群聊职责】'));
+  assert.ok(!personaTail.includes('【私聊职责】'));
   assert.ok(personaTail.includes('主AI职责'));
   // 关系网络概览属于易变背景，随触发消息尾部下发
   const triggerText = String((messages[messages.length - 1] as { content: string }).content);
@@ -333,7 +367,7 @@ test('background prompt renders sender relation card with confidentiality note',
   input.background.senderCard = '小明(456)，出现于 3 个会话\n- [preference][9-28] 喜欢猫';
   input.background.scopeRelationCard = '常聊话题: 游戏、考试';
   const text = buildChildBackgroundPrompt(input);
-  assert.ok(text.includes('发送者档案（关系网络'));
+  assert.ok(text.includes('<发送者档案'));
   assert.ok(text.includes('喜欢猫'));
   assert.ok(text.includes('不要说出"我在别的群看到你'), 'cross-scope confidentiality rule');
   assert.ok(text.includes('本会话关系网络概况'));

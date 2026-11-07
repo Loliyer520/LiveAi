@@ -11,24 +11,28 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AiOrchestrator } from '../src/chat/orchestrator.js';
+import { setDnsResolverForTests } from '../src/chat/net.js';
+import { RelationGraph } from '../src/relations/graph.js';
 import { ScopeRepository } from '../src/store/repository.js';
 import { MessageArchive } from '../src/store/archive.js';
 import { DiarySummarizer } from '../src/store/summarizer.js';
 import { PromptStore } from '../src/prompt/store.js';
 import { ModelManager } from '../src/models/manager.js';
-import { RelationGraph } from '../src/relations/graph.js';
 import { KnowledgeBase } from '../src/knowledge/kb.js';
 import { IntelCollector } from '../src/relations/collector.js';
 import type { NapcatBot } from '../src/bot/napcat.js';
 import type { ChatMessage } from '../src/chat/types.js';
+import { configureImageCache } from '../src/chat/image-cache.js';
 
 interface Harness {
   orchestrator: AiOrchestrator;
   repo: ScopeRepository;
   sent: { chatType: string; targetId: number; text: string }[];
+  sentImages: { chatType: string; targetId: number; file: string }[];
   datalineSent: { text: string }[];
   modelRequests: Record<string, unknown>[];
   modelsJson: string;
+  relations: RelationGraph;
   cleanup: () => Promise<void>;
 }
 
@@ -50,7 +54,8 @@ function makeMessage(chatId: number, text: string, userId = 100, messageId: numb
 /** Scripted anthropic-style replies; one entry per expected model call. */
 type ScriptedReply =
   | { text: string }
-  | { tool: string; input: Record<string, unknown> };
+  | { tool: string; input: Record<string, unknown> }
+  | { error: { status: number; body?: string } };
 
 function anthropicResponse(script: ScriptedReply): Record<string, unknown> {
   if ('tool' in script) {
@@ -59,6 +64,7 @@ function anthropicResponse(script: ScriptedReply): Record<string, unknown> {
       usage: { input_tokens: 10, output_tokens: 10 },
     };
   }
+  if ('error' in script) throw new Error('error script must be handled by the fetch stub');
   return {
     content: [{ type: 'text', text: script.text }],
     usage: { input_tokens: 10, output_tokens: 10 },
@@ -68,6 +74,7 @@ function anthropicResponse(script: ScriptedReply): Record<string, unknown> {
 async function makeHarness(replies: ScriptedReply[], onFirstModelCall?: () => void): Promise<Harness> {
   const dir = await mkdtemp(join(tmpdir(), 'liveai-test-'));
   const stateDir = join(dir, 'state');
+  configureImageCache(join(stateDir, 'imgcache'));
   const modelsJson = join(dir, 'models_config.json');
   await writeFile(modelsJson, JSON.stringify({
     upstreams: [{ name: 'stub', base_url: 'http://model.test', api_key: 'sk-test', protocol: 'anthropic' }],
@@ -87,6 +94,7 @@ async function makeHarness(replies: ScriptedReply[], onFirstModelCall?: () => vo
   const intel = new IntelCollector(relations, repo, models, () => 987654322, false); // disabled: relations tests cover it
 
   const sent: { chatType: string; targetId: number; text: string }[] = [];
+  const sentImages: { chatType: string; targetId: number; file: string }[] = [];
   const datalineSent: { text: string }[] = [];
   const modelRequests: Record<string, unknown>[] = [];
   let callIndex = 0;
@@ -104,6 +112,10 @@ async function makeHarness(replies: ScriptedReply[], onFirstModelCall?: () => vo
     async sendDatalineText(text: string) {
       datalineSent.push({ text });
       return { message_id: 8000 + datalineSent.length };
+    },
+    async sendImage(chatType: string, targetId: number, file: string) {
+      sentImages.push({ chatType, targetId, file });
+      return { message_id: 7000 + sentImages.length };
     },
     async sendReplyText(message: ChatMessage, content: string) {
       sent.push({ chatType: message.chatType, targetId: Number(message.chatId), text: content });
@@ -123,13 +135,27 @@ async function makeHarness(replies: ScriptedReply[], onFirstModelCall?: () => vo
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const url = String(input instanceof Request ? input.url : input);
+    // view_image_raw 的原图代取：返回一张 1x1 PNG（base64）。
+    if (url.includes('img.example.com')) {
+      const png = Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
+        'base64',
+      );
+      return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
+    }
     assert.ok(url.includes('model.test'), `unexpected fetch: ${url}`);
-    if (callIndex === 0) onFirstModelCall?.();
+    if (callIndex === 0) await onFirstModelCall?.();
     const rawBody = input instanceof Request ? await input.clone().text() : String(init?.body ?? '{}');
     const body = JSON.parse(rawBody) as Record<string, unknown>;
     modelRequests.push(body);
     const script = replies[Math.min(callIndex, replies.length - 1)];
     callIndex += 1;
+    if ('error' in script) {
+      return new Response(script.error.body ?? 'temporary upstream failure', {
+        status: script.error.status,
+        headers: { 'content-type': 'text/plain' },
+      });
+    }
     return new Response(JSON.stringify(anthropicResponse(script)), {
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -155,7 +181,7 @@ async function makeHarness(replies: ScriptedReply[], onFirstModelCall?: () => vo
     summarizer,
     relations,
     intel,
-    kb: new KnowledgeBase(join(dir, 'knowledge'), 'private:123456789'),
+    kb: new KnowledgeBase(join(dir, 'knowledge'), 'master:core'),
     tasksPath: join(dir, 'tasks.json'),
   });
   orchestrator.start();
@@ -164,12 +190,15 @@ async function makeHarness(replies: ScriptedReply[], onFirstModelCall?: () => vo
     orchestrator,
     repo,
     sent,
+    sentImages,
     datalineSent,
     modelRequests,
     modelsJson,
+    relations,
     cleanup: async () => {
       globalThis.fetch = originalFetch;
       await orchestrator.stop();
+      configureImageCache('');
       await rm(dir, { recursive: true, force: true });
     },
   };
@@ -191,6 +220,40 @@ test('simple private reply: one model call, send_message sends and persists', as
     assert.ok(outbound !== undefined, 'outbound send persisted to history');
     assert.ok(outbound.message_ref !== undefined);
     await harness.repo.flush();
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('send_message result explains turn completion without blocking intentional follow-ups', async () => {
+  const harness = await makeHarness([
+    { tool: 'send_message', input: { content: '第一条' } },
+    { tool: 'send_message', input: { content: '确实还要补充一条' } },
+    { tool: 'stay_silent', input: {} },
+  ]);
+  try {
+    harness.orchestrator.handleMessage(makeMessage(123, 'ok了', 100, 31));
+    await waitFor(() => harness.modelRequests.length >= 3);
+    assert.deepEqual(harness.sent.map((entry) => entry.text), ['第一条', '确实还要补充一条']);
+    const requests = JSON.stringify(harness.modelRequests);
+    assert.ok(requests.includes('如果本次回应已经完成，请调用 stay_silent 结束本轮'));
+    assert.ok(!requests.includes('本次追加消息已拦截'));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('progress message does not block the result message after a real tool runs', async () => {
+  const harness = await makeHarness([
+    { tool: 'send_message', input: { content: '我去看一下' } },
+    { tool: 'memory_list', input: {} },
+    { tool: 'send_message', input: { content: '看完啦' } },
+    { tool: 'stay_silent', input: {} },
+  ]);
+  try {
+    harness.orchestrator.handleMessage(makeMessage(123, '帮我看看', 100, 32));
+    await waitFor(() => harness.sent.length === 2);
+    assert.deepEqual(harness.sent.map((entry) => entry.text), ['我去看一下', '看完啦']);
   } finally {
     await harness.cleanup();
   }
@@ -246,6 +309,8 @@ test('mid-turn pickup: message arriving during the tool loop joins the same turn
   const harness = await makeHarness(
     [
       { tool: 'send_message', input: { content: '第一条回复' } },
+      // 发送拦截：第一轮的发送被「插队消息」拦下，模型看完新消息后重调才发出
+      { tool: 'send_message', input: { content: '第一条回复' } },
       { tool: 'stay_silent', input: {} },
     ],
     () => {
@@ -258,12 +323,66 @@ test('mid-turn pickup: message arriving during the tool loop joins the same turn
     await waitFor(() => harness.modelRequests.length >= 2);
     await sleep(150);
 
-    assert.equal(harness.sent.length, 1); // first reply sent; second round chose silence
+    assert.equal(harness.sent.length, 1); // 被拦一次 + 重调放行，最终只发一条
     const secondRequest = harness.modelRequests[1];
     const flattened = JSON.stringify(secondRequest.messages);
     assert.ok(flattened.includes('插队消息'), 'queued message became round-2 trigger');
-    assert.ok(flattened.includes('第一条回复'), 'round-1 outbound visible as history continuation');
+    assert.ok(flattened.includes('发送前暂停'), 'send interlock notice present in round 2 context');
     assert.ok(flattened.includes('补审提醒'), 'deferred-count reminder injected');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('主级回话在用户回合进行中到达：折入同一回合并提示主动转告', async () => {
+  const harness = await makeHarness(
+    [
+      { tool: 'memory_write', input: { text: '等待主级结论' } },
+      { tool: 'send_message', input: { content: '主级结论到了，现在开不了。' } },
+      { tool: 'stay_silent', input: {} },
+    ],
+    () => {
+      // 实机故障形态：子AI的用户回合尚未结束，主级回话先进入 mailbox。
+      harness.orchestrator.handleMessage({
+        ...makeMessage(125, '[主级回话 from domain:onebot]\n结论：现在开不了。', 0, 56),
+        rawData: { source: 'agent_message', peer_chat: 'domain:onebot' },
+      });
+    },
+  );
+  try {
+    harness.orchestrator.handleMessage(makeMessage(125, '帮我问问能不能开', 100, 55));
+    await waitFor(() => harness.sent.some((entry) => entry.text.includes('主级结论到了')));
+    const callbackRound = JSON.stringify(harness.modelRequests[1]?.messages ?? '');
+    assert.ok(callbackRound.includes('主级回话 from domain:onebot'), '主级回话应折入进行中的回合');
+    assert.ok(callbackRound.includes('本轮包含主AI/领域中枢对先前请示的正式回话'), '折入后也应带主动转告提示');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('发送拦截：思考期间进来的新消息会暂停第一次发送，模型看完重调才发出', async () => {
+  const harness = await makeHarness(
+    [
+      { tool: 'send_message', input: { content: '先说这个' } },
+      { tool: 'send_message', input: { content: '先说这个' } },
+      { tool: 'stay_silent', input: {} },
+    ],
+    () => {
+      // 第一轮模型调用进行中，用户插了一句——send_message 执行时必须拦下
+      harness.orchestrator.handleMessage(makeMessage(126, '插一句', 100, 55));
+    },
+  );
+  try {
+    harness.orchestrator.handleMessage(makeMessage(126, '开场', 100, 54));
+    await waitFor(() => harness.sent.length === 1, 3000);
+    await sleep(150);
+    assert.equal(harness.sent.filter((entry) => entry.text === '先说这个').length, 1, '重调后只真正发出一次');
+    assert.equal(harness.sent[0].text, '先说这个');
+    // 第二轮请求里必须同时带着拦截提示和新消息本身（fold 折入）
+    const round2 = JSON.stringify(harness.modelRequests[1]?.messages ?? []);
+    assert.ok(round2.includes('发送前暂停'), '拦截提示进了上下文');
+    assert.ok(round2.includes('插一句'), '新消息被 fold 进下一轮触发');
+    assert.ok(round2.includes('没有发出去'), '提示里明确说明未发送');
   } finally {
     await harness.cleanup();
   }
@@ -300,8 +419,28 @@ test('post-turn merge: messages queued during a full turn become ONE follow-up c
   }
 });
 
-test('crash guard: failed model call persists an interrupt note', async () => {
-  const harness = await makeHarness([{ tool: 'stay_silent', input: {} }]);
+test('transient 500 on a user message turn is retried and recovers (no message lost)', async () => {
+  // 第一次模型调用 500（瞬时）→ 协议层内部重试耗尽后回合级重试 → 成功发出去。
+  // 500 重复 3 次：completeChat 自己对瞬时错误重试 3 次，都用 500 脚本，第 4 次调用才放行。
+  const harness = await makeHarness([
+    { error: { status: 500 } },
+    { error: { status: 500 } },
+    { error: { status: 500 } },
+    { tool: 'send_message', input: { content: '恢复了' } },
+    { tool: 'stay_silent', input: {} },
+  ]);
+  try {
+    harness.orchestrator.handleMessage(makeMessage(127, '别丢我', 100, 77));
+    await waitFor(() => harness.sent.some((entry) => entry.text === '恢复了'), 6000);
+    assert.equal(harness.sent.filter((entry) => entry.text === '恢复了').length, 1, '重试成功只发一次');
+    const history = harness.repo.getMessages('private', '127');
+    assert.ok(!history.some((entry) => String(entry.text).includes('上轮 AI 处理异常中断')), '重试成功就不该落中断便签');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('crash guard: failed model call persists an interrupt note', async () => {  const harness = await makeHarness([{ tool: 'stay_silent', input: {} }]);
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => {
     return new Response('upstream exploded', { status: 500 });
@@ -311,7 +450,7 @@ test('crash guard: failed model call persists an interrupt note', async () => {
     await waitFor(() => {
       const history = harness.repo.getMessages('private', '127');
       return history.some((entry) => String(entry.text).includes('上轮 AI 处理异常中断'));
-    }, 200);
+    }, 8000); // 瞬时故障现在有 2 次有界重试（1s+2s 退避），便签要等重试耗尽才落
     const history = harness.repo.getMessages('private', '127');
     const note = history.find((entry) => String(entry.text).includes('上轮 AI 处理异常中断'));
     assert.ok(note !== undefined, 'interrupt note persisted');
@@ -336,7 +475,7 @@ test('report routing: QQ child report lands at Onebot hub, not master', async ()
     const hubHistory = harness.repo.getMessages('domain', 'onebot');
     const relay = hubHistory.find((entry) => String(entry.text).includes('[子AI上报 from private:123'));
     assert.ok(String(relay!.text).includes('准备考研'));
-    const masterHistory = harness.repo.getMessages('private', '123456789');
+    const masterHistory = harness.repo.getMessages('master', 'core');
     assert.ok(
       !masterHistory.some((entry) => String(entry.text).includes('准备考研')),
       'QQ 下级上报不应绕过 Onebot 中枢直送主AI',
@@ -352,7 +491,7 @@ test('Onebot hub: digest relays to master; hub tool set carries domain_message, 
   const harness = await makeHarness([
     { tool: 'send_message', input: { content: '聚合完成：考研情报已沉淀入库。' } },
     // onebot 回合与中枢收尾回合共享剧本：重复 send，任一消费顺序都能把
-    // 摘要送到中枢（若中枢收尾吃掉一条，会走 QQ 私聊发主人，断言容忍）。
+    // 摘要送到中枢（若中枢收尾吃掉一条，只落主AI会话，不发 QQ）。
     { tool: 'send_message', input: { content: '聚合完成：考研情报已沉淀入库。' } },
     { tool: 'stay_silent', input: {} },
     { tool: 'stay_silent', input: {} },
@@ -383,16 +522,14 @@ test('Onebot hub: digest relays to master; hub tool set carries domain_message, 
     assert.ok(hubTools.includes('notify_master'), '领域中枢应有 notify_master 上报通道');
     // 2) onebot 的 send_message 改道直报最高级中枢（domain → 主AI）
     await waitFor(() => {
-      const masterHistory = harness.repo.getMessages('private', '123456789');
+      const masterHistory = harness.repo.getMessages('master', 'core');
       return masterHistory.some((entry) => String(entry.text).includes('[子AI上报 from domain:onebot'));
     });
-    const masterHistory = harness.repo.getMessages('private', '123456789');
+    const masterHistory = harness.repo.getMessages('master', 'core');
     const relay = masterHistory.find((entry) => String(entry.text).includes('[子AI上报 from domain:onebot'));
     assert.ok(String(relay!.text).includes('考研情报已沉淀'));
-    for (const entry of harness.sent) {
-      assert.equal(entry.chatType, 'private');
-      assert.equal(entry.targetId, 123456789);
-    }
+    // 主AI 没有 QQ 窗口：中枢收尾即便吃到 send_message 也只落主AI会话
+    assert.equal(harness.sent.length, 0, '主AI/中枢发言不应发到任何 QQ 窗口');
     await harness.repo.flush();
   } finally {
     await harness.cleanup();
@@ -403,8 +540,8 @@ test('master conclusion relays back to the reporting hub scope', async () => {
   const harness = await makeHarness([{ text: '已收到，情报已归档。' }]);
   try {
     const injected: ChatMessage = {
-      chatType: 'private',
-      chatId: 123456789,
+      chatType: 'master',
+      chatId: 'core',
       userId: 0,
       text: '[子AI上报 from domain:onebot type=intel]\n聚合完成：考研情报已沉淀入库。',
       rawMessage: '[子AI上报 from domain:onebot type=intel]\n聚合完成：考研情报已沉淀入库。',
@@ -468,10 +605,10 @@ test('bili video sub-AI: report routes to bili hub, hub digest reaches master', 
     assert.ok(String(relay!.text).includes('视频要点'));
     // 3) 哔哩中枢消化后直报最高级中枢（domain → 主AI）
     await waitFor(() => {
-      const masterHistory = harness.repo.getMessages('private', '123456789');
+      const masterHistory = harness.repo.getMessages('master', 'core');
       return masterHistory.some((entry) => String(entry.text).includes('[子AI上报 from domain:bili'));
     });
-    const masterHistory = harness.repo.getMessages('private', '123456789');
+    const masterHistory = harness.repo.getMessages('master', 'core');
     const digest = masterHistory.find((entry) => String(entry.text).includes('[子AI上报 from domain:bili'));
     assert.ok(String(digest!.text).includes('视频要点'));
     // 4) 全程零 QQ 发送（虚拟 scope 无窗口）
@@ -482,7 +619,8 @@ test('bili video sub-AI: report routes to bili hub, hub digest reaches master', 
   }
 });
 
-test('master delegate_to_child injects an instruction into the target scope', async () => {  const harness = await makeHarness([
+test('master delegate_to_child injects an instruction into the target scope', async () => {
+  const harness = await makeHarness([
     { tool: 'delegate_to_child', input: { target_scope_type: 'private', target_scope_id: '777', instruction: '转告对方周末聚会改到下午三点' } },
     // The delegated scope's turn races the master's close-out round for the
     // shared scripted replies — duplicate the send so either fetch order
@@ -493,8 +631,8 @@ test('master delegate_to_child injects an instruction into the target scope', as
     { tool: 'stay_silent', input: {} },
   ]);
   try {
-    // 主人直接在主AI会话里下达跨会话指令
-    harness.orchestrator.handleMessage(makeMessage(123456789, '帮我跟 777 说一下聚会改时间', 123456789, 10));
+    // 面板控制台直接在主AI会话（master:core）里下达跨会话指令
+    harness.orchestrator.handleAdminWebuiMessage('帮我跟 777 说一下聚会改时间');
     // target scope received the delegation as an internal instruction…
     await waitFor(() => {
       const targetHistory = harness.repo.getMessages('private', '777');
@@ -548,10 +686,10 @@ test('domain hub: domain:mc turn runs with domain tools; send_message relays bac
     assert.ok(hubTools.includes('notify_master'), '领域中枢应有 notify_master 上报通道');
     // 3) domain:mc 的 send_message 改道 relay 回中枢（[子AI上报 from domain:mc]），不碰任何 QQ 窗口
     await waitFor(() => {
-      const masterHistory = harness.repo.getMessages('private', '123456789');
+      const masterHistory = harness.repo.getMessages('master', 'core');
       return masterHistory.some((entry) => String(entry.text).includes('[子AI上报 from domain:mc'));
     });
-    const masterHistory = harness.repo.getMessages('private', '123456789');
+    const masterHistory = harness.repo.getMessages('master', 'core');
     const relay = masterHistory.find((entry) => String(entry.text).includes('[子AI上报 from domain:mc'));
     assert.ok(String(relay!.text).includes('出生点周围安全'));
     assert.equal(harness.sent.length, 0, '领域发言不应发到 QQ 窗口');
@@ -577,6 +715,97 @@ test('persisted alarm fires back into the origin scope as an internal turn', asy
     const history = harness.repo.getMessages('private', '123');
     assert.ok(history.some((entry) => String(entry.text).includes('[闹钟触发] 提醒主人喝水')));
     await harness.repo.flush();
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('send_image duplicate guard spans model rounds and does not send the same image twice', async () => {
+  setDnsResolverForTests(async () => [{ address: '93.184.216.34', family: 4 }]);
+  const harness = await makeHarness([
+    { tool: 'send_image', input: { file: 'https://img.example.com/same.png' } },
+    { tool: 'send_image', input: { file: 'https://img.example.com/same.png' } },
+    { tool: 'stay_silent', input: {} },
+  ]);
+  try {
+    harness.orchestrator.handleMessage(makeMessage(123, '发图', 100, 14));
+    await waitFor(() => harness.modelRequests.length >= 3);
+    assert.equal(harness.sentImages.length, 1);
+    assert.ok(JSON.stringify(harness.modelRequests[2]).includes('已经把这张图发出去了'));
+  } finally {
+    setDnsResolverForTests(null);
+    await harness.cleanup();
+  }
+});
+
+test('schedule_image caches the inbound original and sends it directly without another model turn', async () => {
+  setDnsResolverForTests(async () => [{ address: '93.184.216.34', family: 4 }]);
+  const harness = await makeHarness([
+    { tool: 'schedule_image', input: { at: '+1s' } },
+    { tool: 'stay_silent', input: {} },
+  ]);
+  try {
+    const imageMessage = makeMessage(123, '10分钟后把这张照片再发给我', 100, 3);
+    imageMessage.rawMessage = '[CQ:image,file=cat.jpg,url=https://img.example.com/cat.jpg]';
+    harness.orchestrator.handleMessage(imageMessage);
+    await waitFor(() => harness.sentImages.length === 1, 8000);
+    assert.equal(harness.sentImages[0].targetId, 123);
+    assert.ok(harness.sentImages[0].file.startsWith('base64://'), 'sends the durable cached bytes, not the expiring QQ URL');
+    assert.equal(harness.modelRequests.length, 2, 'only schedule + stay_silent; firing needs no model call');
+    const history = harness.repo.getMessages('private', '123');
+    assert.ok(history.some((entry) => entry.user_id === 987654322 && entry.text === '[图片]'));
+    await harness.repo.flush();
+  } finally {
+    setDnsResolverForTests(null);
+    await harness.cleanup();
+  }
+});
+
+test('scheduled image with an unrecoverable original fails once instead of retrying a dead URL forever', async () => {
+  setDnsResolverForTests(async () => [{ address: '93.184.216.34', family: 4 }]);
+  const harness = await makeHarness([
+    { tool: 'schedule_image', input: { at: '+2s' } },
+    { tool: 'stay_silent', input: {} },
+  ]);
+  try {
+    const imageMessage = makeMessage(123, '稍后发图', 100, 15);
+    imageMessage.rawMessage = '[CQ:image,file=gone.jpg,url=https://img.example.com/gone.jpg]';
+    harness.orchestrator.handleMessage(imageMessage);
+    await waitFor(() => harness.modelRequests.length >= 2);
+    configureImageCache('');
+    const harnessFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.includes('img.example.com')) throw new Error('expired original');
+      return harnessFetch(input, init);
+    }) as typeof fetch;
+
+    await waitFor(() => harness.sent.some((entry) => entry.text.includes('定时图片发送失败')), 8000);
+    assert.equal(harness.sentImages.length, 0);
+    await sleep(1200);
+    assert.equal(harness.sent.filter((entry) => entry.text.includes('定时图片发送失败')).length, 1);
+    assert.equal(harness.modelRequests.length, 2, 'failure is deterministic and does not wake the model');
+  } finally {
+    setDnsResolverForTests(null);
+    await harness.cleanup();
+  }
+});
+
+test('scheduled turn retries exhausted transient model failures before any tool side effect', async () => {
+  const harness = await makeHarness([
+    { tool: 'create_task', input: { kind: 'set_alarm', at: '+1s', note: '故障后提醒' } },
+    { tool: 'stay_silent', input: {} },
+    { error: { status: 503 } },
+    { error: { status: 503 } },
+    { error: { status: 503 } },
+    { tool: 'send_message', input: { content: '恢复后提醒到了' } },
+    { tool: 'stay_silent', input: {} },
+  ]);
+  try {
+    harness.orchestrator.handleMessage(makeMessage(123, '设置一个闹钟', 100, 2));
+    await waitFor(() => harness.sent.some((entry) => entry.text === '恢复后提醒到了'), 10000);
+    assert.equal(harness.sent.filter((entry) => entry.text === '恢复后提醒到了').length, 1);
+    assert.ok(harness.modelRequests.length >= 6, 'three protocol attempts precede the scheduled-turn retry');
   } finally {
     await harness.cleanup();
   }
@@ -645,6 +874,36 @@ test('view_image result feeds back into the next round and the turn completes', 
     assert.ok(round2.includes('物理试卷'), 'image description reached the model');
     await harness.repo.flush();
   } finally {
+    await harness.cleanup();
+  }
+});
+
+test('view_image_raw shows the image once, then expires in later rounds', async () => {
+  // img.example.com 现实里解析不到：桩掉 DNS，让 SSRF 守卫放行。
+  setDnsResolverForTests(async () => [{ address: '93.184.216.34', family: 4 }]);
+  const harness = await makeHarness([
+    { tool: 'view_image_raw', input: { index: 1 } },
+    { tool: 'send_message', input: { content: '看到了原图' } },
+    { tool: 'stay_silent', input: {} },
+  ]);
+  try {
+    const imageMessage = makeMessage(132, '', 100, 12);
+    imageMessage.rawMessage = '[CQ:image,file=x.jpg,url=https://img.example.com/raw.jpg]';
+    harness.orchestrator.handleMessage(imageMessage);
+    await waitFor(() => harness.sent.length === 1);
+    await sleep(150);
+
+    // 3 model calls: round 1 (tool call) → round 2 (sees the image) → close-out.
+    assert.equal(harness.modelRequests.length, 3);
+    const round2 = JSON.stringify(harness.modelRequests[1]);
+    assert.ok(round2.includes('"type":"base64"'), 'raw image inlined for the round right after the call');
+    assert.ok(round2.includes('"media_type":"image/png"'), 'png media type on the inline block');
+    const round3 = JSON.stringify(harness.modelRequests[2]);
+    assert.ok(round3.includes('【原图已过期，如需查看，请再次调用 view_image_raw 工具获取原图】'), 'later rounds see the expired marker');
+    assert.ok(!round3.includes('"type":"base64"'), 'the image itself is gone after one round');
+    await harness.repo.flush();
+  } finally {
+    setDnsResolverForTests(null);
     await harness.cleanup();
   }
 });
@@ -757,7 +1016,7 @@ test('dataline message joins the master scope and the reply goes back over datal
     assert.equal(harness.sent.length, 0, 'nothing went out over QQ');
 
     // landed in the master scope history with the dataline source label
-    const history = harness.repo.getMessages('private', '123456789');
+    const history = harness.repo.getMessages('master', 'core');
     const entry = history.find((item) => item.text === '手机数据线来的');
     assert.ok(entry !== undefined, 'dataline message persisted in the master scope');
     assert.equal(entry.user_id, 123456789);
@@ -767,11 +1026,13 @@ test('dataline message joins the master scope and the reply goes back over datal
   }
 });
 
-test('master channel follows the latest ingress: QQ private flips replies back to QQ', async () => {
+test('master scope has no QQ window: owner private chat is an ordinary child, panel ingress replies stay off QQ', async () => {
   const harness = await makeHarness([
     { tool: 'send_message', input: { content: '走数据线' } },
     { tool: 'stay_silent', input: {} },
-    { tool: 'send_message', input: { content: '走QQ' } },
+    { tool: 'send_message', input: { content: '号主私聊子AI回话' } },
+    { tool: 'stay_silent', input: {} },
+    { tool: 'send_message', input: { content: '面板回话' } },
     { tool: 'stay_silent', input: {} },
   ]);
   try {
@@ -780,13 +1041,113 @@ test('master channel follows the latest ingress: QQ private flips replies back t
     harness.orchestrator.handleDatalineMessage(inbound);
     await waitFor(() => harness.datalineSent.length === 1);
 
-    // master then writes from their real QQ → replies return to QQ private chat
-    harness.orchestrator.handleMessage(makeMessage(123456789, '回到QQ上说', 123456789, 611));
+    // 号主从真 QQ 私聊过来 → 普通下级会话 private:<号主>，不进主AI会话
+    harness.orchestrator.handleMessage(makeMessage(123456789, '私聊说一句', 123456789, 611));
     await waitFor(() => harness.sent.length === 1);
-    assert.equal(harness.sent[0].text, '走QQ');
+    assert.equal(harness.sent[0].text, '号主私聊子AI回话');
     assert.equal(harness.sent[0].chatType, 'private');
     assert.equal(harness.sent[0].targetId, 123456789);
-    assert.equal(harness.datalineSent.length, 1, 'dataline untouched after the flip');
+    assert.ok(!harness.repo.getMessages('master', 'core').some((e) => e.text === '私聊说一句'), 'owner QQ chat stays out of the master scope');
+
+    // 面板控制台进主AI会话 → 回复只落主AI会话：不发 QQ，也不再走数据线
+    harness.orchestrator.handleAdminWebuiMessage('面板来的');
+    await waitFor(() => harness.repo.getMessages('master', 'core').some((e) => e.text === '面板回话'));
+    assert.equal(harness.sent.length, 1, 'master reply never goes out over QQ');
+    assert.equal(harness.datalineSent.length, 1, 'panel ingress flips the master channel off dataline');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('请示回执：带 need_reply 的上报未获回话，回合结束被系统追问一次', async () => {
+  const harness = await makeHarness([
+    { tool: 'stay_silent', input: {} }, // hub 第一回合：静默结案（违规）
+    { tool: 'stay_silent', input: {} }, // 回执提醒回合：仍静默（提醒不连环自激）
+    { tool: 'stay_silent', input: {} },
+  ]);
+  try {
+    const injected: ChatMessage = {
+      chatType: 'domain',
+      chatId: 'onebot',
+      userId: 0,
+      text: '[子AI上报 from private:1059681169 type=system_operation need_reply=1]\n用户请求打开 mc2d 总开关，请确认是否授权。',
+      rawMessage: '[子AI上报 from private:1059681169 type=system_operation need_reply=1]\n用户请求打开 mc2d 总开关，请确认是否授权。',
+      sender: { nickname: '后台任务', user_id: 0 },
+      messageId: 'sys_test_ack_1',
+      mentionsSelf: false,
+      timestamp: Date.now() / 1000,
+      rawData: { source: 'agent_message', relayed_from: 'private:1059681169', ack_required: 'private:1059681169' },
+    };
+    harness.orchestrator.handleMessage(injected);
+    // 静默结案 → 系统注入 [回执提醒]，提醒里列出来源会话与摘要
+    await waitFor(() => {
+      const hubHistory = harness.repo.getMessages('domain', 'onebot');
+      return hubHistory.some((entry) => String(entry.text).includes('[回执提醒]'));
+    });
+    const hubHistory = harness.repo.getMessages('domain', 'onebot');
+    const reminder = hubHistory.find((entry) => String(entry.text).includes('[回执提醒]'));
+    assert.ok(String(reminder!.text).includes('private:1059681169'), '提醒应列出来源会话');
+    assert.ok(String(reminder!.text).includes('mc2d'), '提醒应带上报摘要');
+    // 提醒触发第二轮模型调用，请求里应含回执提醒内容
+    await waitFor(() => harness.modelRequests.length >= 2);
+    const reminderRequest = harness.modelRequests[1];
+    assert.ok(JSON.stringify(reminderRequest).includes('回执提醒'), '第二轮请求应携带回执提醒');
+    // 提醒自身不带 ack 标记：不会有第三次追问
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const reminders = harness.repo.getMessages('domain', 'onebot')
+      .filter((entry) => String(entry.text).includes('[回执提醒]'));
+    assert.equal(reminders.length, 1, '提醒最多一次，不得连环自激');
+    await harness.repo.flush();
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('请示回执：domain_message 直回来源会话即算回执，子AI收到结论后主动转告', async () => {
+  const harness = await makeHarness([
+    { tool: 'domain_message', input: { target: 'private:1059681169', content: '驳回：mc2d 总开关只有号主本人能开。' } },
+    { tool: 'stay_silent', input: {} }, // hub 收尾
+    { tool: 'send_message', input: { content: '问到了，mc2d 总开关只有号主本人能开。' } }, // 子AI主动转告
+    { tool: 'stay_silent', input: {} },
+  ]);
+  try {
+    const injected: ChatMessage = {
+      chatType: 'domain',
+      chatId: 'onebot',
+      userId: 0,
+      text: '[子AI上报 from private:1059681169 type=system_operation need_reply=1]\n用户请求打开 mc2d 总开关，请确认是否授权。',
+      rawMessage: '[子AI上报 from private:1059681169 type=system_operation need_reply=1]\n用户请求打开 mc2d 总开关，请确认是否授权。',
+      sender: { nickname: '后台任务', user_id: 0 },
+      messageId: 'sys_test_ack_2',
+      mentionsSelf: false,
+      timestamp: Date.now() / 1000,
+      rawData: { source: 'agent_message', relayed_from: 'private:1059681169', ack_required: 'private:1059681169' },
+    };
+    harness.orchestrator.handleMessage(injected);
+    // 回话注入来源会话
+    await waitFor(() => {
+      const childHistory = harness.repo.getMessages('private', '1059681169');
+      return childHistory.some((entry) => String(entry.text).includes('[主级回话 from domain:onebot]'));
+    });
+    const childHistory = harness.repo.getMessages('private', '1059681169');
+    const reply = childHistory.find((entry) => String(entry.text).includes('[主级回话 from domain:onebot]'));
+    assert.ok(String(reply!.text).includes('驳回'), '回话内容应送达来源会话');
+    // 子AI收到回话的那一轮必须带主动转告提示，并实际发消息给用户。
+    await waitFor(() => harness.sent.some((entry) => entry.chatType === 'private' && entry.targetId === 1059681169));
+    assert.ok(
+      harness.sent.some((entry) => entry.targetId === 1059681169 && entry.text.includes('只有号主本人能开')),
+      '子AI不应把已经收到的结论静默扣下',
+    );
+    const childRequest = harness.modelRequests.find((request) => JSON.stringify(request).includes('本轮包含主AI/领域中枢对先前请示的正式回话'));
+    assert.ok(childRequest, '主级回话回合应明确提示 send_message 主动转告');
+    // 已回执：不得出现 [回执提醒]
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const hubHistory = harness.repo.getMessages('domain', 'onebot');
+    assert.ok(
+      !hubHistory.some((entry) => String(entry.text).includes('[回执提醒]')),
+      '已回执的请示不应再被追问',
+    );
+    await harness.repo.flush();
   } finally {
     await harness.cleanup();
   }

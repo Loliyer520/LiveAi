@@ -25,7 +25,11 @@ import { initPluginRegistry } from '../chat/plugins.js';
 import { loadDomains } from '../chat/domains.js';
 import { configureMcBot, configureStickers, configureTts } from '../chat/tools.js';
 import { configureMediaSpool } from '../chat/media-spool.js';
-import { configureMc2d, mc2dClient } from '../chat/mc2d.js';
+import { configureImageCache } from '../chat/image-cache.js';
+import { configureMcPresence, mcPresenceStatus, startMcPresencePolling, stopMcPresencePolling } from '../chat/mc-presence.js';
+import { configureGlobalIdentity, registerIdentityChannel } from '../store/global-identity.js';
+import { configurePersonaRefs } from '../store/persona-refs.js';
+import { MASTER_SCOPE_KEY } from '../chat/types.js';
 
 export class ChatModule implements LiveAiModule {
   readonly name = 'chat';
@@ -54,21 +58,25 @@ export class ChatModule implements LiveAiModule {
   private readonly masterQq: number;
   private readonly napcatHttpUrl: string;
   private readonly napcatToken: string;
-  private readonly mc2dAutoJoin: boolean;
   /** Minecraft 边车连接信息（管理面板代理探测用）。 */
   readonly mcBotUrl: string;
   readonly mcBotToken: string;
 
   constructor(config: LiveAiConfig) {
     this.archive = new MessageArchive(join(config.storage.stateDir, 'archive'));
-    this.repo = new ScopeRepository(config.storage.stateDir, config.ai.historyLimit, this.archive);
+    this.repo = new ScopeRepository(
+      config.storage.stateDir,
+      config.ai.historyLimit,
+      this.archive,
+      config.ai.globalTriggerRate,
+    );
     this.prompts = new PromptStore(config.storage.promptDir);
     this.models = new ModelManager(config.storage.modelsConfigPath);
     this.summarizer = new DiarySummarizer(this.repo, this.models, config.ai.summaryEnabled);
     this.relations = new RelationGraph(join(config.storage.stateDir, 'relations.json'));
     this.kb = new KnowledgeBase(
       join(config.storage.stateDir, '..', 'knowledge'),
-      `private:${config.ai.masterQq}`,
+      MASTER_SCOPE_KEY,
     );
     this.intel = new IntelCollector(
       this.relations,
@@ -91,6 +99,7 @@ export class ChatModule implements LiveAiModule {
       wsUrl: config.napcat.wsUrl,
       httpUrl: config.napcat.httpUrl,
       selfId: config.napcat.selfId,
+      allowedSelfIds: config.napcat.allowedSelfIds,
       legacySelfIds: config.napcat.legacySelfIds,
       accessToken: config.napcat.accessToken,
       reconnectBaseMs: config.napcat.reconnectBaseMs,
@@ -101,6 +110,8 @@ export class ChatModule implements LiveAiModule {
         onPrivateMessage: (message) => this.orchestrator.handleMessage(message),
         onSelfMessage: (message) => this.orchestrator.handleSelfMessage(message),
         onDatalineMessage: (message) => this.orchestrator.handleDatalineMessage(message),
+        onFriendRequest: (event) => this.orchestrator.handleQqRequestEvent(event),
+        onGroupRequest: (event) => this.orchestrator.handleQqRequestEvent(event),
         onConnected: () => console.info(`[napcat] websocket connected (${this.bot.selfId || 'self_id 待学习'})`),
         onDisconnected: (reason) => console.info(`[napcat] websocket disconnected: ${reason}, reconnecting…`),
       },
@@ -138,12 +149,15 @@ export class ChatModule implements LiveAiModule {
         ? { dir: join(config.storage.stateDir, 'media-spool'), publicBase: config.napcat.publicBaseUrl }
         : null,
     );
-    this.mc2dAutoJoin = config.mc2d.autoJoin;
-    configureMc2d(
-      config.mc2d.enabled
-        ? { wsUrl: config.mc2d.wsUrl, name: config.mc2d.name, uid: config.mc2d.uid }
-        : null,
+    // 全局共同体记忆：静态行人人可见；动态频道（MC 分身等）按会话订阅注入。
+    configureGlobalIdentity(join(config.storage.stateDir, 'global_identity.json'));
+    // 人设参考图：画自己时 image_edit 传 persona-ref://<名> 引用；跟着 image 插件走
+    // （插件关了参考图也没用了），存在 <插件目录>/image/refs/。
+    configurePersonaRefs(
+      join(process.env.LIVEAI_PLUGIN_DIR ?? join(config.storage.stateDir, '..', 'plugins'), 'image', 'refs'),
     );
+    // 入站图片缓存：QQ 图链 rkey 时效短，进站即抓本地副本供事后回看/编辑。
+    configureImageCache(join(config.storage.stateDir, 'imgcache'));
     // Minecraft 边车：URL 可 env 覆盖；token 与 mc 插件共用 data/plugins/secrets.json
     let mcBotToken = '';
     try {
@@ -157,17 +171,29 @@ export class ChatModule implements LiveAiModule {
     configureMcBot(mcBotUrl, mcBotToken);
     this.mcBotUrl = mcBotUrl;
     this.mcBotToken = mcBotToken;
+    // 真实 MC 的在场情报：低频轮询边车 /status，任何会话都能用它回答
+    // 「你进服了吗/看到我上线了吗」。
+    configureMcPresence(mcBotUrl, mcBotToken);
+    registerIdentityChannel({
+      name: 'mc',
+      description: '真实 Minecraft 服务器（角色 BingTang 游玩的 26.2 本地服）的在线状态与玩家名单；'
+        + 'BingTang 就是你在游戏里的身体（由服务器边车操控，你没有另一个游戏客户端）；'
+        + '进服/游戏操作由 Minecraft 中枢（domain:mc）的 mc_* 工具执行',
+      status: mcPresenceStatus,
+    });
   }
 
   async start(): Promise<void> {
     await this.models.load();
+    const swept = await this.repo.sweepOrphanTemps();
+    if (swept > 0) console.info(`[repository] 清扫孤儿 .tmp 文件 ${swept} 个`);
     await this.migrateImpressions();
     await this.recoverPendingSummaries();
     this.orchestrator.start();
     this.bot.start();
+    startMcPresencePolling();
     this.scheduleStickerRefresh();
     this.startBridgeProbe();
-    if (this.mc2dAutoJoin) mc2dClient()?.autoJoin();
   }
 
   async stop(): Promise<void> {
@@ -184,7 +210,7 @@ export class ChatModule implements LiveAiModule {
     await this.orchestrator.stop();
     await this.summarizer.drainKnownScopes();
     await this.relations.flush();
-    mc2dClient()?.shutdown();
+    stopMcPresencePolling();
     this.bot.stop();
   }
 

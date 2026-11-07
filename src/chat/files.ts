@@ -15,6 +15,35 @@ export interface FileRef {
 }
 
 const CQ_FILE_PATTERN = /\[CQ:file,([^\]]*)\]/g;
+const CQ_VIDEO_PATTERN = /\[CQ:video,([^\]]*)\]/g;
+
+/**
+ * 视频消息直链提取（CQ:video / 数组 type=video）。模型看不到视频本体，
+ * watch_video 靠这份清单把「有人刚发的视频」抓下来抽帧。
+ */
+export function extractVideoRefs(message: ChatMessage): string[] {
+  const refs: string[] = [];
+  const seen = new Set<string>();
+  const push = (url: string | undefined): void => {
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    refs.push(url);
+  };
+  const segments = (message.rawData as { message?: unknown }).message;
+  if (Array.isArray(segments)) {
+    for (const segment of segments) {
+      if (typeof segment !== 'object' || segment === null) continue;
+      const typed = segment as { type?: unknown; data?: { url?: unknown } };
+      if (typed.type !== 'video') continue;
+      push(httpOrUndefined((typed.data ?? {}).url));
+    }
+  }
+  const raw = String(message.rawMessage ?? '');
+  for (const match of raw.matchAll(CQ_VIDEO_PATTERN)) {
+    push(httpOrUndefined(parseCqParams(match[1]!).url));
+  }
+  return refs;
+}
 
 /** Collect file refs from an inbound message (array segments + CQ codes). */
 export function extractFileRefs(message: ChatMessage): FileRef[] {

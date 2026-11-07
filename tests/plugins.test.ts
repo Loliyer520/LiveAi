@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PluginRegistry, extractPath, initPluginRegistry } from '../src/chat/plugins.js';
+import { PluginRegistry, extractPath, initPluginRegistry, interpolateJsonBody } from '../src/chat/plugins.js';
 import { chatToolSchemas, type ToolContext } from '../src/chat/tools.js';
 import type { NapcatBot } from '../src/bot/napcat.js';
 import { Workspace } from '../src/chat/workspace.js';
@@ -35,6 +35,7 @@ function fakeContext(): ToolContext {
     workspace: new Workspace('/tmp/liveai-test-workspace'),
     networkBudget: { used: 0 },
     triggerImageRefs: [],
+          triggerVideoRefs: [],
     describeImage: async () => '',
     scopeType: 'private',
     scopeId: '123',
@@ -531,4 +532,52 @@ test('crippled success body (code ok but missing template field) surfaces real u
     await rm(workspaceDir, { recursive: true, force: true });
     await cleanup();
   }
+});
+
+test('inline image short-ID miss fails honestly instead of substituting the current image', async () => {
+  const { dir, cleanup } = await makePluginDir({
+    'image/plugin.json': JSON.stringify({
+      name: 'image',
+      tools: [{
+        name: 'image_edit',
+        description: 'edit',
+        parameters: { type: 'object', properties: { image: { type: 'string' } }, required: ['image'] },
+        inline_data_uri: ['image'],
+        request: { url: 'https://93.184.216.34/edit', body: '{"image":{{image}}}' },
+      }],
+    }),
+  });
+  try {
+    const registry = new PluginRegistry(dir);
+    registry.load();
+    const context = fakeContext();
+    context.triggerImageRefs = ['https://a.cn/unrelated-current.jpg'];
+    context.repo = {
+      findEntryByRef: () => null,
+      recentImageRefs: () => [{ ref: 'REAL', ageMinutes: 1 }],
+    } as never;
+    const result = await registry.execute('image_edit', { image: '#TYPO' }, context);
+    assert.equal(result?.ok, false);
+    assert.ok(result?.output.includes('不能偷偷改用本轮其他图片'));
+    assert.ok(result?.output.includes('REAL'));
+  } finally {
+    await cleanup();
+  }
+});
+
+test('JSON body 插值：字符串内转义引号/换行，字符串外保留数组（image_edit 400 回归）', () => {
+  const values: Record<string, string> = {
+    prompt: '删除 "Mutianyu Great Wall"\n并保留城墙',
+    image: JSON.stringify(['data:image/png;base64,AAAA']),
+  };
+  const body = interpolateJsonBody('{"prompt":"{{prompt}}","image":{{image}}}', (key) => values[key]);
+  assert.deepEqual(JSON.parse(body), {
+    prompt: values.prompt,
+    image: ['data:image/png;base64,AAAA'],
+  });
+});
+
+test('JSON body 插值：模板原有转义与占位符相邻时仍合法', () => {
+  const body = interpolateJsonBody('{"text":"前缀\\n{{value}}后缀","n":{{n}}}', (key) => key === 'value' ? '"中"' : '2');
+  assert.deepEqual(JSON.parse(body), { text: '前缀\n"中"后缀', n: 2 });
 });

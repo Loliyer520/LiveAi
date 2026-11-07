@@ -12,6 +12,7 @@
 
 import type { HistoryEntry, ModelMessage, TriggerEntry } from '../chat/types.js';
 import { isInternalReportEntry } from '../chat/types.js';
+import { normalizeMessageRef } from '../message-ref.js';
 
 const COLLIDING_TOKENS = [
   '</user_msg>',
@@ -62,7 +63,7 @@ function formatHistoryItem(entry: HistoryEntry): string {
 }
 
 export function normalizeRef(ref: unknown): string {
-  const value = String(ref ?? '').trim().replace(/^\[#?|\]$/g, '');
+  const value = normalizeMessageRef(ref);
   return value;
 }
 
@@ -197,6 +198,6 @@ export function normalizeToolContextMessages(value: unknown): ModelMessage[] {
 export function buildTriggerUserMessage(triggerMessages: TriggerEntry[]): string {
   const items = triggerMessages.filter((entry) => String(entry.text ?? '').trim() !== '');
   if (items.length === 0) return '暂无新消息';
-  const blocks = renderPendingBlocks(items as HistoryEntry[], '这是系统内部异步结果，默认只更新记忆、消化即可，非必要不要调用 send_message 对外发送');
+  const blocks = renderPendingBlocks(items as HistoryEntry[], '这是系统内部异步结果，默认只更新记忆、消化即可，非必要不要调用 send_message 对外发送；但带 need_reply=1 标记的是请示类上报，必须给来源会话回话：用 domain_message(target="<来源会话>") 把结论递回去，只记记忆静默结案会让对方干等');
   return blocks.length > 0 ? blocks.join('\n') : '暂无新消息';
 }

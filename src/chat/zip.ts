@@ -72,7 +72,9 @@ export async function extractZip(buffer: Buffer, destDir: string): Promise<strin
     cursor += 46 + nameLength + extraLength + commentLength;
 
     const name = safeEntryName(rawName);
-    if (name.endsWith('/')) continue; // directory marker
+    // 目录条目要在规范化之前判：rawName './' 规范化后变 '.'，不再以 '/' 结尾，
+    // 会当成文件写向 destDir 本身。空名/'.' 同理直接跳过。
+    if (rawName.endsWith('/') || name === '' || name === '.') continue; // directory marker
 
     // 中央目录里的 uncompressedSize 是压缩包自报的，可能是假的（zip 炸弹）。
     // 只用它做廉价的早期拒绝，真正的账按解压后的实际字节数算。
@@ -85,7 +87,13 @@ export async function extractZip(buffer: Buffer, destDir: string): Promise<strin
     const localExtraLength = buffer.readUInt16LE(localOffset + 28);
     const dataStart = localOffset + 30 + localNameLength + localExtraLength;
     const compressed = buffer.subarray(dataStart, dataStart + compressedSize);
-    const content = method === 0 ? Buffer.from(compressed) : inflateRawSync(compressed);
+    // 解压输出直接给硬上限：zlib 一超限就抛错，不会先把炸弹完整展开再检查。
+    const remaining = MAX_TOTAL_BYTES - totalBytes;
+    if (remaining <= 0) throw new Error('解压后总量超过 64MB 上限');
+    if (method === 0 && compressedSize > remaining) throw new Error(`条目 ${name} 解压后过大`);
+    const content = method === 0
+      ? Buffer.from(compressed)
+      : inflateRawSync(compressed, { maxOutputLength: remaining });
     totalBytes += content.byteLength;
     if (content.byteLength > MAX_TOTAL_BYTES) throw new Error(`条目 ${name} 解压后过大`);
     if (totalBytes > MAX_TOTAL_BYTES) throw new Error('解压后总量超过 64MB 上限');
@@ -101,7 +109,7 @@ export async function extractZip(buffer: Buffer, destDir: string): Promise<strin
 
 /** Gunzip a single-file .gz buffer → write to destPath (name sans .gz). */
 export async function extractGzip(buffer: Buffer, destPath: string): Promise<number> {
-  const content = gunzipSync(buffer);
+  const content = gunzipSync(buffer, { maxOutputLength: MAX_TOTAL_BYTES });
   if (content.byteLength > MAX_TOTAL_BYTES) throw new Error('解压后超过 64MB 上限');
   await mkdir(dirname(destPath), { recursive: true });
   await writeFile(destPath, content);

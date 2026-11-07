@@ -5,7 +5,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TaskScheduler, type ScheduledTask } from '../src/chat/scheduler.js';
@@ -77,6 +77,23 @@ test('tasks persist to disk and a fresh scheduler recovers them', async () => {
   }
 });
 
+test('scheduled image keeps its original URL across persistence and reload', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'liveai-sched-'));
+  const path = join(dir, 'tasks.json');
+  try {
+    const first = new TaskScheduler(path, () => {});
+    first.scheduleImage('private:9', Date.now() / 1000 + 600, 'https://img.example.com/original.png');
+    first.stop();
+    const second = new TaskScheduler(path, () => {});
+    const task = second.list()[0];
+    assert.equal(task.kind, 'send_image');
+    assert.equal(task.imageUrl, 'https://img.example.com/original.png');
+    second.stop();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('overdue tasks fire immediately on start (restart catch-up)', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'liveai-sched-'));
   const path = join(dir, 'tasks.json');
@@ -129,6 +146,151 @@ test('list filters by scope', async () => {
     assert.equal(scheduler.list('group:2')[0].note, 'b');
   } finally {
     scheduler.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('delivery exception keeps an alarm pending and retries with backoff', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'liveai-sched-'));
+  const fired: string[] = [];
+  let attempts = 0;
+  const scheduler = new TaskScheduler(join(dir, 'tasks.json'), async (task) => {
+    attempts += 1;
+    await sleep(10);
+    if (attempts === 1) throw new Error('temporary mailbox failure');
+    fired.push(task.taskId);
+  });
+  try {
+    scheduler.start();
+    const taskId = scheduler.scheduleAlarm('private:6', Date.now() / 1000 + 0.05, '故障后仍要提醒');
+    await sleep(180);
+    assert.equal(attempts, 1);
+    assert.equal(scheduler.list().length, 1, 'failed delivery is not marked done');
+    await sleep(1_100);
+    assert.deepEqual(fired, [taskId]);
+    assert.equal(scheduler.list().length, 0);
+  } finally {
+    scheduler.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('recurring task survives a delivery exception and is re-armed', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'liveai-sched-'));
+  let attempts = 0;
+  const scheduler = new TaskScheduler(join(dir, 'tasks.json'), () => {
+    attempts += 1;
+    if (attempts === 1) throw new Error('temporary fire failure');
+  });
+  try {
+    scheduler.start();
+    scheduler.scheduleRecurring('group:8', 0.1, '异常后继续巡检');
+    await sleep(180);
+    assert.equal(attempts, 1);
+    assert.equal(scheduler.list().length, 1);
+    await sleep(1_250);
+    assert.ok(attempts >= 3, `expected retry plus a later interval, got ${attempts}`);
+    assert.equal(scheduler.list().length, 1);
+  } finally {
+    scheduler.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('start is idempotent and never installs duplicate recurring timers', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'liveai-sched-'));
+  const fired: string[] = [];
+  const scheduler = new TaskScheduler(join(dir, 'tasks.json'), (task) => fired.push(task.taskId));
+  try {
+    scheduler.scheduleRecurring('private:7', 0.2, '只触发一份');
+    scheduler.start();
+    scheduler.start();
+    await sleep(450);
+    assert.equal(fired.length, 2);
+  } finally {
+    scheduler.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('corrupt task file is backed up instead of silently overwritten', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'liveai-sched-'));
+  const path = join(dir, 'tasks.json');
+  try {
+    await writeFile(path, '{not-json', 'utf-8');
+    const scheduler = new TaskScheduler(path, () => {});
+    scheduler.start();
+    assert.equal(scheduler.list().length, 0);
+    const backups = (await readdir(dir)).filter((name) => name.startsWith('tasks.json.bak-'));
+    assert.equal(backups.length, 1);
+    scheduler.scheduleAlarm('private:1', Date.now() / 1000 + 100, '新任务');
+    assert.equal(JSON.parse(await readFile(path, 'utf-8')).tasks.length, 1);
+    scheduler.stop();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('history retention never evicts pending tasks', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'liveai-sched-'));
+  const scheduler = new TaskScheduler(join(dir, 'tasks.json'), () => {});
+  try {
+    for (let index = 0; index < 205; index += 1) {
+      scheduler.scheduleAlarm('private:1', Date.now() / 1000 + 3600 + index, `pending-${index}`);
+    }
+    assert.equal(scheduler.list().length, 205);
+  } finally {
+    scheduler.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('watchdog：同 tag 顶替旧保底，不同 tag 共存，重启可恢复', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'liveai-sched-'));
+  const path = join(dir, 'tasks.json');
+  const fired: { taskId: string; note: string }[] = [];
+  try {
+    const scheduler = new TaskScheduler(path, (task) => { fired.push({ taskId: task.taskId, note: task.note }); });
+    scheduler.start();
+    const first = scheduler.scheduleWatchdog('private:9', Date.now() / 1000 + 3600, '等 MC 中枢回报', 'mc');
+    // 重委派：同 tag 新保底顶掉旧的，不积压
+    const second = scheduler.scheduleWatchdog('private:9', Date.now() / 1000 + 3600, '等 MC 中枢回报（续）', 'mc');
+    assert.notEqual(first, second);
+    const mine = scheduler.list('private:9').filter((task) => task.kind === 'watchdog');
+    assert.equal(mine.length, 1);
+    assert.equal(mine[0].taskId, second);
+    // 不同 tag 各自独立
+    scheduler.scheduleWatchdog('private:9', Date.now() / 1000 + 3600, '等下载', 'download');
+    assert.equal(scheduler.list('private:9').filter((task) => task.kind === 'watchdog').length, 2);
+    // 别的 scope 不受影响也查不到
+    assert.equal(scheduler.list('group:8').filter((task) => task.kind === 'watchdog').length, 0);
+    scheduler.stop();
+
+    // 重启：tag 随任务持久化恢复
+    const revived = new TaskScheduler(path, () => {});
+    revived.start();
+    const restored = revived.list('private:9').filter((task) => task.kind === 'watchdog');
+    assert.equal(restored.length, 2);
+    assert.ok(restored.every((task) => typeof task.tag === 'string' && task.tag.length > 0));
+    revived.stop();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('watchdog：到点触发且一次性（触发后不再重复）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'liveai-sched-'));
+  const fired: string[] = [];
+  try {
+    const scheduler = new TaskScheduler(join(dir, 'tasks.json'), (task) => { fired.push(task.taskId); return true; });
+    scheduler.start();
+    scheduler.scheduleWatchdog('private:10', Date.now() / 1000 + 0.1, '催办', 'mc');
+    await sleep(450);
+    assert.equal(fired.length, 1);
+    await sleep(250);
+    assert.equal(fired.length, 1); // 一次性，不重复
+    scheduler.stop();
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });

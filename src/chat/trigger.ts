@@ -121,11 +121,14 @@ export function shouldTrigger(
   agent: TriggerAgentConfig,
   log: (line: string) => void = () => {},
 ): boolean {
-  if (agent.enabled === false) return false;
   const kind: SourceKind = sourceKindOf(message);
   // 内部任务（闹钟/周期任务/主AI委派/请求事件）在任何会话都必须触发——
-  // 否则群里的闹钟和委派 99% 被随机率拦掉，任务形同虚设。
+  // 否则群里的闹钟和委派 99% 被随机率拦掉，任务形同虚设。这个判断必须排在
+  // enabled 前面：关闭自动接话只关掉群聊闲聊，用户自己设的闹钟/委派仍要送达。
   if (kind === 'internal_task') return true;
+  // 主AI 会话（master:core）只有面板/数据线/下级上报会进来，来一条处理一条，不能关。
+  if (message.chatType === 'master') return true;
+  if (agent.enabled === false) return false;
   if (message.chatType === 'private') {
     if (kind === 'system_private') return false;
     return true;
@@ -148,8 +151,9 @@ export function shouldTrigger(
 /** Synthetic continuation message for the debounce path. */
 export function buildDebounceTriggerMessage(scopeId: string, epoch: number, selfId: number): ChatMessage {
   const text =
-    '（连续对话触发：群里沉默了5秒。先看看最后的话题——如果你刚刚已经回复过、没有新内容可接，直接 stay_silent；'
-    + '有别人抛出了新话题或你确实有想补充的，再用 send_message 自然接一句。不要重复自己已经说过的话。）';
+    '（连续对话触发：群里沉默了5秒。默认选择是 stay_silent——没人@你、话题也没落到你身上就不接。'
+    + '只有别人明确抛出了新话题且你确实有一句接得自然的话，才用 send_message 轻描淡写接一句；'
+    + '不要重复自己已经说过的话，不要为了不冷场而硬接。）';
   return {
     chatType: 'group',
     chatId: Number(scopeId),

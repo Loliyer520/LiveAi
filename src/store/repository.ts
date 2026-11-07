@@ -13,13 +13,14 @@
  * One JSON file per scope, atomic write via tmp+rename.
  */
 
-import { mkdir, readdir, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { readFileSync, readdirSync, renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import type { HistoryEntry } from '../chat/types.js';
 import type { MessageArchive } from './archive.js';
+import { normalizeMessageRef } from '../message-ref.js';
 
 const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -87,6 +88,13 @@ const MAX_UNSUMMARIZED_SEGMENTS = 10;
  * 跳动之间前缀完全稳定，跨回合缓存命中率从 ~10% 提到 ~97%。
  */
 const HISTORY_EVICT_CHUNK = 20;
+/**
+ * 短ID映射（message_id ↔ 4位 ref）只对仍可能被引用的消息有意义：活跃窗口 +
+ * 未归档日记段 + 少量近期归档。发版实测单个会话堆到 99,817 条、状态文件
+ * 7.26MB——每来一条消息全量 stringify 一次，纯属白白拖慢回合。保留最近
+ * MAX_MESSAGE_REFS 条即可，活跃窗口内的永远保留。
+ */
+const MAX_MESSAGE_REFS = 5_000;
 
 export class ScopeRepository {
   private readonly cache = new Map<string, ScopeState>();
@@ -95,12 +103,19 @@ export class ScopeRepository {
     private readonly stateDir = join(PROJECT_ROOT, 'data', 'state'),
     private readonly historyLimit = 500,
     private readonly archive: MessageArchive | null = null,
+    private readonly defaultTriggerRate = 0.01,
   ) {}
 
   // ── agents ────────────────────────────────────────────────────────────────
 
   getOrCreateAgent(scopeType: string, scopeId: string, persona = ''): AgentRecord {
     const state = this.loadScope(scopeType, scopeId);
+    // Honor the documented seeding parameter: an explicitly supplied persona
+    // fills an agent that has none (never overwrites an existing one).
+    if (persona.trim() && !state.agent.persona.trim()) {
+      state.agent.persona = persona;
+      this.persist(state);
+    }
     return state.agent;
   }
 
@@ -154,6 +169,7 @@ export class ScopeRepository {
       needsSummarize = true;
       this.enforceSegmentBound(state);
     }
+    this.pruneMessageRefs(state);
     this.persist(state);
     return needsSummarize;
   }
@@ -163,11 +179,30 @@ export class ScopeRepository {
     return [...this.loadScope(scopeType, scopeId).diarySegments];
   }
 
+  /** 启动清扫：tmp+rename 写到一半被 kill 会留下孤儿 .tmp，攒多了占盘还碍眼。 */
+  async sweepOrphanTemps(): Promise<number> {
+    let names: string[] = [];
+    try {
+      names = await readdir(this.stateDir);
+    } catch {
+      return 0;
+    }
+    let swept = 0;
+    for (const name of names) {
+      if (!/\.tmp$/.test(name)) continue;
+      try {
+        await rm(join(this.stateDir, name), { force: true });
+        swept += 1;
+      } catch { /* best-effort */ }
+    }
+    return swept;
+  }
+
   /** Scope keys ("type:id") of every persisted state file — recovery scans. */
   async listPersistedScopes(): Promise<string[]> {
     let names: string[] = [];
     try {
-      names = (await readdir(this.stateDir)).filter((name) => name.endsWith('.json'));
+      names = (await readdir(this.stateDir)).filter((name) => /^(group|private|domain)_[^/]+\.json$/.test(name));
     } catch {
       return [];
     }
@@ -248,18 +283,34 @@ export class ScopeRepository {
 
   resolveRef(scopeType: string, scopeId: string, ref: string): string | null {
     const state = this.loadScope(scopeType, scopeId);
-    return state.refToMessageId[String(ref).trim().replace(/^\[#?|\]$/g, '')] ?? null;
+    return state.refToMessageId[normalizeMessageRef(ref)] ?? null;
   }
 
   /** History entry carrying a short ID — view_image looks up images this way. */
   findEntryByRef(scopeType: string, scopeId: string, ref: string): HistoryEntry | null {
-    const normalized = String(ref).trim().replace(/^\[#?|\]$/g, '');
+    const normalized = normalizeMessageRef(ref);
     if (!normalized) return null;
     const state = this.loadScope(scopeType, scopeId);
     for (let i = state.messages.length - 1; i >= 0; i -= 1) {
       if (String(state.messages[i].message_ref ?? '') === normalized) return state.messages[i];
     }
     return null;
+  }
+
+  /** 最近的带图消息（新→旧，最多 limit 条）：取图失败时提示模型真实可用的短ID。 */
+  recentImageRefs(scopeType: string, scopeId: string, limit = 5): { ref: string; ageMinutes: number }[] {
+    const state = this.loadScope(scopeType, scopeId);
+    const now = Date.now() / 1000; // entry.timestamp 是 epoch 秒，别拿毫秒减
+    const out: { ref: string; ageMinutes: number }[] = [];
+    for (let i = state.messages.length - 1; i >= 0 && out.length < limit; i -= 1) {
+      const entry = state.messages[i];
+      const ref = String(entry.message_ref ?? '');
+      if (ref === '' || !Array.isArray(entry.image_refs) || entry.image_refs.length === 0) continue;
+      const timestamp = Number(entry.timestamp);
+      const ageMinutes = Number.isFinite(timestamp) ? Math.max(0, Math.round((now - timestamp) / 60)) : 0;
+      out.push({ ref, ageMinutes });
+    }
+    return out;
   }
 
   // ── scope state file management ───────────────────────────────────────────
@@ -288,6 +339,55 @@ export class ScopeRepository {
       });
       state.diarySummaries.sort((a, b) => a.index - b.index);
     }
+    // Same 20-segment prompt window as storeDiarySummary: fallback summaries
+    // must not grow the list past the window the prompt actually reads.
+    if (state.diarySummaries.length > 20) {
+      state.diarySummaries.splice(0, state.diarySummaries.length - 20);
+    }
+  }
+
+  /**
+   * Bound the short-ID maps. Refs still reachable from the active history
+   * window / unsummarized diary segments are always kept; the rest degrade
+   * to "newest MAX_MESSAGE_REFS" (numeric message ids are chronological).
+   */
+  private pruneMessageRefs(state: ScopeState): void {
+    const total = Object.keys(state.messageRefs).length;
+    if (total <= MAX_MESSAGE_REFS) return;
+    const liveIds = new Set<string>();
+    const collect = (entries: HistoryEntry[] | undefined): void => {
+      for (const entry of entries ?? []) {
+        const id = String(entry.message_id ?? '');
+        if (id) liveIds.add(id);
+      }
+    };
+    collect(state.messages);
+    collect(state.pendingDiary?.messages);
+    for (const segment of state.diarySegments) collect(segment.messages);
+
+    const keep = new Set<string>();
+    for (const id of liveIds) if (state.messageRefs[id] !== undefined) keep.add(id);
+    if (keep.size >= MAX_MESSAGE_REFS) {
+      // Pathological active window larger than the cap: keep only live refs.
+    } else {
+      const rest = Object.keys(state.messageRefs)
+        .filter((id) => !keep.has(id))
+        .sort((a, b) => {
+          const na = Number(a);
+          const nb = Number(b);
+          return Number.isFinite(na) && Number.isFinite(nb) ? nb - na : b.localeCompare(a);
+        });
+      for (const id of rest) {
+        if (keep.size >= MAX_MESSAGE_REFS) break;
+        keep.add(id);
+      }
+    }
+    for (const id of Object.keys(state.messageRefs)) {
+      if (keep.has(id)) continue;
+      const ref = state.messageRefs[id];
+      delete state.messageRefs[id];
+      if (ref !== undefined) delete state.refToMessageId[ref];
+    }
   }
 
   private scopePath(scopeType: string, scopeId: string): string {
@@ -304,7 +404,7 @@ export class ScopeRepository {
       // later hydrate into persisting defaults over disk state.
       const raw = JSON.parse(readFileSync(this.scopePath(scopeType, scopeId), 'utf-8')) as Partial<ScopeState>;
       state = {
-        agent: { ...defaultAgent(scopeType, scopeId), ...raw.agent },
+        agent: { ...defaultAgent(scopeType, scopeId, this.defaultTriggerRate), ...raw.agent },
         messages: raw.messages ?? [],
         diarySegments: raw.diarySegments ?? [],
         diarySummaries: raw.diarySummaries ?? [],
@@ -329,7 +429,7 @@ export class ScopeRepository {
       state = null;
     }
     state ??= {
-      agent: defaultAgent(scopeType, scopeId),
+      agent: defaultAgent(scopeType, scopeId, this.defaultTriggerRate),
       messages: [],
       diarySegments: [],
       diarySummaries: [],
@@ -375,7 +475,7 @@ export class ScopeRepository {
   }
 }
 
-function defaultAgent(scopeType: string, scopeId: string): AgentRecord {
+function defaultAgent(scopeType: string, scopeId: string, triggerRate = 0.01): AgentRecord {
   return {
     agentId: `agent_${randomUUID().slice(0, 8)}`,
     scopeType,
@@ -383,7 +483,7 @@ function defaultAgent(scopeType: string, scopeId: string): AgentRecord {
     persona: '',
     impression: '',
     triggerWords: [], // 默认只认 @；触发词由各会话自行配置（trigger_config / scope_manage）
-    triggerRate: 0.01,
+    triggerRate,
     enabled: true,
     displayName: '',
     createdAt: Date.now() / 1000,

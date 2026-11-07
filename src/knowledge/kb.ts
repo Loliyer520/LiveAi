@@ -11,7 +11,7 @@
  *   write  = 追加 + 修订挂载范围内既有条目
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, renameSync } from 'node:fs';
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -54,6 +54,8 @@ export interface KbState {
 const MAX_SUBJECT = 80;
 const MAX_CONTENT = 2000;
 const MAX_TAG = 32;
+/** 待审核队列上限：防下级 AI 抽风无限堆积。 */
+const MAX_PENDING = 200;
 
 function now(): number {
   return Date.now() / 1000;
@@ -216,7 +218,7 @@ export class KnowledgeBase {
   /** 某 scope 的可见条目（并集去重，按更新时间倒序）。 */
   visibleFor(scopeKey: string): KbEntry[] {
     if (this.isAdmin(scopeKey)) {
-      return Object.values(this.load().entries).sort((a, b) => b.updatedAt - a.createdAt);
+      return Object.values(this.load().entries).sort((a, b) => b.updatedAt - a.updatedAt);
     }
     const mounts = this.mountsFor(scopeKey);
     if (mounts.length === 0) return [];
@@ -275,7 +277,12 @@ export class KnowledgeBase {
     };
     if (!item.entry.subject) throw new Error('subject 为空');
     if (!item.entry.content) throw new Error('content 为空');
-    this.pending().push(item);
+    // 待审核队列不设上限的话，下级 AI 抽风能把 pending 堆到永远没人清。
+    const queue = this.pending();
+    if (queue.length >= MAX_PENDING) {
+      throw new Error(`待审核队列已满（${MAX_PENDING} 条），请先让主级审批清理后再提议。`);
+    }
+    queue.push(item);
     this.persistPending();
     return item.id;
   }
@@ -318,7 +325,18 @@ export class KnowledgeBase {
         mounts: Array.isArray(raw.mounts) ? raw.mounts : [],
         updatedAt: raw.updatedAt ?? 0,
       };
-    } catch {
+    } catch (error) {
+      // Never let the next persist() overwrite an unreadable kb.json: keep a
+      // timestamped backup first (same policy as repository/scheduler).
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        const backup = `${this.kbPath}.bak-${Date.now()}`;
+        try {
+          renameSync(this.kbPath, backup);
+          console.error(`[kb] 知识库文件损坏，已备份到 ${backup}:`, error);
+        } catch (backupError) {
+          console.error('[kb] 知识库文件损坏且备份失败:', error, backupError);
+        }
+      }
       this.state = { entries: {}, mounts: [], updatedAt: 0 };
     }
     return this.state;
@@ -329,7 +347,16 @@ export class KnowledgeBase {
     try {
       const raw = JSON.parse(readFileSync(this.pendingPath, 'utf-8')) as KbPendingItem[] | null;
       this.pendingState = Array.isArray(raw) ? raw : [];
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        const backup = `${this.pendingPath}.bak-${Date.now()}`;
+        try {
+          renameSync(this.pendingPath, backup);
+          console.error(`[kb] 待审队列损坏，已备份到 ${backup}:`, error);
+        } catch (backupError) {
+          console.error('[kb] 待审队列损坏且备份失败:', error, backupError);
+        }
+      }
       this.pendingState = [];
     }
     return this.pendingState;

@@ -65,9 +65,19 @@ export class InMemoryEventMailbox {
     return entry;
   }
 
+  /**
+   * Read-only peek at a scope's queued transients (does NOT pop or drain).
+   * Used by the send-interlock: messages sitting here arrived while the turn
+   * was mid-flight, so the model has not seen them yet.
+   */
+  peekScopeTransients<T>(scopeKey: string): (T | null)[] {
+    const queue = this.scopeQueues.get(scopeKey);
+    if (!queue || queue.length === 0) return [];
+    return queue.map((entry) => entry.transient as T | null);
+  }
+
   /** Re-admit a failed event at the head of its scope, deferred by `delayMs`. */
-  requeueFront(
-    event: EventEnvelope,
+  requeueFront(    event: EventEnvelope,
     transient: unknown = null,
     attempt = 1,
     delayMs = 0,

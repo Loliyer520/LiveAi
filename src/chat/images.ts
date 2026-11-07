@@ -10,7 +10,7 @@
  */
 
 import type { ChatMessage } from './types.js';
-import { assertPublicUrl, fetchGuarded, readCapped } from './net.js';
+import { cachedImageUri, ensureImageCached } from './image-cache.js';
 
 const CQ_IMAGE_PATTERN = /\[CQ:image,([^\]]*)\]/g;
 
@@ -39,6 +39,17 @@ export function extractImageRefs(message: ChatMessage): string[] {
   return [...new Set(refs)];
 }
 
+/** Find the NapCat file ID for the exact selected URL, not by a deduped array index. */
+export function extractImageFile(rawMessage: string, imageUrl: string): string {
+  for (const match of String(rawMessage ?? '').matchAll(CQ_IMAGE_PATTERN)) {
+    const params = parseCqParams(match[1]);
+    if (pickImageUrl(params.url, params.file) !== imageUrl) continue;
+    const file = String(params.file ?? '').trim();
+    return /^https?:\/\//i.test(file) ? '' : file;
+  }
+  return '';
+}
+
 function pickImageUrl(url: unknown, file: unknown): string | null {
   const asUrl = String(url ?? '').trim();
   if (/^https?:\/\//i.test(asUrl)) return asUrl;
@@ -65,8 +76,6 @@ function parseCqParams(body: string): Record<string, string> {
   return params;
 }
 
-const MAX_EMBED_BYTES = 6 * 1024 * 1024;
-
 /**
  * Download a remote image and return it as a `data:<mime>;base64,…` URL.
  * Vision providers generally refuse to fetch remote URLs themselves (and QQ
@@ -76,15 +85,12 @@ const MAX_EMBED_BYTES = 6 * 1024 * 1024;
  */
 export async function embedImageAsDataUrl(url: string): Promise<string> {
   if (url.startsWith('data:') || !/^https?:\/\//i.test(url)) return url;
-  // QQ CDN 是公网地址，过 SSRF 守卫不影响正常用图；重定向逐跳复查，读体走硬上限。
-  const checked = await assertPublicUrl(url);
-  const response = await fetchGuarded(checked, {
-    headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://im.qq.com/' },
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!response.ok) throw new Error(`图片下载失败 HTTP ${response.status}`);
-  const buffer = await readCapped(response, MAX_EMBED_BYTES);
-  const mime = (response.headers.get('content-type') ?? '').split(';', 1)[0].trim() || 'image/jpeg';
-  if (!mime.startsWith('image/')) throw new Error(`不是图片内容: ${mime}`);
-  return `data:${mime};base64,${buffer.toString('base64')}`;
+  // 看图与原样回发共用同一份持久缓存：即使随后 QQ 图链过期，也已经留下原图字节。
+  const existing = await cachedImageUri(url);
+  if (existing) return existing;
+  if (await ensureImageCached(url)) {
+    const cached = await cachedImageUri(url);
+    if (cached) return cached;
+  }
+  throw new Error('图片下载失败：原图链接已失效、响应过大或内容不是图片');
 }

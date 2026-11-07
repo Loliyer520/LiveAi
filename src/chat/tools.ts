@@ -4,8 +4,9 @@
  * pair, recall, notes (memory), master relay, alarms.
  */
 
-import { resolve as resolveAbs, sep as pathSep, dirname } from 'node:path';
+import { resolve as resolveAbs, sep as pathSep, dirname, join as joinPath } from 'node:path';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFile, mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
 import type { ToolSchema } from '../models/types.js';
 import type { NapcatBot } from '../bot/napcat.js';
 import type { ScopeRepository } from '../store/repository.js';
@@ -13,7 +14,10 @@ import type { MessageArchive } from '../store/archive.js';
 import type { RelationGraph } from '../relations/graph.js';
 import type { TaskScheduler } from './scheduler.js';
 import type { ChatMessage, HistoryEntry } from './types.js';
+import { MASTER_SCOPE_KEY } from './types.js';
 import { replyMessageLines } from './reply-lines.js';
+import { embedImageAsDataUrl, extractImageFile } from './images.js';
+import { cachedImageFileInfo, cachedImageUri, cdnDownloadHeaders, ensureImageCached } from './image-cache.js';
 import { stripThinking } from './thinking.js';
 import { ACTION_TOOL_SCHEMAS, executeActionTool, spendNetworkBudget } from './actions.js';
 import { formatUsageText, usageStats } from '../models/usage.js';
@@ -21,11 +25,21 @@ import { pluginRegistry } from './plugins.js';
 import { downloadToFile } from './net.js';
 import { spoolToUrl } from './media-spool.js';
 import { extractFrameTiled, videoDuration } from './video-frames.js';
-import { mc2dClient } from './mc2d.js';
+import {
+  addIdentityLine,
+  identityChannelList,
+  identityEvents,
+  listIdentityLines,
+  removeIdentityLine,
+  setSubscription,
+  subscriptionsFor,
+} from '../store/global-identity.js';
 import type { GroupRolesInfo } from './group-roles.js';
 import type { Workspace } from './workspace.js';
 import type { KnowledgeBase, KbPermission } from '../knowledge/kb.js';
 import { domainDefForScope, domainDefs, domainScopeHasBuiltin } from './domains.js';
+import { QQ_CHAT_TOOL_SCHEMAS, QQ_MAIN_TOOL_SCHEMAS, executeQqTool } from './qq-tools.js';
+import { normalizeMessageRef } from '../message-ref.js';
 
 function domainList(): string { return domainDefs().map((def) => `domain:${def.id}（${def.title}）`).join('、'); }
 
@@ -93,6 +107,8 @@ export function configureStickers(indexPath: string): void {
 
 /** 各会话最近一次下载的视频（send_video 记、watch_video 默认看它）。 */
 const lastVideoByScope = new Map<string, string>();
+/** 本回合已 send_image 的 file 指纹（按 ToolContext 弱引用，回合结束可整体回收）。 */
+const sentImageUrlsThisTurn = new WeakMap<object, Set<string>>();
 
 function loadStickerIndex(): StickerEntry[] {
   if (stickerIndexCache !== null) return stickerIndexCache;
@@ -269,7 +285,7 @@ export interface ToolContext {
   /** True when the current turn runs in the master (主AI) scope. */
   isMaster: boolean;
   /** Called with the master-relay payload; orchestrator routes it. */
-  notifyMaster: (payload: { text: string; requestType?: string; fromScope: string }) => void;
+  notifyMaster: (payload: { text: string; requestType?: string; fromScope: string; needReply?: boolean }) => void;
   /** Per-scope sandboxed filesystem root for the autonomous-action tools. */
   workspace: Workspace;
   /** Per-turn network call counter (web_* / download_* share the budget). */
@@ -288,12 +304,16 @@ export interface ToolContext {
   sendTextOverride?: (line: string) => Promise<Record<string, unknown>>;
   /** Image URLs attached to this turn's trigger messages (view_image fallback). */
   triggerImageRefs: string[];
+  /** Video URLs attached to this turn's trigger messages (watch_video fallback). */
+  triggerVideoRefs: string[];
   /** Vision-model describe call (role 'vision', falls back to main). */
   describeImage: (url: string, question: string) => Promise<string>;
   /** Group scopes: owner/admins + the bot's own role (drives admin tools). */
   getGroupRoles?: () => Promise<GroupRolesInfo>;
   scopeType: string;
   scopeId: string;
+  /** Per-turn successfully sent image fingerprints; shared across tool rounds. */
+  sentImageKeys?: Set<string>;
   executedTools: string[];
 }
 
@@ -304,9 +324,31 @@ export interface ToolResult {
   staySilent?: boolean;
   /** The tool delivered user-visible content (suppresses the re-prompt rescue). */
   sentToUser?: boolean;
+  /** 原图直出：orchestrator 把这些 URL 内联成图像块，仅下一轮请求可见一次。 */
+  inlineImageUrls?: string[];
 }
 
 export const CHAT_TOOL_SCHEMAS: ToolSchema[] = [
+  {
+    name: 'intel_channel',
+    description:
+      '订阅/退订「自我情报频道」，并查频道的推送记录。你有多个分身/领域身份（频道列表见下），'
+      + '默认不订阅=上下文里不注入它们的动态（省 token，也跟你无关就别惦记）；'
+      + '本会话聊到相关话题（比如有人喊你玩 MC）时再订阅，并用 events 翻推送记录补课；话题过去了可以退订。'
+      + '频道：mc=真实 Minecraft 服务器（角色 BingTang 游玩的 26.2 本地服）的在线状态与玩家名单。'
+      + '回答「你进服了吗/看到我上线了吗/现在能玩了吗」之前，必须先 action=status 或 events 查 mc 频道；'
+      + '没有工具结果，绝对不许声称自己进去了/连不上/掉线了，也不要自演进服过程。'
+      + 'action: status=看各频道当前状态+自己的订阅；subscribe/unsubscribe=订阅/退订（channel）；events=查最近推送记录（channel 可选，limit 默认 20）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'status / subscribe / unsubscribe / events' },
+        channel: { type: 'string', description: '频道名（subscribe/unsubscribe 必填；events 可选）' },
+        limit: { type: 'number', description: 'events 条数，默认 20' },
+      },
+      required: ['action'],
+    },
+  },
   {
     name: 'send_message',
     description:
@@ -402,12 +444,17 @@ export const CHAT_TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'notify_master',
     description:
-      '联系主AI：上报情报、跨会话协调、请求高风险授权、系统级操作。request_type 常用: intel / set_user_preference / relation_add_fact / system_operation / cross_session_relay。',
+      '联系主AI：上报情报、跨会话/跨领域协调、请求高风险授权、系统级操作。request_type 常用: intel / set_user_preference / relation_add_fact / system_operation / cross_session_relay / bili / mc。'
+      + 'B 站搜索、BV 号详情或取直链用 request_type=bili，并在 text 写全关键词/链接/BV号和观看或发送需求。'
+      + 'MC 进服、游戏内操作或需要真实服务器状态用 request_type=mc；只想知道「自己在不在服里」可先查 intel_channel 的 mc 频道。'
+      + '需要主AI给出结论并回话的请示（授权、协调、需要你等答复才能继续的事）必须传 need_reply=true（request_type=system_operation 自动视为需要回执）；'
+      + '纯情报报备不要传，避免每条都被要求回话。',
     parameters: {
       type: 'object',
       properties: {
         text: { type: 'string', description: '要告诉主AI的完整内容' },
         request_type: { type: 'string', description: '请求类型' },
+        need_reply: { type: 'boolean', description: '是否需要主AI回话（请示/授权/协调类必传 true）' },
       },
       required: ['text'],
     },
@@ -427,6 +474,42 @@ export const CHAT_TOOL_SCHEMAS: ToolSchema[] = [
         note: { type: 'string', description: '提醒内容 / 周期任务每次要执行的指令' },
       },
       required: ['kind', 'note'],
+    },
+  },
+  {
+    name: 'set_watchdog',
+    description:
+      '回执超时保底：给「发起后要等结果的事」上闹钟，到点自动重新唤醒你自己检查。'
+      + '典型用法：delegate_to_child 委派、notify_master(need_reply=true) 请示、跨应用/边车长任务（MC 操作、下载、生图）之后，'
+      + 'after 设为预期耗时加一点余量（如预期 1 分钟就 "+2m"），note 写清「等的是什么+没结果该怎么办」。'
+      + '到点会以内部消息触发你：有结果就收尾或 stay_silent，没结果就继续跟进或如实汇报卡点，不会打扰用户设定以外的内容。'
+      + '同一 tag 的新保底会自动顶掉旧的（重委派/续期不积压）；收到回执不再需要保底时用 cancel_task 取消。'
+      + 'after 支持 "+90s"/"+5m"/"+2h" 或 Unix 秒，最短 30 秒、最长 24 小时。',
+    parameters: {
+      type: 'object',
+      properties: {
+        after: { type: 'string', description: '多久后触发（+90s/+5m/+2h 或 Unix 秒）' },
+        note: { type: 'string', description: '等的是什么、到点还没回音时该怎么跟进（会原文回给你自己）' },
+        tag: { type: 'string', description: '可选标签；同 scope 同 tag 旧保底自动作废（默认 default）' },
+      },
+      required: ['after', 'note'],
+    },
+  },
+  {
+    name: 'schedule_image',
+    description:
+      '把用户发过的一张图片延迟原样发回，例如「10分钟后把这张照片再发给我」。'
+      + 'at 传 +10m/+1h 或 Unix 秒；默认使用本轮最新的图，本轮没图则使用本会话最近一张图，历史图传真实的 message_ref，多图用 index 指定。'
+      + '创建时会先把原图保存到本地，到点直接发送，不经过二次生成、不修改图片，重启也会恢复。最长 23 小时 59 分钟。'
+      + '延迟发原图必须用它，不要拿 create_task 加图片链接代替。',
+    parameters: {
+      type: 'object',
+      properties: {
+        at: { type: 'string', description: '发送时间：Unix 秒或 +90s/+10m/+2h' },
+        message_ref: { type: 'string', description: '可选，历史带图消息的真实短ID；省略=本轮图片，没有则取本会话最近一张' },
+        index: { type: 'number', description: '消息里的第几张图，从 1 开始，默认 1' },
+      },
+      required: ['at'],
     },
   },
   {
@@ -458,16 +541,35 @@ export const CHAT_TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
-    name: 'send_image',
+    name: 'view_image_raw',
     description:
-      '给用户发送一张图片。file 传 http(s) 图片链接、base64:// 数据或 NapCat 可访问的本地绝对路径。'
-      + '需要配文字说明时用 send_message 另发一条。',
+      '直接看原图（以图像形式呈现给你本人，不经文字转写）：默认看本轮消息带的图（index 从 1 开始），'
+      + '也可传 message_ref 看历史某条消息里的图。原图只在紧随其后的那一轮里可见一次，'
+      + '之后的轮次里会显示为【已过期】——需要再看就再次调用本工具。'
+      + '判断构图/长相/画风/图上文字排版这类转写容易失真的细节时用它；只要粗略内容用 view_image 就够。',
     parameters: {
       type: 'object',
       properties: {
-        file: { type: 'string', description: '图片地址：http(s)://… / base64://… / 绝对路径' },
+        message_ref: { type: 'string', description: '可选，历史消息短ID，如 A1B2；不传则看本轮消息的图' },
+        index: { type: 'number', description: '第几张图，从 1 开始，默认 1' },
       },
-      required: ['file'],
+    },
+  },
+  {
+    name: 'send_image',
+    description:
+      '给用户发送一张图片。仅在用户明确说「把这张图/刚才的图原样发回」「再发给我」时才可省略参数，'
+      + '此时自动使用本轮图片，本轮没图则使用本会话最近一张图；不要先 view_image，也不要凭以前的失败记录拒绝。'
+      + '其他发图场景必须明确图片来源：新生成/外部图片用 file，已有图片用真实的 message_ref；'
+      + '无参时当前消息图片优先；只有当前无图且历史存在多个带图消息时才拒绝并列出候选短ID，必须按语境选定后重试。'
+      + 'file 支持 http(s) 图片链接、base64:// 数据或 NapCat 可访问的本地绝对路径，多图用 index 指定。需要配文字说明时用 send_message 另发一条。',
+    parameters: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: '可选，外部图片地址：http(s)://… / base64://… / 绝对路径；省略=回发用户已有的图' },
+        message_ref: { type: 'string', description: '可选，历史带图消息的真实短ID；与 file 二选一' },
+        index: { type: 'number', description: '消息里的第几张图，从 1 开始，默认 1' },
+      },
     },
   },
   {
@@ -495,7 +597,7 @@ export const CHAT_TOOL_SCHEMAS: ToolSchema[] = [
     description:
       '给用户发送一条视频消息。url 传视频直链（http(s) 的 mp4/flv 等；B 站 CDN 直链会自动带 Referer）。'
       + '先下载再发，最大 150MB，下载+转码要等一会儿；太大就换低清晰度的直链（如 B 站取 360P）。'
-      + '配文字说明用 send_message 另发。看完就走的小视频场景（B 站插件 bili_url 取直链后）用它。',
+      + '配文字说明用 send_message 另发。B 站直链由哔哩中枢的 bili_url 获取；当前会话没有该工具时按提示词协调，不要调用不可见工具。',
     parameters: {
       type: 'object',
       properties: {
@@ -508,8 +610,9 @@ export const CHAT_TOOL_SCHEMAS: ToolSchema[] = [
     name: 'watch_video',
     description:
       '用眼睛看视频：从视频文件抽取若干帧、贴成一张带时间戳的长图，交给视觉模型看（真多模态）。'
-      + '想看视频里发生了什么、验证画面内容、找某个画面时用它。file 传 send_video 返回的工作区路径（不传默认看最近一次下载的视频），'
-      + '也可直接给 url 现下载。moments 写想看的时刻（秒，逗号分隔，最多 10 个，如 0,30,120）；不写则自动均匀取 5 帧。'
+      + '想看视频里发生了什么、验证画面内容、找某个画面时用它。消息里出现 [视频×N] 时直接无参调用——会自动抓那条视频；'
+      + 'file 传 send_video 返回的工作区路径（不传默认看最近一次下载的视频），也可直接给 url 现下载。'
+      + 'moments 写想看的时刻（秒，逗号分隔，最多 10 个，如 0,30,120）；不写则自动均匀取 5 帧。'
       + '画面是抽帧快照，看不到声音和连贯动作；要发给用户看还是用 send_video。',
     parameters: {
       type: 'object',
@@ -519,6 +622,35 @@ export const CHAT_TOOL_SCHEMAS: ToolSchema[] = [
         moments: { type: 'string', description: '想看的时刻，秒，逗号分隔（如 0,15,60,180），最多 10 个；不写自动均匀取 5 帧' },
         question: { type: 'string', description: '想从画面里知道什么；不写则客观描述每帧内容' },
       },
+    },
+  },
+  {
+    name: 'file_save',
+    description:
+      '把文件长期保存进本会话工作区（重启不丢，之后用 file_list 查看、send_image/send_video 发出去；普通的列目录/读文件用 file_list/file_read）。'
+      + '来源二选一：url=下载 http(s) 链接（图片/视频/文件都行，QQ 图链和 B 站 CDN 自动带防盗链头）；'
+      + '或 message_ref+index=把某条历史消息里的第 N 张图存下来（优先吃本地缓存，原链过期也能存）。'
+      + 'filename 是保存成的文件名，可带子目录（如 images/晚霞.png），扩展名可省（按内容自动补）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'http(s) 文件链接（与 message_ref 二选一）' },
+        message_ref: { type: 'string', description: '带图消息的短ID（与 url 二选一）' },
+        index: { type: 'number', description: '消息里第几张图，默认 1', default: 1 },
+        filename: { type: 'string', description: '保存为的文件名，可带子目录，如 images/晚霞.png' },
+      },
+      required: ['filename'],
+    },
+  },
+  {
+    name: 'file_delete',
+    description: '删除本会话长期工作区里的一个文件（filename 传 file_list 列出的相对路径）。删了找不回，确认不要了再删。',
+    parameters: {
+      type: 'object',
+      properties: {
+        filename: { type: 'string', description: 'file_list 里的相对路径' },
+      },
+      required: ['filename'],
     },
   },
   {
@@ -621,6 +753,23 @@ export const CHAT_TOOL_SCHEMAS: ToolSchema[] = [
 /** 主AI scope 专属工具：关系网写入、跨会话委派、直接发消息。 */
 const MASTER_ONLY_TOOL_SCHEMAS: ToolSchema[] = [
   {
+    name: 'identity_write',
+    description:
+      '维护「全局共同体记忆」——写给所有会话的你自己看的共享自我情报（仅主AI）。'
+      + '写进来的每一行会出现在你所有会话（群/私聊/领域）的上下文里，让每个分身都知道「我这个账号还有什么身份/分身/长期状态」。'
+      + '适合放：分身清单、长期身份设定、跨会话要记住的自我事实。会变的游戏/任务实时状态不用写（系统自动注入）。'
+      + 'action: list=列出现有行（含 id）；add=追加一行（text）；remove=按 id 删一行。上限 40 行，先 list 再改。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'list / add / remove' },
+        text: { type: 'string', description: 'add 的内容（≤500 字，一行一个事实）' },
+        id: { type: 'string', description: 'remove 的目标行 ID' },
+      },
+      required: ['action'],
+    },
+  },
+  {
     name: 'relation_write',
     description:
       '写入/修订全局关系网络（仅主AI）。action 说明：'
@@ -653,9 +802,9 @@ const MASTER_ONLY_TOOL_SCHEMAS: ToolSchema[] = [
     description:
       '委派另一个会话/领域中枢/领域下级做事（仅主AI）：instruction 会被注入目标，由那边的 AI 自主执行'
       + '（它可以自然地与用户说话、查证、回报）。跨会话联系/转达/查情况优先用它，而不是自己直接出面。'
-      + 'target_scope_type：group / private 是 QQ 会话；domain 是领域主级中枢（如 domain mc = Minecraft 中枢，'
-      + 'MC 相关任务一律委派给它，它持有全部 mc_* 工具和 mc_view）；bili 是 B 站视频下级 AI'
-      + '（target_scope_id 传 bvid，如 BV1xx，每个视频一个独立上下文）；mcclient 是 MC client 下级 AI'
+      + 'target_scope_type：group / private 是 QQ 会话；domain 是领域主级中枢（mc = Minecraft 中枢，持有全部 mc_* 工具和 mc_view；'
+      + 'bili = 哔哩中枢，持有 bili_search / bili_detail / bili_url，B 站搜索、详情、取直链和细看任务统一先委派给它）；'
+      + 'bili 是 B 站视频下级 AI（target_scope_id 传 bvid，如 BV1xx，每个视频一个独立上下文，通常由哔哩中枢协调）；mcclient 是 MC client 下级 AI'
       + '（target_scope_id 传 client 名）。'
       + 'instruction 要写全背景：谁要求的、要做什么、说完要不要回报。对方完成后会通过 notify_master 回报结果。',
     parameters: {
@@ -734,92 +883,6 @@ const MASTER_ONLY_TOOL_SCHEMAS: ToolSchema[] = [
       '同步号主的收藏表情到表情包库（仅主AI）。拉取收藏清单按 MD5 增量比对：新表情用视觉模型看图自动打标（描述+检索标签），'
       + '已打标的跳过不重复花钱，被取消收藏的移除。每次启动会自动同步一次，主人说「更新/刷新表情库」'
       + '或表情库报缺、有新收藏时手动调。新表情多时打标要一会儿，属正常。',
-    parameters: { type: 'object', properties: {} },
-  },
-  // ── 2D 我的世界联机（MC2D）：bot 以「冰糖」身份进服陪玩 ──────────────────
-  {
-    name: 'mc2d_status',
-    description:
-      '查看 2D 我的世界联机游戏状态（仅主AI）：自己坐标/生命/饥饿/背包、在线玩家、附近生物、最近聊天，'
-      + '以及身边方块地形图。第一次调用会自动以「冰糖」进服，掉线会自动重连。'
-      + '主人问「你在游戏里吗/周围有什么/旁边是谁」时先调它。',
-    parameters: { type: 'object', properties: {} },
-  },
-  {
-    name: 'mc2d_move',
-    description:
-      '让游戏角色走到目标方块列 x（仅主AI，0-399）。按真实物理走，会自动跳 1-2 格高的台阶，'
-      + '最多约 45 秒，被地形卡住会返回实际位置——可以再调一次或先用 mc2d_dig 挖开挡路方块。',
-    parameters: {
-      type: 'object',
-      properties: { x: { type: 'number', description: '目标方块列（横坐标）' } },
-      required: ['x'],
-    },
-  },
-  {
-    name: 'mc2d_dig',
-    description:
-      '挖掉指定方块（仅主AI）。只能在身边 6 格（曼哈顿距离）内挖，挖到的掉落物自动进背包。'
-      + '用 mc2d_status 的地形图确认方块坐标再挖。',
-    parameters: {
-      type: 'object',
-      properties: {
-        x: { type: 'number', description: '方块列' },
-        y: { type: 'number', description: '方块行（0=世界顶部，越大越深）' },
-      },
-      required: ['x', 'y'],
-    },
-  },
-  {
-    name: 'mc2d_place',
-    description:
-      '在指定位置放一个方块（仅主AI，6 格内，目标必须是空气，背包里要有该方块）。'
-      + 'block 用方块 id：2 泥土 / 4 原木 / 6 沙子 / 7 木板 / 8 圆石 / 9 煤矿 / 10 铁矿 / 11 金矿 / 12 钻石矿 / 17 床 / 20 熔炉。',
-    parameters: {
-      type: 'object',
-      properties: {
-        x: { type: 'number', description: '方块列' },
-        y: { type: 'number', description: '方块行' },
-        block: { type: 'number', description: '方块 id（见描述）' },
-      },
-      required: ['x', 'y', 'block'],
-    },
-  },
-  {
-    name: 'mc2d_attack',
-    description:
-      '攻击附近的生物（仅主AI，6 格内）。不传 mob_id 就打最近的。damage 1-8，默认 4。'
-      + '打死猪会掉猪肉；僵尸/骷髅/苦力怕晚上才刷。',
-    parameters: {
-      type: 'object',
-      properties: {
-        mob_id: { type: 'number', description: '目标生物 id（mc2d_status 里有），不传=最近' },
-        damage: { type: 'number', description: '伤害 1-8，默认 4' },
-      },
-    },
-  },
-  {
-    name: 'mc2d_say',
-    description: '在 MC2D 游戏聊天框里说一句话（仅主AI，最多 60 字），服务器里的其他玩家能看到。',
-    parameters: {
-      type: 'object',
-      properties: { message: { type: 'string', description: '要说的话，≤60 字' } },
-      required: ['message'],
-    },
-  },
-  {
-    name: 'mc2d_view',
-    description:
-      '把游戏当前画面渲染成图片交给视觉模型看（仅主AI）：能识别自己所在的地形、周围方块、其他玩家和生物。'
-      + '想确认「眼前是什么/怎么走/怪在哪」时用；坐标和方块名优先用 mc2d_status 的文本地形图。',
-    parameters: {
-      type: 'object',
-      properties: { question: { type: 'string', description: '可选，想让视觉模型重点看什么' } },
-    },
-  },
-  {
-    name: 'mc2d_leave',
-    description: '让角色退出 MC2D 服务器（仅主AI）。下次调用任意 mc2d_* 工具会自动重新进服。',
     parameters: { type: 'object', properties: {} },
   },
   {
@@ -911,13 +974,14 @@ const HUB_TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'domain_message',
     description:
-      '主级AI互聊（仅主AI与领域中枢可用）：直接给另一个领域中枢或主AI留言，对方会话里会收到'
-      + '[主级互聊 from …] 注入。target 传领域 id（mc / onebot / bili…）或 "master"。'
-      + '跨领域协调、约行动、同步情报优先用它；它是主级之间的横向通道，不等同 notify_master 汇报。',
+      '主级AI互聊（仅主AI与领域中枢可用）：直接给另一个领域中枢、主AI、或某个下级会话留言，对方会话里会收到'
+      + '[主级互聊 from …] 注入。target 传领域 id（mc / onebot / bili…）、"master"，或下级会话全限定名（group:<群号> / private:<QQ号>）。'
+      + '跨领域协调、约行动、同步情报优先用它；它是主级之间的横向通道，不等同 notify_master 汇报。'
+      + '收到带 need_reply 的请示上报后，必须用 target=<来源会话全限定名> 把结论（批准/驳回/暂缓及原因）回给来源会话。',
     parameters: {
       type: 'object',
       properties: {
-        target: { type: 'string', description: '目标领域 id（如 mc、onebot、bili）或 master' },
+        target: { type: 'string', description: '目标：领域 id（如 mc、onebot、bili）、master，或下级会话（group:<群号> / private:<QQ号>）' },
         content: { type: 'string', description: '要传达的完整内容' },
         request_type: { type: 'string', description: '可选，请求类型标注（coord / intel / request 等）' },
       },
@@ -933,29 +997,83 @@ const HUB_TOOL_SCHEMAS: ToolSchema[] = [
  * 主级互聊工具；bili/mcclient 等虚拟下级 scope 拿 CHILD 集（无 QQ 窗口，
  * 发言经 orchestrator 改道汇报给自己领域的中枢）。
  */
+/**
+ * 主AI专属工具的执行侧白名单。schema 只发给主AI，但模型输出/插件注入仍可能
+ * 直接点名调用，所以执行入口再兜一层，不能只靠「没给 schema」。
+ */
+const MASTER_ONLY_TOOL_NAMES = new Set(MASTER_ONLY_TOOL_SCHEMAS.map((schema) => schema.name));
+
 export function chatToolSchemas(scopeKey: string, isMaster: boolean): ToolSchema[] {
   const domain = domainDefForScope(scopeKey);
   const builtin: ToolSchema[] = isMaster
     ? [
       ...CHAT_TOOL_SCHEMAS.filter((schema) => !CHILD_ONLY_TOOL_NAMES.has(schema.name)),
+      ...QQ_CHAT_TOOL_SCHEMAS,
+      ...QQ_MAIN_TOOL_SCHEMAS,
       ...ACTION_TOOL_SCHEMAS,
       ...MASTER_ONLY_TOOL_SCHEMAS,
       ...HUB_TOOL_SCHEMAS,
     ]
     : domain !== null
-      ? [...CHAT_TOOL_SCHEMAS, ...ACTION_TOOL_SCHEMAS, ...domain.builtinTools, ...HUB_TOOL_SCHEMAS]
-      : [...CHAT_TOOL_SCHEMAS, ...ACTION_TOOL_SCHEMAS];
+      ? [
+        ...CHAT_TOOL_SCHEMAS,
+        ...QQ_CHAT_TOOL_SCHEMAS,
+        ...(scopeKey === 'domain:onebot' ? QQ_MAIN_TOOL_SCHEMAS : []),
+        ...ACTION_TOOL_SCHEMAS,
+        ...domain.builtinTools,
+        ...HUB_TOOL_SCHEMAS,
+      ]
+      : [...CHAT_TOOL_SCHEMAS, ...QQ_CHAT_TOOL_SCHEMAS, ...ACTION_TOOL_SCHEMAS];
   const reserved = new Set(builtin.map((schema) => schema.name));
   const pluginSchemas = pluginRegistry()?.toolSchemas(scopeKey, isMaster, reserved) ?? [];
   return [...builtin, ...pluginSchemas];
+}
+
+type ImageSelection = { url: string; source: string; napcatFile?: string } | { error: string };
+
+/** 原图回发：优先本轮图；后续「再发给我」这类无图消息则回看本会话最近的带图消息。 */
+function selectImageForReturn(context: ToolContext, args: Record<string, unknown>): ImageSelection {
+  let refs = context.triggerImageRefs;
+  let source = '本轮消息';
+  let sourceEntry: HistoryEntry | null = null;
+  const ref = normalizeMessageRef(args.message_ref);
+  let recent: { ref: string; ageMinutes: number }[] = [];
+  if (!ref && refs.length === 0 && typeof (context.repo as { recentImageRefs?: unknown }).recentImageRefs === 'function') {
+    recent = context.repo.recentImageRefs(context.scopeType, context.scopeId, 2);
+    if (recent.length > 1) {
+      const candidates = recent.map((item) => `[#${item.ref}]`).join('、');
+      return { error: `本会话有多个带图消息（${candidates}），无参默认取最新一张容易发错。请按上下文明确选择目标消息，传真实 message_ref 后再调用；不要猜。` };
+    }
+  }
+  if (ref) {
+    sourceEntry = context.repo.findEntryByRef(context.scopeType, context.scopeId, ref);
+    if (!sourceEntry) return { error: `没有找到短ID ${ref} 对应的消息，禁止编造短ID；请使用消息里实际标出的 [#XXXX]。` };
+    refs = Array.isArray(sourceEntry.image_refs) ? sourceEntry.image_refs : [];
+    source = `消息 ${ref}`;
+  } else if (refs.length === 0) {
+    sourceEntry = recent[0] ? context.repo.findEntryByRef(context.scopeType, context.scopeId, recent[0].ref) : null;
+    if (sourceEntry && Array.isArray(sourceEntry.image_refs)) {
+      refs = sourceEntry.image_refs;
+      source = `本会话最近带图消息 [#${recent[0].ref}]`;
+    }
+  }
+  if (refs.length === 0) return { error: `${source}没有图片。请让用户发图，或传真实的带图消息短ID。` };
+  const index = Math.max(1, Math.trunc(Number(args.index ?? 1)) || 1);
+  if (index > refs.length) return { error: `${source}只有 ${refs.length} 张图，index ${index} 超出范围。` };
+  const napcatFile = sourceEntry ? extractImageFile(String(sourceEntry.raw_message ?? ''), refs[index - 1]) : undefined;
+  return { url: refs[index - 1], source: `${source}第 ${index} 张`, napcatFile: napcatFile || undefined };
 }
 
 export async function executeChatTool(
   call: { name: string; arguments: Record<string, unknown> },
   context: ToolContext,
 ): Promise<ToolResult> {
+  if (!context.isMaster && MASTER_ONLY_TOOL_NAMES.has(call.name)) {
+    return { ok: false, output: `${call.name} 仅限主AI使用。` };
+  }
   context.executedTools.push(call.name);
   const args = call.arguments ?? {};
+  const toolName = call.name;
   switch (call.name) {
     case 'send_message': {
       // Never "chat" with the bot's own account (self-chat is not a scope).
@@ -1020,7 +1138,12 @@ export async function executeChatTool(
       }
       if (refs.length === 0) return { ok: false, output: `send_message 发送失败: ${failure}` };
       const interrupted = failure ? `（后续行发送中断: ${failure}）` : '';
-      return { ok: true, output: `已发送 ${refs.length} 条（短ID ${refs.join('、')}）${interrupted}。`, sentToUser: true };
+      return {
+        ok: true,
+        output: `已发送 ${refs.length} 条（短ID ${refs.join('、')}）${interrupted}。`
+          + '发言已送达；如果本次回应已经完成，请调用 stay_silent 结束本轮，等待用户新消息，不要追加催问。',
+        sentToUser: true,
+      };
     }
     case 'stay_silent':
       return { ok: true, output: '本轮保持沉默。', staySilent: true };
@@ -1081,12 +1204,40 @@ export async function executeChatTool(
     case 'notify_master': {
       const text = String(args.text ?? '').trim();
       if (!text) return { ok: false, output: 'text 为空。' };
+      const requestType = String(args.request_type ?? '') || undefined;
+      const needReply = args.need_reply === true || requestType === 'system_operation';
       context.notifyMaster({
         text,
-        requestType: String(args.request_type ?? '') || undefined,
+        requestType,
         fromScope: `${context.scopeType}:${context.scopeId}`,
+        needReply,
       });
-      return { ok: true, output: '已上报主AI。' };
+      return {
+        ok: true,
+        output: needReply
+          ? '已上报主AI（已带回执请求）：主AI/中枢处理完会把结论回话到本会话，耐心等待即可。'
+          : '已上报主AI。',
+      };
+    }
+    case 'schedule_image': {
+      if ((context.scopeType !== 'group' && context.scopeType !== 'private') || !/^\d+$/.test(context.scopeId)) {
+        return { ok: false, output: '当前虚拟会话没有 QQ 图片窗口，不能创建定时发图。' };
+      }
+      const at = parseRelativeTime(String(args.at ?? ''));
+      if (at === null) return { ok: false, output: 'at 格式无法解析（支持 Unix 秒或 +90s/+10m/+2h）。' };
+      const now = Date.now() / 1000;
+      if (at <= now) return { ok: false, output: '定时发图时间必须在未来。' };
+      if (at > now + 24 * 60 * 60 - 60) return { ok: false, output: '定时发图最长支持 23 小时 59 分钟（须给 24 小时原图缓存留出安全余量）。' };
+
+      const selected = selectImageForReturn(context, args);
+      if ('error' in selected) return { ok: false, output: `${selected.error} 未创建任务。` };
+      const { url: imageUrl, source } = selected;
+      // 必须先拿到本地副本再承诺：QQ rkey 很可能在延时期间失效。
+      if (!await ensureImageCached(imageUrl)) {
+        return { ok: false, output: '原图保存失败，未创建定时任务（不能假装已安排）。请让用户重新发图后再试。' };
+      }
+      const taskId = context.tasks.scheduleImage(`${context.scopeType}:${context.scopeId}`, at, imageUrl);
+      return { ok: true, output: `定时发图已创建（task ${taskId}）：${source}，到点直接原样发送。任务和本地副本已持久化，重启后仍会执行。` };
     }
     case 'create_task': {
       const kind = String(args.kind ?? '').trim();
@@ -1108,6 +1259,23 @@ export async function executeChatTool(
       }
       return { ok: false, output: `暂不支持的任务类型: ${kind || '(空)'}（可用: set_alarm / recurring_task）` };
     }
+    case 'set_watchdog': {
+      const note = String(args.note ?? '').trim();
+      if (!note) return { ok: false, output: 'note 为空（要写清等的是什么、没回音时怎么跟进）。' };
+      const at = parseRelativeTime(String(args.after ?? ''));
+      if (at === null) return { ok: false, output: 'after 格式无法解析（支持 Unix 秒或 +30s/+90s/+5m/+2h）。' };
+      const now = Date.now() / 1000;
+      if (at <= now + 30) return { ok: false, output: '保底至少要设在 30 秒之后（再短的等待不值得起保底）。' };
+      if (at > now + 24 * 60 * 60) return { ok: false, output: '保底最长 24 小时；更久的等待拆成多段续期。' };
+      const tag = String(args.tag ?? '').trim();
+      const taskId = context.tasks.scheduleWatchdog(`${context.scopeType}:${context.scopeId}`, at, note, tag);
+      return {
+        ok: true,
+        output: `回执超时保底已挂上（task ${taskId}${tag ? `，tag=${tag}` : ''}）：`
+          + `${Math.round(at - now)} 秒后还没等到回音就会唤醒你自查。`
+          + '先收到结果的话记得 cancel_task 撤掉它。',
+      };
+    }
     case 'list_tasks': {
       const tasks = context.isMaster ? context.tasks.list() : context.tasks.list(`${context.scopeType}:${context.scopeId}`);
       if (tasks.length === 0) return { ok: true, output: '（没有待触发的任务）' };
@@ -1115,7 +1283,10 @@ export async function executeChatTool(
         const when = new Date(task.runAt * 1000);
         const pad = (value: number) => String(value).padStart(2, '0');
         const timeText = `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())} ${pad(when.getHours())}:${pad(when.getMinutes())}`;
-        const kind = task.kind === 'recurring' ? `周期(每${formatInterval(task.intervalSeconds ?? 0)})` : '闹钟';
+        const kind = task.kind === 'recurring'
+          ? `周期(每${formatInterval(task.intervalSeconds ?? 0)})`
+          : task.kind === 'send_image' ? '定时发图'
+            : task.kind === 'watchdog' ? `超时保底${task.tag ? `(${task.tag})` : ''}` : '闹钟';
         const scope = context.isMaster ? ` ${task.originScope}` : '';
         return `- ${task.taskId} [${kind}]${scope} ${timeText}：${task.note.slice(0, 60)}`;
       });
@@ -1132,62 +1303,137 @@ export async function executeChatTool(
       if (!context.tasks.cancel(taskId)) return { ok: false, output: `任务 ${taskId} 已触发或已取消。` };
       return { ok: true, output: `已取消任务 ${taskId}。` };
     }
-    case 'view_image': {
+    case 'view_image':
+    case 'view_image_raw': {
+      const refHint = (): string => {
+        // 测试桩的 repo 可能没有这个方法；没有就不加提示。
+        const list = typeof (context.repo as { recentImageRefs?: unknown }).recentImageRefs === 'function'
+          ? context.repo.recentImageRefs(context.scopeType, context.scopeId, 5)
+          : [];
+        const recent = list.map((entry) => `${entry.ref}（${entry.ageMinutes} 分钟前）`).join('、');
+        return recent !== '' ? `本会话最近带图的消息短ID：${recent}。` : '本会话近期消息里没有图。';
+      };
       let refs = context.triggerImageRefs;
       let sourceNote = '本轮消息';
       const ref = String(args.message_ref ?? '').trim();
       if (ref) {
-        const normalized = ref.replace(/^\[#?|\]$/g, '');
+        const normalized = normalizeMessageRef(ref);
         const entry = context.repo.findEntryByRef(context.scopeType, context.scopeId, normalized);
-        if (!entry) return { ok: false, output: `没有找到短ID ${ref} 对应的消息。` };
+        if (!entry) return { ok: false, output: `没有找到短ID ${ref} 对应的消息（注意别自己编短ID，要用消息里 [#XXXX] 标出的真实短ID）。${refHint()}` };
         refs = Array.isArray(entry.image_refs) ? (entry.image_refs as string[]) : [];
         sourceNote = `消息 ${ref}`;
-        if (refs.length === 0) return { ok: false, output: `消息 ${ref} 里没有图片。` };
+        if (refs.length === 0) return { ok: false, output: `消息 ${ref} 里没有图片。${refHint()}` };
       }
-      if (refs.length === 0) return { ok: false, output: '本轮消息没有图片；如果图在历史消息里，传 message_ref。' };
+      if (refs.length === 0) return { ok: false, output: `本轮消息没有图片；如果图在历史消息里，传 message_ref。${refHint()}` };
       const index = Math.max(1, Math.trunc(Number(args.index ?? 1)) || 1);
       if (index > refs.length) {
         return { ok: false, output: `${sourceNote}只有 ${refs.length} 张图，index ${index} 超出范围。` };
       }
+      const chosen = refs[index - 1];
+      // 原图直出：优先入站缓存的本地副本（QQ 图链 rkey 时效极短，事后回看经常 400），
+      // 缓存没命中才交原 URL 给 orchestrator 内联。
+      if (toolName === 'view_image_raw') {
+        try {
+          const inlineImage = await embedImageAsDataUrl(chosen);
+          return {
+            ok: true,
+            output: `已取得 ${sourceNote}第 ${index}/${refs.length} 张的原图，将随本轮直接呈现给你（仅本次可见；之后会标记为【已过期】，需要再看就重新调用本工具）。`,
+            inlineImageUrls: [inlineImage],
+          };
+        } catch (error) {
+          return { ok: false, output: `原图读取失败：${error instanceof Error ? error.message : String(error)}。没有把图片呈现给你；可重试一次，仍失败再请用户重新发图。` };
+        }
+      }
       const question = String(args.question ?? '').trim() || '请客观描述这张图片的内容：主体、场景、文字信息（如有）、值得注意的细节。';
       try {
         const description = await context.describeImage(refs[index - 1], question);
-        return { ok: true, output: `图片内容（${sourceNote}第 ${index}/${refs.length} 张）：\n${description}` };
+        return {
+          ok: true,
+          output: `图片内容（${sourceNote}第 ${index}/${refs.length} 张）：\n${description}\n图片链接（可传给 image_edit 的 image 参数；QQ 图链时效很短，编辑历史旧图前先让用户重发一张）：${refs[index - 1]}`,
+        };
       } catch (error) {
         console.warn(`[vision] view_image failed scope=${context.scopeType}:${context.scopeId} url=${String(refs[index - 1]).slice(0, 120)}: ${error instanceof Error ? error.message : String(error)}`);
         return { ok: false, output: `图片解析失败: ${error instanceof Error ? error.message : String(error)}（这通常是上游临时抖动，请直接再调用一次本工具重试；连续两次都失败再告诉用户看不了）` };
       }
     }
     case 'send_image': {
-      const file = String(args.file ?? '').trim();
-      if (!file) return { ok: false, output: 'file 为空。' };
+      if ((context.scopeType !== 'group' && context.scopeType !== 'private') || !/^\d+$/.test(context.scopeId)) {
+        return { ok: false, output: '当前虚拟会话没有 QQ 图片窗口，不能调用 send_image；请改用 send_message 汇报文字。' };
+      }
+      let file = String(args.file ?? '').trim();
+      let napcatFile = '';
+      let source = 'file 参数指定的图片';
+      if (!file) {
+        const selected = selectImageForReturn(context, args);
+        if ('error' in selected) return { ok: false, output: selected.error };
+        file = selected.url;
+        napcatFile = selected.napcatFile ?? '';
+        source = selected.source;
+      }
       if (!/^(https?:\/\/|base64:\/\/|\/)/i.test(file)) {
         return { ok: false, output: 'file 必须是 http(s) 链接、base64:// 数据或绝对路径。' };
+      }
+      // 同回合同图防重发。指纹只在真正发送成功后记录，失败重试不能被误报成已发。
+      let sent = context.sentImageKeys;
+      if (sent === undefined) {
+        sent = sentImageUrlsThisTurn.get(context);
+        if (sent === undefined) {
+          sent = new Set<string>();
+          sentImageUrlsThisTurn.set(context, sent);
+        }
+      }
+      const imageKey = file.replace(/^base64:\/\//i, '').slice(0, 200);
+      if (sent.has(imageKey)) {
+        return {
+          ok: false,
+          output: `这一回合你已经把这张图发出去了（用户收得到，不用重发）。想换一张就先重新 image_edit 生成新图再 send_image 新 URL；没别要说的话就直接结束回合。`,
+        };
       }
       // 本地绝对路径只放行本会话工作区内的文件——否则一条注入就能让 NapCat 把
       // secrets.json 之类的任意文件读出去发掉。
       if (file.startsWith('/')) {
         const abs = resolveAbs(file);
         if (abs !== context.workspace.root && !abs.startsWith(context.workspace.root + pathSep)) {
-          return { ok: false, output: '本地路径只支持本会话工作区内的文件（先把图 download_file 下来再发）。' };
+          return { ok: false, output: '本地路径只支持本会话工作区内的文件（先把图 file_save 下来再发）。' };
         }
       }
       try {
-        const result = await context.bot.sendImage(context.scopeType as 'group' | 'private', Number(context.scopeId), file);
+        // NapCat 对 QQ 入站图链的二次下载经常 1200/Bad Request；进站缓存里已有
+        // 原始字节，直接 base64 发回。缓存尚未完成时共享同一次下载，失败才回落原链。
+        let deliveryFile = file;
+        if (/^https?:\/\//i.test(file)) {
+          const cached = await cachedImageUri(file)
+            ?? (await ensureImageCached(file) ? await cachedImageUri(file) : null);
+          if (cached?.startsWith('data:')) {
+            deliveryFile = `base64://${cached.slice(cached.indexOf(',') + 1)}`;
+          } else if (napcatFile) {
+            // 图链已过期且本地副本缺失时，NapCat 宿主通常仍持有入站原图。
+            // get_image 返回的是 NapCat 那台机器的路径，必须原样交回同一宿主发送。
+            try {
+              const info = await context.bot.getImage(napcatFile);
+              const resolved = String(info.file ?? info.path ?? info.url ?? '').trim();
+              if (resolved) deliveryFile = resolved.startsWith('/') ? `file://${resolved}` : resolved;
+            } catch (error) {
+              console.warn(`[napcat] get_image fallback failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
+        }
+        const result = await context.bot.sendImage(context.scopeType as 'group' | 'private', Number(context.scopeId), deliveryFile);
+        sent.add(imageKey);
         const sentId = (result as { message_id?: number | string }).message_id;
         const ref = context.repo.registerMessageRef(context.scopeType, context.scopeId, sentId ?? null);
         context.repo.appendMessage(context.scopeType, context.scopeId, {
           user_id: context.bot.selfId,
           nickname: context.bot.selfNickname || 'AI',
-          text: '[图片]',
-          raw_message: `[CQ:image,file=${file.slice(0, 120)}]`,
+          text: `[图片]（来源：${source}）`,
+          raw_message: '[图片]',
           message_id: sentId ?? null,
           message_ref: ref,
           timestamp: Date.now() / 1000,
           source_label: '',
           image_refs: /^https?:\/\//i.test(file) ? [file] : [],
         });
-        return { ok: true, output: `图片已发送（短ID ${ref}）。`, sentToUser: true };
+        return { ok: true, output: `图片已发送（新短ID ${ref}；来源：${source}）。不要重复发送；后续可按这个新短ID查看或再次引用。`, sentToUser: true };
       } catch (error) {
         return { ok: false, output: `图片发送失败: ${error instanceof Error ? error.message : String(error)}` };
       }
@@ -1262,13 +1508,10 @@ export async function executeChatTool(
       try {
         spendNetworkBudget(context);
         const abs = context.workspace.resolvePath(`videos/video-${Date.now()}.mp4`);
-        // B 站视频 CDN 校验 Referer（实测缺失 403），识别 CDN 域名自动补浏览器头
-        const headers = /bilivideo|akamaized\.net|hdslb\.com/i.test(url)
-          ? {
-            referer: 'https://www.bilibili.com/',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-          }
-          : undefined;
+        // B 站视频 CDN 校验 Referer（实测缺失 403），识别 CDN 域名自动补浏览器头；
+        // 必须带 Range（bytes=0- = 全量）——裸 GET + 浏览器 UA 会被风控打 567
+        // （2026-11-04 实测：同链接加 Range 即 206 正常下载）。
+        const headers = cdnDownloadHeaders(url);
         const { bytes, contentType } = await downloadToFile(url, abs, 150 * 1024 * 1024, { headers, timeoutMs: 300_000 });
         const head = readFileSync(abs).subarray(0, 16).toString('latin1');
         if (bytes < 100_000 || head.startsWith('<') || head.startsWith('{')) {
@@ -1296,6 +1539,80 @@ export async function executeChatTool(
         return { ok: false, output: `视频发送失败: ${error instanceof Error ? error.message : String(error)}。太大可换 360P 直链（B 站 bili_url 的 qn=16）再试一次。` };
       }
     }
+    case 'file_save': {
+      const filename = String(args.filename ?? '').trim();
+      if (filename === '') return { ok: false, output: 'filename 不能为空（要保存成的文件名，可带子目录，如 images/晚霞.png）。' };
+      let url = String(args.url ?? '').trim();
+      const ref = String(args.message_ref ?? '').trim();
+      if (ref !== '') {
+        const entry = context.repo.findEntryByRef(context.scopeType, context.scopeId, normalizeMessageRef(ref));
+        if (!entry) return { ok: false, output: `没有找到短ID ${ref} 对应的消息（别自己编短ID，用消息里 [#XXXX] 标出的）。` };
+        const refs = Array.isArray(entry.image_refs) ? (entry.image_refs as string[]) : [];
+        const index = Math.max(1, Math.trunc(Number(args.index ?? 1)) || 1);
+        if (refs.length === 0 || index > refs.length) {
+          return { ok: false, output: `消息 ${ref} 里没有第 ${index} 张图（共 ${refs.length} 张）。` };
+        }
+        url = String(refs[index - 1]);
+      }
+      if (!/^https?:\/\//i.test(url)) {
+        return { ok: false, output: 'file_save 需要来源二选一：url（http(s) 链接）或 message_ref+index（存消息里的图）。' };
+      }
+      let target: string;
+      try {
+        target = context.workspace.resolvePath(filename);
+      } catch (error) {
+        return { ok: false, output: `文件名无效：${error instanceof Error ? error.message : String(error)}` };
+      }
+      try {
+        spendNetworkBudget(context);
+        let contentType = '';
+        // 入站图片优先吃 24h 本地缓存——QQ 图链 rkey 过期后原链 400，缓存还能救
+        const cached = cachedImageFileInfo(url);
+        if (cached !== null) {
+          contentType = cached.contentType;
+          await mkdir(dirname(target), { recursive: true });
+          await copyFile(cached.path, target);
+        } else {
+          const headers = cdnDownloadHeaders(url);
+          const result = await downloadToFile(url, target, 150 * 1024 * 1024, { headers, timeoutMs: 300_000 });
+          contentType = result.contentType;
+        }
+        let finalTarget = target;
+        if (!/\.[A-Za-z0-9]{1,5}$/.test(target) && contentType !== '') {
+          const ext = CONTENT_TYPE_EXT[contentType] ?? '';
+          if (ext !== '') {
+            finalTarget = `${target}${ext}`;
+            await rename(target, finalTarget);
+          }
+        }
+        const size = (await stat(finalTarget)).size;
+        if (size < 100) {
+          await rm(finalTarget, { force: true });
+          return { ok: false, output: `下载到的内容太小（${size}B），不像有效文件，没保存。链接可能已过期，换一条再试。` };
+        }
+        return {
+          ok: true,
+          output: `已长期保存到工作区：${context.workspace.displayPath(finalTarget)}（${(size / 1024).toFixed(0)}KB）。`
+            + `发这张图/文件时把绝对路径 ${finalTarget} 传给 send_image 的 file。`,
+        };
+      } catch (error) {
+        return { ok: false, output: `保存失败: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    }
+    case 'file_delete': {
+      const filename = String(args.filename ?? '').trim();
+      let target: string;
+      try {
+        target = context.workspace.resolvePath(filename);
+      } catch (error) {
+        return { ok: false, output: `文件名无效：${error instanceof Error ? error.message : String(error)}` };
+      }
+      const info = await stat(target).catch(() => null);
+      if (info === null) return { ok: false, output: `工作区里没有 ${filename}（用 file_list 看现有文件）。` };
+      if (info.isDirectory()) return { ok: false, output: `${filename} 是目录，只能删文件。` };
+      await rm(target, { force: true });
+      return { ok: true, output: `已删除 ${filename}（${(info.size / 1024).toFixed(0)}KB），找不回了。` };
+    }
     case 'watch_video': {
       let abs = '';
       const fileArg = String(args.file ?? '').trim();
@@ -1311,9 +1628,7 @@ export async function executeChatTool(
         try {
           spendNetworkBudget(context);
           abs = context.workspace.resolvePath(`videos/watch-${Date.now()}.mp4`);
-          const headers = /bilivideo|akamaized\.net|hdslb\.com/i.test(urlArg)
-            ? { referer: 'https://www.bilibili.com/', 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36' }
-            : undefined;
+          const headers = cdnDownloadHeaders(urlArg);
           await downloadToFile(urlArg, abs, 150 * 1024 * 1024, { headers, timeoutMs: 300_000 });
           lastVideoByScope.set(`${context.scopeType}:${context.scopeId}`, abs);
         } catch (error) {
@@ -1321,7 +1636,21 @@ export async function executeChatTool(
         }
       } else {
         abs = lastVideoByScope.get(`${context.scopeType}:${context.scopeId}`) ?? '';
-        if (abs === '') return { ok: false, output: '本会话还没有下载过视频。先 send_video 或 bili_url+send_video 下载，再 watch_video；或直接给 url。' };
+        if (abs === '') {
+          // 没下载过就找本轮/触发消息里别人刚发的视频，抓第一条下来看。
+          const recent = context.triggerVideoRefs[context.triggerVideoRefs.length - 1];
+          if (recent === undefined) {
+            return { ok: false, output: '本会话没有可看的视频（本轮和最近下载都没有）。B 站视频先按提示词协调哔哩中枢取直链，或先 send_video 下载，再 watch_video。' };
+          }
+          try {
+            spendNetworkBudget(context);
+            abs = context.workspace.resolvePath(`videos/watch-${Date.now()}.mp4`);
+            await downloadToFile(recent, abs, 150 * 1024 * 1024, { timeoutMs: 300_000 });
+            lastVideoByScope.set(`${context.scopeType}:${context.scopeId}`, abs);
+          } catch (error) {
+            return { ok: false, output: `消息里的视频下载失败: ${error instanceof Error ? error.message : String(error)}（QQ 直链可能已过期，让对方重发一次）` };
+          }
+        }
       }
       // 时刻解析：逗号/空白分隔的秒数，去重排序，钳到 [0, 时长)，最多 10 帧
       const duration = await videoDuration(abs);
@@ -1391,107 +1720,6 @@ export async function executeChatTool(
       if (!context.isMaster) return { ok: false, output: 'sticker_refresh 仅主AI可用。' };
       const result = await refreshStickerIndex(context.bot, context.describeImage);
       return { ok: result.ok, output: result.message };
-    }
-    case 'mc2d_status': {
-      if (!context.isMaster) return { ok: false, output: 'mc2d 工具仅主AI可用。' };
-      const client = mc2dClient();
-      if (client === null) return { ok: false, output: 'MC2D 未启用（config.json 的 mc2d.enabled=false）。' };
-      try {
-        return { ok: true, output: await client.status() };
-      } catch (error) {
-        return { ok: false, output: `进服/查看失败: ${error instanceof Error ? error.message : String(error)}。检查 127.0.0.1:6601（mc2d-tunnel）是否在线。` };
-      }
-    }
-    case 'mc2d_move': {
-      if (!context.isMaster) return { ok: false, output: 'mc2d 工具仅主AI可用。' };
-      const client = mc2dClient();
-      if (client === null) return { ok: false, output: 'MC2D 未启用（config.json 的 mc2d.enabled=false）。' };
-      const x = Number(args.x);
-      if (!Number.isFinite(x)) return { ok: false, output: 'x 必须是数字（目标方块列 0-399）。' };
-      try {
-        const result = await client.moveTo(x);
-        return {
-          ok: true,
-          output: result.reached
-            ? `走到目标附近了，现在在(${result.x},${result.y})。`
-            : `还没走到，现在在(${result.x},${result.y})——可能被地形卡住或目标太远。可以再调一次 mc2d_move，或先 mc2d_dig 挖开挡路的方块。`,
-        };
-      } catch (error) {
-        return { ok: false, output: `走路失败: ${error instanceof Error ? error.message : String(error)}` };
-      }
-    }
-    case 'mc2d_dig': {
-      if (!context.isMaster) return { ok: false, output: 'mc2d 工具仅主AI可用。' };
-      const client = mc2dClient();
-      if (client === null) return { ok: false, output: 'MC2D 未启用（config.json 的 mc2d.enabled=false）。' };
-      const x = Number(args.x);
-      const y = Number(args.y);
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false, output: 'x/y 必须是数字（方块坐标）。' };
-      try {
-        return { ok: true, output: await client.dig(x, y) };
-      } catch (error) {
-        return { ok: false, output: `挖掘失败: ${error instanceof Error ? error.message : String(error)}` };
-      }
-    }
-    case 'mc2d_place': {
-      if (!context.isMaster) return { ok: false, output: 'mc2d 工具仅主AI可用。' };
-      const client = mc2dClient();
-      if (client === null) return { ok: false, output: 'MC2D 未启用（config.json 的 mc2d.enabled=false）。' };
-      const x = Number(args.x);
-      const y = Number(args.y);
-      const block = Number(args.block);
-      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(block)) {
-        return { ok: false, output: 'x/y/block 必须都是数字。' };
-      }
-      try {
-        return { ok: true, output: await client.place(x, y, block) };
-      } catch (error) {
-        return { ok: false, output: `放置失败: ${error instanceof Error ? error.message : String(error)}` };
-      }
-    }
-    case 'mc2d_attack': {
-      if (!context.isMaster) return { ok: false, output: 'mc2d 工具仅主AI可用。' };
-      const client = mc2dClient();
-      if (client === null) return { ok: false, output: 'MC2D 未启用（config.json 的 mc2d.enabled=false）。' };
-      const mobId = args.mob_id === undefined || args.mob_id === '' ? undefined : Number(args.mob_id);
-      const damage = args.damage === undefined || args.damage === '' ? 4 : Number(args.damage);
-      if (mobId !== undefined && !Number.isFinite(mobId)) return { ok: false, output: 'mob_id 必须是数字。' };
-      try {
-        return { ok: true, output: await client.attack(mobId, Number.isFinite(damage) ? damage : 4) };
-      } catch (error) {
-        return { ok: false, output: `攻击失败: ${error instanceof Error ? error.message : String(error)}` };
-      }
-    }
-    case 'mc2d_say': {
-      if (!context.isMaster) return { ok: false, output: 'mc2d 工具仅主AI可用。' };
-      const client = mc2dClient();
-      if (client === null) return { ok: false, output: 'MC2D 未启用（config.json 的 mc2d.enabled=false）。' };
-      try {
-        return { ok: true, output: await client.say(String(args.message ?? '')) };
-      } catch (error) {
-        return { ok: false, output: `游戏内发言失败: ${error instanceof Error ? error.message : String(error)}` };
-      }
-    }
-    case 'mc2d_view': {
-      if (!context.isMaster) return { ok: false, output: 'mc2d 工具仅主AI可用。' };
-      const client = mc2dClient();
-      if (client === null) return { ok: false, output: 'MC2D 未启用（config.json 的 mc2d.enabled=false）。' };
-      const question = String(args.question ?? '').trim()
-        || '这是 2D 我的世界（横版侧视图）当前画面。黄色带白点的小人是你自己，蓝色是其他玩家，粉色是猪，灰/绿色是骷髅/僵尸，亮绿色是苦力怕。请客观描述：你站在什么地形上、周围方块（草/泥土/石头/原木/矿）、最近的生物或玩家在你的哪一侧、有没有危险。';
-      try {
-        const png = await client.viewPng();
-        const description = await context.describeImage(`data:image/png;base64,${png.toString('base64')}`, question);
-        return { ok: true, output: `游戏画面（${client.positionText()}）：\n${description}` };
-      } catch (error) {
-        return { ok: false, output: `看游戏画面失败: ${error instanceof Error ? error.message : String(error)}` };
-      }
-    }
-    case 'mc2d_leave': {
-      if (!context.isMaster) return { ok: false, output: 'mc2d 工具仅主AI可用。' };
-      const client = mc2dClient();
-      if (client === null) return { ok: false, output: 'MC2D 未启用（config.json 的 mc2d.enabled=false）。' };
-      client.leave();
-      return { ok: true, output: '已离开 MC2D 服务器（下次调用 mc2d_* 会重新进服）。' };
     }
     case 'mc_view': {
       const scopeKey = `${context.scopeType}:${context.scopeId}`;
@@ -1640,6 +1868,67 @@ export async function executeChatTool(
       if (!context.isMaster) return { ok: false, output: 'relation_write 仅限主AI使用，请通过 notify_master 上报由主AI归档。' };
       return executeRelationWrite(args, context);
     }
+    case 'intel_channel': {
+      const action = String(args.action ?? '').trim();
+      const callerScope = `${context.scopeType}:${context.scopeId}`;
+      if (action === 'status') {
+        const list = identityChannelList();
+        const mine = new Set(await subscriptionsFor(callerScope));
+        const lines = list.map((c) => {
+          const head = `${mine.has(c.name) ? '●' : '○'} ${c.name} — ${c.description}`;
+          let state = '';
+          try {
+            state = c.status().trim();
+          } catch {
+            state = '';
+          }
+          return state === '' ? head : `${head}\n  当前：${state.replace(/\n/g, '\n  ')}`;
+        });
+        return { ok: true, output: `频道状态（●=已订阅，会持续注入你的上下文）：\n${lines.join('\n') || '（暂无频道）'}` };
+      }
+      if (action === 'subscribe' || action === 'unsubscribe') {
+        const channel = String(args.channel ?? '').trim();
+        if (channel === '') return { ok: false, output: '需要 channel（先 status 看频道列表）。' };
+        return { ok: true, output: await setSubscription(callerScope, channel, action === 'subscribe') };
+      }
+      if (action === 'events') {
+        const channel = String(args.channel ?? '').trim();
+        const events = identityEvents(channel || undefined, Number(args.limit) || 20);
+        if (events.length === 0) return { ok: true, output: '没有最近的推送记录（可能刚重启，或该频道没有动静）。' };
+        return {
+          ok: true,
+          output: events.map((e) => `[${new Date(e.at).toLocaleString('zh-CN', { hour12: false })}] ${e.channel}: ${e.text}`).join('\n'),
+        };
+      }
+      return { ok: false, output: 'action 只能是 status / subscribe / unsubscribe / events。' };
+    }
+    case 'identity_write': {
+      if (!context.isMaster) return { ok: false, output: 'identity_write 仅限主AI使用。' };
+      const action = String(args.action ?? '').trim();
+      if (action === 'list') {
+        const lines = await listIdentityLines();
+        if (lines.length === 0) return { ok: true, output: '全局共同体记忆还没有静态行。MC 分身等实时状态系统会自动注入，不用手写。' };
+        return { ok: true, output: lines.map((l) => `[${l.id}] ${l.text}`).join('\n') };
+      }
+      if (action === 'add') {
+        const text = String(args.text ?? '').trim();
+        if (text === '') return { ok: false, output: 'add 需要 text。' };
+        try {
+          const line = await addIdentityLine(text, MASTER_SCOPE_KEY);
+          return { ok: true, output: `已写入全局共同体记忆（${line.id}），所有会话的上下文都会带上这条。` };
+        } catch (error) {
+          return { ok: false, output: error instanceof Error ? error.message : String(error) };
+        }
+      }
+      if (action === 'remove') {
+        const id = String(args.id ?? '').trim();
+        if (id === '') return { ok: false, output: 'remove 需要 id（先 list 查）。' };
+        return await removeIdentityLine(id)
+          ? { ok: true, output: `已删除 ${id}。` }
+          : { ok: false, output: `没找到 ${id}，先 list 确认。` };
+      }
+      return { ok: false, output: 'action 只能是 list / add / remove。' };
+    }
     case 'scope_manage': {
       if (!context.isMaster) return { ok: false, output: 'scope_manage 仅限主AI使用。' };
       return executeScopeManage(args, context);
@@ -1673,15 +1962,27 @@ export async function executeChatTool(
       if (!target || !content) return { ok: false, output: 'target / content 都不能为空。' };
       const requestType = String(args.request_type ?? '').trim();
       if (target === 'master') {
+        // 主AI 给自己发 master 消息 = 自环，notifyMaster 会把回合喂回自己。
+        if (context.isMaster) return { ok: false, output: '你就是最高级中枢（主AI），target="master" 没有更上级可发。' };
         context.notifyMaster({
           text: content,
           requestType: requestType || 'peer_chat',
           fromScope: callerScope,
+          needReply: requestType === 'system_operation',
         });
         return { ok: true, output: '已直发最高级中枢（主AI）。' };
       }
+      // 全限定下级会话（group:<群号> / private:<QQ号> / bili:… / mcclient:…）：
+      // 主级直接回话给下级子AI——请示回执的主通道，注入后由该会话子AI自然转达用户。
+      const scoped = /^(group|private|bili|mcclient):(.+)$/.exec(target);
+      if (scoped !== null) {
+        if (target === callerScope) return { ok: false, output: '目标就是自己，直接处理即可。' };
+        const text = `[主级回话 from ${callerScope}${requestType ? ` type=${requestType}` : ''}]\n${content}\n（这是对此前请示的正式回话；其中给当前用户或当前会话的结论，要用 send_message 主动转达，不要等用户追问。同一结论常经多条链路先后回来——先对照你最近几条发言，实质相同的已讲过就 stay_silent，勿换措辞重复。）`;
+        context.peerInject(target, text, { peer_chat: callerScope });
+        return { ok: true, output: `已回话给 ${target}，该会话的子AI会在自己的回合里收到并转达。` };
+      }
       if (domainDefForScope(`domain:${target}`) === null) {
-        return { ok: false, output: `没有注册 domain:${target} 这个领域中枢。现有领域: ${domainList()}；找最高级中枢传 target="master"。` };
+        return { ok: false, output: `没有注册 domain:${target} 这个领域中枢。现有领域: ${domainList()}；找最高级中枢传 target="master"；回下级会话传全限定名（如 private:<QQ号>）。` };
       }
       if (context.scopeType === 'domain' && context.scopeId === target) {
         return { ok: false, output: '目标就是自己，直接处理即可。' };
@@ -1888,6 +2189,8 @@ export async function executeChatTool(
           return { ok: false, output: `plugin_manage 失败: ${error instanceof Error ? error.message : String(error)}` };
         }
       }
+      const qqResult = await executeQqTool(call, context);
+      if (qqResult) return qqResult;
       const actionResult = await executeActionTool(call, context);
       if (actionResult) return actionResult;
       const pluginResult = await pluginRegistry()?.execute(call.name, args, context);
@@ -1897,9 +2200,25 @@ export async function executeChatTool(
   }
 }
 
-function botIsSelfId(bot: NapcatBot, id: unknown): boolean {
-  // Stubs in older tests may not implement isSelfId; fall back to selfId.
-  return typeof bot.isSelfId === 'function' ? bot.isSelfId(id) : String(id) === String(bot.selfId);
+/** file_save 按 content-type 补扩展名用。 */
+const CONTENT_TYPE_EXT: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'video/mp4': '.mp4',
+  'video/x-flv': '.flv',
+  'audio/mpeg': '.mp3',
+  'audio/wav': '.wav',
+  'application/pdf': '.pdf',
+  'application/zip': '.zip',
+};
+
+function botIsSelfId(bot: NapcatBot, id: unknown): boolean {  // 「不跟自己聊天」这类闸门只认现役登录号：legacy 旧号可能已被号主拿回去
+  // 当普通联系人用，含 legacy 的 isSelfId 会把发给旧号的消息全部拦掉
+  // （2026-11-03 换号回滚实测踩中两次）。渲染历史另算，不走这里。
+  if (typeof bot.isCurrentSelfId === 'function') return bot.isCurrentSelfId(id);
+  return String(id) === String(bot.selfId);
 }
 
 function executeScopeManage(args: Record<string, unknown>, context: ToolContext): ToolResult {
@@ -1921,8 +2240,6 @@ function executeScopeManage(args: Record<string, unknown>, context: ToolContext)
   if (!targetType || !targetId) return { ok: false, output: 'target_scope_type / target_scope_id 都不能为空。' };
   if (targetType !== 'group' && targetType !== 'private') return { ok: false, output: `target_scope_type 只能是 group 或 private，收到: ${targetType}` };
 
-  // 主AI会话是对外生命线，关闭后主人就联系不上主AI了。
-  const isMasterScope = targetType === 'private' && targetId === String(context.masterQq);
 
   switch (action) {
     case 'get': {
@@ -1931,7 +2248,6 @@ function executeScopeManage(args: Record<string, unknown>, context: ToolContext)
     }
     case 'set_enabled': {
       if (typeof args.enabled !== 'boolean') return { ok: false, output: 'set_enabled 需要 enabled=true/false。' };
-      if (isMasterScope && !args.enabled) return { ok: false, output: '主AI会话不能关闭——关了你就联系不上我了。' };
       repo.updateAgent(targetType, targetId, { enabled: args.enabled });
       const agent = repo.getOrCreateAgent(targetType, targetId);
       return { ok: true, output: `已${args.enabled ? '开启' : '关闭'}：${describe(agent)}` };
@@ -2031,7 +2347,7 @@ function parseInterval(value: string, minSeconds = 60): number | null {
   const amount = Number(relative[1]);
   const unit = relative[2] === 's' ? 1 : relative[2] === 'm' ? 60 : relative[2] === 'h' ? 3600 : 86400;
   const seconds = amount * unit;
-  return seconds >= minSeconds ? seconds : null;
+  return Number.isFinite(seconds) && seconds >= minSeconds ? seconds : null;
 }
 
 function formatInterval(seconds: number): string {

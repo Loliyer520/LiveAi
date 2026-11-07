@@ -169,6 +169,7 @@ function triggerToolContext(): { context: ToolContext; agent: AgentRecord } {
     sendToScope: async () => 'ok',
     peerInject: () => undefined,
     triggerImageRefs: [],
+          triggerVideoRefs: [],
     describeImage: async () => '',
     scopeType: 'group',
     scopeId: '777',
@@ -296,6 +297,7 @@ function scopeManageContext(): { context: ToolContext; agents: Map<string, Agent
     sendToScope: async () => 'ok',
     peerInject: () => undefined,
     triggerImageRefs: [],
+          triggerVideoRefs: [],
     describeImage: async () => '',
     scopeType: 'private',
     scopeId: '123456789',
@@ -355,14 +357,21 @@ test('scope_manage set_enabled gates triggering but not history', async () => {
   assert.equal(agents.get('group:777')!.enabled, true);
 });
 
-test('scope_manage never disables the master scope', async () => {
+test('scope_manage cannot reach the master scope; owner private chat is an ordinary child', async () => {
   const { context, agents } = scopeManageContext();
-  const result = await executeChatTool(
+  // 主AI 是上级 agent（master:core），不在 QQ 会话管控范围内
+  const master = await executeChatTool(
+    { name: 'scope_manage', arguments: { action: 'set_enabled', target_scope_type: 'master', target_scope_id: 'core', enabled: false } },
+    context,
+  );
+  assert.equal(master.ok, false);
+  // 号主私聊不再是主AI会话：与其它私聊一样可开关
+  const owner = await executeChatTool(
     { name: 'scope_manage', arguments: { action: 'set_enabled', target_scope_type: 'private', target_scope_id: '123456789', enabled: false } },
     context,
   );
-  assert.equal(result.ok, false);
-  assert.equal(agents.get('private:123456789')!.enabled, true, 'master scope stays enabled');
+  assert.equal(owner.ok, true);
+  assert.equal(agents.get('private:123456789')!.enabled, false);
 });
 
 test('scope_manage set_trigger_rate validates 0~1', async () => {

@@ -6,8 +6,9 @@
  * tiered → main, so `/role set tiered <channel>` covers all three tiers.
  */
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import {
   PROTOCOL_PATHS,
   type Channel,
@@ -72,14 +73,29 @@ export class ModelManager {
         channels: raw.channels ?? [],
         roles: raw.roles ?? {},
       };
-    } catch {
+    } catch (error) {
+      // ENOENT = first run. Anything else (bad JSON, permissions) must leave a
+      // .bak behind: the next save() would otherwise overwrite the only copy
+      // of the upstream/channel/role configuration.
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        const backup = `${this.configPath}.bak-${Date.now()}`;
+        try {
+          await rename(this.configPath, backup);
+          console.error(`[models] 配置损坏，已备份到 ${backup}:`, error);
+        } catch (backupError) {
+          console.error('[models] 配置损坏且备份失败:', error, backupError);
+        }
+      }
       this.config = emptyConfig();
     }
   }
 
   async save(): Promise<void> {
     await mkdir(dirname(this.configPath), { recursive: true });
-    await writeFile(this.configPath, JSON.stringify(this.config, null, 2), 'utf-8');
+    // tmp+rename 原子落盘：写一半断电/被kill 不能把上游密钥配置截成半个 JSON。
+    const tmp = `${this.configPath}.${randomUUID().slice(0, 8)}.tmp`;
+    await writeFile(tmp, JSON.stringify(this.config, null, 2), 'utf-8');
+    await rename(tmp, this.configPath);
   }
 
   /** Pick the current model for a role, advancing round-robin counters. */
@@ -139,22 +155,36 @@ export class ModelManager {
     const models = channel.models ?? [];
     if (models.length === 0) return null;
     const strategy = normalizeStrategy(channel.strategy);
-    let entry: { upstream: string; model_id: string };
-    if (strategy === 'random') {
-      entry = models[Math.floor(Math.random() * models.length)];
-    } else if (strategy === 'roundrobin') {
-      const index = (this.roundRobinCounters.get(channel.name) ?? 0) % models.length;
-      if (advance) this.roundRobinCounters.set(channel.name, index + 1);
-      entry = models[index];
-    } else if (strategy === 'fallback_reset') {
-      entry = models[(this.requestFallbackIndexes.get(channel.name) ?? 0) % models.length];
-    } else {
-      entry = models[(this.fallbackIndexes.get(channel.name) ?? 0) % models.length];
-    }
+    const start = strategy === 'random'
+      ? Math.floor(Math.random() * models.length)
+      : strategy === 'roundrobin'
+        ? (this.roundRobinCounters.get(channel.name) ?? 0) % models.length
+        : strategy === 'fallback_reset'
+          ? (this.requestFallbackIndexes.get(channel.name) ?? 0) % models.length
+          : (this.fallbackIndexes.get(channel.name) ?? 0) % models.length;
 
-    const upstream = this.findUpstream(String(entry.upstream ?? '').trim());
-    const modelId = String(entry.model_id ?? '').trim();
-    if (!upstream || !modelId) return null;
+    // Scan the channel from the strategy's start point: one broken model
+    // entry (missing/renamed upstream) must not take the whole role offline
+    // when the next entry is perfectly usable.
+    let entry: { upstream: string; model_id: string } | null = null;
+    let upstream: Upstream | undefined;
+    let modelId = '';
+    let resolvedIndex = start;
+    for (let offset = 0; offset < models.length; offset += 1) {
+      resolvedIndex = (start + offset) % models.length;
+      const candidate = models[resolvedIndex];
+      const candidateUpstream = this.findUpstream(String(candidate.upstream ?? '').trim());
+      const candidateId = String(candidate.model_id ?? '').trim();
+      if (!candidateUpstream || !candidateId) continue;
+      entry = candidate;
+      upstream = candidateUpstream;
+      modelId = candidateId;
+      break;
+    }
+    if (entry === null || upstream === undefined) return null;
+    if (strategy === 'roundrobin' && advance) {
+      this.roundRobinCounters.set(channel.name, resolvedIndex + 1);
+    }
     const protocol = normalizeProtocol(upstream.protocol);
     return {
       baseUrl: String(upstream.base_url ?? '').trim().replace(/\/+$/, ''),

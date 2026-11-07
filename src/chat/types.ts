@@ -4,9 +4,11 @@
  */
 
 export interface ChatMessage {
-  /** 'domain' = 领域主级 AI 的虚拟 scope（无 QQ 窗口，只走内部注入）；
+  /** 'master' = 主AI（最高级中枢）的虚拟 scope（固定 master:core）：上级 agent，
+   * 不是任何 QQ 号，没有 QQ 窗口——只经面板/数据线/下级上报注入；
+   * 'domain' = 领域主级 AI 的虚拟 scope（无 QQ 窗口，只走内部注入）；
    * 'bili'/'mcclient' = 领域下级 AI 的虚拟 scope（每视频/每 MC client 一个，同样无 QQ 窗口）。 */
-  chatType: 'group' | 'private' | 'domain' | 'bili' | 'mcclient';
+  chatType: 'group' | 'private' | 'master' | 'domain' | 'bili' | 'mcclient';
   /** domain/bili/mcclient scope 用字符串 id（如 'mc'、'BV1xx'），QQ scope 是数字号。 */
   chatId: number | string;
   userId: number;
@@ -106,6 +108,18 @@ export function isInternalReportEntry(entry: { source_kind?: string; raw_source?
   if (rawSource === 'dev_agent_task_report' || rawSource === 'agent_message') return true;
   const userId = Number(entry.user_id);
   return Number.isFinite(userId) && userId === 0;
+}
+
+/**
+ * 主AI 的 scope：上级 agent 只此一个，与号主 QQ（ai.master_qq，只是「号主身份」）
+ * 完全脱钩——号主私聊 private:<号主QQ> 是普通下级会话。
+ */
+export const MASTER_SCOPE_TYPE = 'master';
+export const MASTER_SCOPE_ID = 'core';
+export const MASTER_SCOPE_KEY = `${MASTER_SCOPE_TYPE}:${MASTER_SCOPE_ID}`;
+
+export function isMasterScope(scopeType: string, scopeId: string | number): boolean {
+  return scopeType === MASTER_SCOPE_TYPE && String(scopeId) === MASTER_SCOPE_ID;
 }
 
 export function scopeKeyOf(chatType: string, chatId: string | number): string {

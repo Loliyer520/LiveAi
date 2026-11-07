@@ -121,9 +121,17 @@ test('usage_stats tool is master-only and returns the formatted report', async (
   try {
     const result = await executeChatTool(
       { name: 'usage_stats', arguments: {} },
-      { bot: {} as never, executedTools: [] as string[] } as never,
+      { bot: {} as never, executedTools: [] as string[], isMaster: true } as never,
     );
     assert.ok((result as { output: string }).output.includes('合计：1 次 · 输入 500 · 输出 20'));
+
+    // 即使模型/插件直接点名调用，非主AI在执行入口也会被拒。
+    const denied = await executeChatTool(
+      { name: 'usage_stats', arguments: {} },
+      { bot: {} as never, executedTools: [] as string[], isMaster: false } as never,
+    );
+    assert.equal(denied.ok, false);
+    assert.ok(denied.output.includes('仅限主AI'));
   } finally {
     usageStats.reset();
   }

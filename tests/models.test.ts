@@ -82,6 +82,38 @@ test('upstream without the flag omits the thinking param entirely', async () => 
   }
 });
 
+test('request serialization replaces lone surrogates without damaging valid pairs', async () => {
+  const { manager, cleanup } = await makeManager(false);
+  let rawBody = '';
+  const capture: { body?: Record<string, unknown> } = {};
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    rawBody = String(init?.body ?? '');
+    capture.body = JSON.parse(rawBody) as Record<string, unknown>;
+    return new Response(JSON.stringify({
+      content: [{ type: 'text', text: '好的' }],
+      usage: { input_tokens: 10, output_tokens: 2 },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    const model = manager.getModelForRole('main');
+    assert.ok(model);
+    await completeChat(model, {
+      ...BASE_REQUEST,
+      system: [{ text: '有效字符 𝕄，孤立低位 \uDC00' }],
+      messages: [{ role: 'user', content: '孤立高位 \uD835 后续' }],
+    });
+    const messages = capture.body?.messages as { content: string }[];
+    const system = capture.body?.system as { text: string }[];
+    assert.equal(messages[0].content, '孤立高位 � 后续');
+    assert.equal(system[0].text, '有效字符 𝕄，孤立低位 �');
+    assert.doesNotMatch(rawBody, /\\u[dD]835|\\u[dD][cC]00/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanup();
+  }
+});
+
 test('drop_temperature upstream omits the temperature field entirely', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'liveai-models-'));
   try {

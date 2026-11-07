@@ -15,7 +15,7 @@
  */
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
+import { readFileSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -68,6 +68,9 @@ interface GraphState {
 }
 
 const MAX_FACTS_PER_PERSON = 60;
+/** Superseded/retracted facts are an audit trail, not an archive: keep the
+ *  newest slice per person (production had 2,201 dead facts in one graph). */
+const MAX_RETIRED_FACTS_PER_PERSON = 80;
 const MAX_MEMBERS_SAMPLED = 40;
 const MAX_TOPIC_TAGS = 12;
 const MAX_FACT_TEXT = 200;
@@ -191,14 +194,27 @@ export class RelationGraph {
         }
       }
     }
+    this.pruneRetiredFacts(person);
     this.persist();
     return fact;
+  }
+
+  /** Drop the oldest non-active facts once the audit trail grows past the cap. */
+  private pruneRetiredFacts(person: PersonRecord): void {
+    const retired = person.facts.filter((entry) => entry.status !== 'active');
+    if (retired.length <= MAX_RETIRED_FACTS_PER_PERSON) return;
+    const dead = new Set(
+      retired.slice(0, retired.length - MAX_RETIRED_FACTS_PER_PERSON).map((entry) => entry.id),
+    );
+    person.facts = person.facts.filter((entry) => !dead.has(entry.id));
   }
 
   retractFact(factId: string): boolean {
     const fact = this.findFact(factId);
     if (!fact) return false;
     fact.status = 'retracted';
+    const person = this.load().people[String(fact.subject)];
+    if (person) this.pruneRetiredFacts(person);
     this.persist();
     return true;
   }
@@ -217,6 +233,8 @@ export class RelationGraph {
     if (next !== null && next.id !== old.id) {
       old.status = 'superseded';
       old.supersededBy = next.id;
+      const person = this.load().people[String(old.subject)];
+      if (person) this.pruneRetiredFacts(person);
       this.persist();
     }
     return next;
@@ -372,7 +390,18 @@ export class RelationGraph {
         scopes: raw.scopes ?? {},
         updatedAt: raw.updatedAt ?? 0,
       };
-    } catch {
+    } catch (error) {
+      // The graph is the only copy of cross-scope intel — back it up before
+      // the first persist() replaces it with an empty state.
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        const backup = `${this.path}.bak-${Date.now()}`;
+        try {
+          renameSync(this.path, backup);
+          console.error(`[relations] 关系网络文件损坏，已备份到 ${backup}:`, error);
+        } catch (backupError) {
+          console.error('[relations] 关系网络文件损坏且备份失败:', error, backupError);
+        }
+      }
       this.state = { people: {}, scopes: {}, updatedAt: 0 };
     }
     // Records persisted before impressions existed default to ''.
@@ -438,7 +467,16 @@ export class RelationGraph {
     try {
       const raw = JSON.parse(await readFile(this.path, 'utf-8')) as Partial<GraphState>;
       this.state = { people: raw.people ?? {}, scopes: raw.scopes ?? {}, updatedAt: raw.updatedAt ?? 0 };
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        const backup = `${this.path}.bak-${Date.now()}`;
+        try {
+          await rename(this.path, backup);
+          console.error(`[relations] 关系网络文件损坏，已备份到 ${backup}:`, error);
+        } catch (backupError) {
+          console.error('[relations] 关系网络文件损坏且备份失败:', error, backupError);
+        }
+      }
       this.state = { people: {}, scopes: {}, updatedAt: 0 };
     }
     for (const person of Object.values(this.state.people)) person.impression ??= '';

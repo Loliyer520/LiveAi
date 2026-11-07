@@ -12,7 +12,7 @@
  *   下一章 / 上一章  → 翻页
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import type { NapcatBot } from '../bot/napcat.js';
 import type { ScopeRepository } from '../store/repository.js';
 import type { ChatMessage } from './types.js';
@@ -22,9 +22,8 @@ export interface NovelCmdDeps {
   scopes: readonly string[];
   /** fq-novel 服务基址。 */
   baseUrl: string;
-  /** 互备基址链（2026-10-14 双机互备）：主线路连接失败/业务失败时依次改走。
-   * 默认 127.0.0.1:7641/fq = 经南京跳板隧道到重庆 183 的 ForAPI /fq 代理，
-   * 对端自己还会再兜回本机（环有界：双方各试一次）。 */
+  /** 兜底基址链：主线路连接失败/业务失败时依次改走。
+   * 2026-11-03 原 7641 隧道（183 互备）已删，默认空=不兜底；需要时 env/配置给。 */
   fallbackBaseUrls: readonly string[];
   /** 阅读状态持久化文件（每 scope 的当前书/目录/进度）。 */
   statePath: string;
@@ -221,11 +220,17 @@ export class NovelCommandHandler {
     }
 
     if (/^(下一章|继续)$/.test(text)) {
-      const idx = (state.chapterIdx ?? 0) + 1;
-      await this.handleRead(scopeKey, message, state, idx + 1, reply);
+      // 「继续」是正常聊天高频词：只有在读状态（选过书）时才劫持，
+      // 否则放给主 AI 当普通消息处理（2026-11 审计：纯聊天里一句「继续」被小说吃掉）。
+      if (state.bookId === undefined) return false;
+      // chapterIdx is the 0-based index of the last read chapter; undefined
+      // means nothing read yet, so "下一章" starts at chapter 1 (not 2).
+      const nextChapterNo = state.chapterIdx === undefined ? 1 : state.chapterIdx + 2;
+      await this.handleRead(scopeKey, message, state, nextChapterNo, reply);
       return true;
     }
     if (/^上一章$/.test(text)) {
+      if (state.bookId === undefined) return false;
       const idx = state.chapterIdx ?? 0;
       if (idx <= 0) {
         await reply('已经是第一章啦');
@@ -366,6 +371,10 @@ export class NovelCommandHandler {
       await reply(`取第 ${chapterNo} 章失败：${errText(error)}。可以再发一次同样的指令重试`);
       return;
     }
+    // 超长章节硬截断：无上限分块会把群刷成小说墙（审计 P2），
+    // 30000 字已经远超正常章节，截断并明示。
+    const truncated = body.length > 30000;
+    if (truncated) body = `${body.slice(0, 30000)}\n……（本章过长，已截断）`;
     // 正文发送（分块）前先发标题行，长章在 QQ 里不至于只有一坨墙
     const header = `《${state.bookTitle ?? ''}》${title}`;
     const chunks = chunkChapterText(body);
@@ -448,7 +457,10 @@ export class NovelCommandHandler {
 
   private persist(): void {
     try {
-      writeFileSync(this.statePath, JSON.stringify(this.states), 'utf-8');
+      // tmp+rename：同步写一半被 kill 不至于把进度文件截成半个 JSON。
+      const tmp = `${this.statePath}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify(this.states), 'utf-8');
+      renameSync(tmp, this.statePath);
     } catch (error) {
       console.warn('[novel-cmd] state persist failed:', error instanceof Error ? error.message : String(error));
     }

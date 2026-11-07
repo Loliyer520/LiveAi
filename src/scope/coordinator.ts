@@ -64,13 +64,23 @@ export class AtomicTurnBatchCoordinator {
     };
     const turnItem = turnItemFromBatch(liveBatch);
 
-    // Representative = latest live FIFO entry (already is, via turnItemFromBatch).
-    const representative = liveEntries[liveEntries.length - 1].transient;
+    // Representative = latest live FIFO entry that can actually start a turn.
+    // A trailing silent entry (the account's own message from another device)
+    // is persisted to history but must not become the turn's `message`: the
+    // model would then see the bot itself as sender (and lose user-mode
+    // persona/rescue hints). Prefer the newest non-silent message; fall back
+    // to the old "last entry" behavior when the batch is silent-only.
+    const representative = [...liveEntries].reverse().find(
+      (entry) => entry.transient.message !== null
+        && !(entry.transient.kind === 'message' && entry.transient.silentEvent),
+    )?.transient ?? liveEntries[liveEntries.length - 1].transient;
     if (representative.message !== null) {
       turnItem.message = representative.message;
       turnItem.cleaned = representative.cleaned;
       turnItem.agentId = representative.agentId;
       turnItem.kind = representative.kind;
+      // 代表团换了发言人，沉默标记也要跟着换——否则拿非沉默消息顶包却仍按沉默处理。
+      turnItem.silentEvent = representative.silentEvent;
     }
     if (historySeed.length > 0) {
       turnItem.historySeed = historySeed.map((entry) => ({ ...entry }));
@@ -113,7 +123,14 @@ export function mergeFollowupItems(scopeKey: string, ...segments: (TurnItem | nu
   }
   if (mergedItems.length === 0) return null;
 
-  const representative = structuredClone(mergedItems[mergedItems.length - 1]);
+  // Representative = 最新一条「能真正发起回合」的条目：尾随的沉默条目
+  // （bot 自己从别的设备发的消息）要进历史，但不能成为本回合的 message，
+  // 否则模型会把 bot 自己当成发信人。与 drainScopeFollowup 的选取规则一致。
+  const repSource = [...mergedItems].reverse().find(
+    (entry) => entry.message !== null
+      && !(entry.kind === 'message' && entry.silentEvent),
+  ) ?? mergedItems[mergedItems.length - 1];
+  const representative = structuredClone(repSource);
   const triggerMessages: TurnItem['triggerMessages'] = [];
   let deferredCount = 0;
   const mailboxEventIds: string[] = [];

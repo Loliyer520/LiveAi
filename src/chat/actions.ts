@@ -18,9 +18,11 @@ import { dirname, join } from 'node:path';
 import type { ToolSchema } from '../models/types.js';
 import type { ToolContext, ToolResult } from './tools.js';
 import { downloadToFile, webFetch, webSearch } from './net.js';
+import { cdnDownloadHeaders } from './image-cache.js';
 import { extractGzip, extractZip, isGzip, isZip } from './zip.js';
 import { safeFilename } from './workspace.js';
 import type { HistoryEntry } from './types.js';
+import { normalizeMessageRef } from '../message-ref.js';
 
 const DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024;
 const WRITE_MAX_CHARS = 200_000;
@@ -99,7 +101,7 @@ export const ACTION_TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'file_list',
-    description: '列出本会话工作区里的文件（相对路径 + 大小）。',
+    description: '列出本会话工作区里的文件（相对路径 + 大小）。工作区是长期保存的，重启不丢——下载/收藏的图片文件都放这。',
     parameters: {
       type: 'object',
       properties: { subdir: { type: 'string', description: '子目录（可选）' } },
@@ -243,10 +245,20 @@ async function run(name: string, args: Record<string, unknown>, context: ToolCon
           filename = new URL(url).pathname.split('/').filter(Boolean).pop() ?? '';
         } catch { /* fall through to safeFilename default */ }
       }
-      filename = safeFilename(decodeURIComponent(filename), `download-${Date.now()}`);
+      // A malformed escape ("100%.txt") throws URIError; the filename is
+      // attacker/model supplied, so keep the raw string instead of failing
+      // the whole turn.
+      let decodedName = filename;
+      try {
+        decodedName = decodeURIComponent(filename);
+      } catch {
+        // keep raw
+      }
+      filename = safeFilename(decodedName, `download-${Date.now()}`);
       await context.workspace.ensure();
       const target = context.workspace.resolvePath(join('downloads', filename));
-      const { bytes, contentType } = await downloadToFile(url, target, DOWNLOAD_MAX_BYTES);
+      // QQ 图链/B 站 CDN 缺防盗链头会 400/567，自动补（qqImageHeaders 同款集中处）
+      const { bytes, contentType } = await downloadToFile(url, target, DOWNLOAD_MAX_BYTES, { headers: cdnDownloadHeaders(url) });
       const rel = context.workspace.displayPath(target);
       return {
         ok: true,
@@ -257,7 +269,7 @@ async function run(name: string, args: Record<string, unknown>, context: ToolCon
 
     case 'download_qq_file': {
       spendNetwork(context);
-      const ref = String(args.message_ref ?? '').trim().replace(/^\[#?|\]$/g, '');
+      const ref = normalizeMessageRef(args.message_ref);
       const entry = context.repo.findEntryByRef(context.scopeType, context.scopeId, ref);
       if (!entry) return { ok: false, output: `没有找到短ID ${ref} 对应的消息。` };
       const fileRefs = Array.isArray(entry.file_refs) ? entry.file_refs : [];
@@ -309,6 +321,7 @@ async function run(name: string, args: Record<string, unknown>, context: ToolCon
       const from = Math.max(1, Number(args.from ?? 1) || 1);
       const to = Math.min(lines.length, Number(args.to ?? 0) || from + READ_MAX_LINES - 1, from + READ_MAX_LINES - 1);
       if (from > lines.length) return { ok: false, output: `文件只有 ${lines.length} 行，from=${from} 超出范围。` };
+      if (to < from) return { ok: false, output: `from=${from} 大于 to=${to}，区间为空；请调整参数。` };
       let body = '';
       for (let index = from; index <= to; index += 1) {
         const line = `${index}: ${lines[index - 1]}`;
@@ -363,7 +376,9 @@ async function run(name: string, args: Record<string, unknown>, context: ToolCon
       const buffer = await readFile(abs);
       const rel = context.workspace.displayPath(abs);
       if (isZip(buffer)) {
-        const destDir = abs.replace(/\.zip$/i, '');
+        // 与 gz 同理：不带 .zip 后缀时 replace 是空操作，直接当目录名会撞上文件本身。
+        let destDir = abs.replace(/\.zip$/i, '');
+        if (destDir === abs) destDir = `${abs}.out`;
         const names = await extractZip(buffer, destDir);
         if (names.length === 0) return { ok: true, output: `${rel} 里没有可解出的文件。` };
         const destRel = context.workspace.displayPath(destDir);
@@ -481,7 +496,13 @@ export async function sendLinesVerbatim(
   let failure = '';
   for (const batch of batches) {
     try {
-      const result = await context.bot.sendText(context.scopeType as 'group' | 'private', Number(context.scopeId), batch);
+      // Same routing as send_message: dataline master turns go back over the
+      // cable, virtual scopes (domain/bili/mcclient) relay to their hub. A raw
+      // bot.sendText here would send to QQ id "mc"/"domain" (NaN) or leak a
+      // master-only reply into the QQ private chat.
+      const result = context.sendTextOverride
+        ? await context.sendTextOverride(batch)
+        : await context.bot.sendText(context.scopeType as 'group' | 'private', Number(context.scopeId), batch);
       const sentId = (result as { message_id?: number | string }).message_id;
       const msgRef = context.repo.registerMessageRef(context.scopeType, context.scopeId, sentId ?? null);
       const entry: HistoryEntry = {

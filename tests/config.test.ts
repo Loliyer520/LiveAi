@@ -12,7 +12,7 @@ test('loadConfig uses safe defaults', () => {
   assert.equal(config.host, '127.0.0.1');
   assert.equal(config.port, 7650);
   assert.equal(config.logLevel, 'info');
-  assert.equal(config.napcat.wsUrl, 'ws://127.0.0.1:7631/openclaw-bind');
+  assert.equal(config.napcat.wsUrl, 'ws://127.0.0.1:7631/deeplive-bind');
   assert.equal(config.napcat.httpUrl, 'http://127.0.0.1:7632');
   assert.equal(config.napcat.selfId, 0);
   assert.equal(config.ai.masterQq, 0);

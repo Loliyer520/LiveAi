@@ -82,6 +82,7 @@ async function makeHarness(body: () => Buffer | string): Promise<Harness> {
     workspace: new Workspace(dir),
     networkBudget: { used: 0 },
     triggerImageRefs: [],
+          triggerVideoRefs: [],
     describeImage: async () => '',
     scopeType: 'private',
     scopeId: '3319085316',

@@ -4,11 +4,13 @@
  * Layout under data/prompt/:
  *   char.txt           — persona 人设
  *   char_prefill.txt   — assistant's persona acknowledgement (fake exchange)
- *   chat_focus.txt     — chat-mode duties (watch group, report intel)
+ *   chat_focus.txt     — group-chat duties (watch group, report intel)
+ *   private_focus.txt  — private-chat duties and capability routing
  *   chat_style.txt     — pre-send self check list
- *   child_rules.txt    — 25 CHILD_RULES for the session AI
+ *   child_rules.txt    — always-on behavioral rules for the session AI
  *   main.txt           — 主AI (coordinator) system prompt
- *   agent.txt          — 常驻后台 agent system prompt
+ *   agent.txt          — legacy 常驻后台 agent prompt; loaded but currently has no
+ *                        consumer (the agent/tasker subsystem was never ported to TS)
  *   staff/10..50.txt   — layered session-AI system blocks, sorted concat
  *
  * staff blocks support the {{char_prompt}} placeholder.
@@ -55,6 +57,7 @@ export interface PromptBundle {
   char: string;
   charPrefill: string;
   chatFocus: string;
+  privateFocus: string;
   chatStyle: string;
   childRules: string;
   main: string;
@@ -79,9 +82,10 @@ export class PromptStore {
     const now = Date.now();
     if (this.cache !== null && now - this.loadedAt < this.ttlMs) return this.cache;
     const char = await readText(join(this.promptDir, 'char.txt'), DEFAULT_CHAR_PROMPT);
-    const [charPrefill, chatFocus, chatStyle, childRules, main, agent] = await Promise.all([
+    const [charPrefill, chatFocus, privateFocus, chatStyle, childRules, main, agent] = await Promise.all([
       readText(join(this.promptDir, 'char_prefill.txt'), ''),
       readText(join(this.promptDir, 'chat_focus.txt'), ''),
+      readText(join(this.promptDir, 'private_focus.txt'), ''),
       readText(join(this.promptDir, 'chat_style.txt'), ''),
       readText(join(this.promptDir, 'child_rules.txt'), ''),
       readText(join(this.promptDir, 'main.txt'), ''),
@@ -105,6 +109,7 @@ export class PromptStore {
       char,
       charPrefill,
       chatFocus,
+      privateFocus,
       chatStyle,
       childRules,
       main,

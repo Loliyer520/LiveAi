@@ -18,15 +18,18 @@ import { dirname } from 'node:path';
 const MAX_REDIRECTS = 3;
 const DEFAULT_TIMEOUT_MS = 20_000;
 
-/** 提取 IPv4-mapped IPv6（::ffff:a.b.c.d / ::ffff:7f00:1 / 全展开形式）里的 v4 地址，非映射返回 null。 */
-function mappedV4Address(ip: string): string | null {
-  let addr = ip.toLowerCase();
+/** 把 IPv6 文本（含 :: 压缩、末尾点分 v4、%zone）展开成 8 个 16 位分组。 */
+function expandV6(address: string): number[] | null {
+  let addr = address.toLowerCase();
+  const zone = addr.indexOf('%');
+  if (zone >= 0) addr = addr.slice(0, zone);
   const quad = /(\d{1,3}(?:\.\d{1,3}){3})$/.exec(addr);
   if (quad !== null) {
     const nums = quad[1].split('.').map(Number);
-    const hi = ((nums[0]! << 8) | nums[1]!).toString(16);
-    const lo = ((nums[2]! << 8) | nums[3]!).toString(16);
-    addr = addr.slice(0, addr.length - quad[1].length) + hi + ':' + lo;
+    if (nums.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) return null;
+    addr = addr.slice(0, addr.length - quad[1].length)
+      + ((nums[0]! << 8) | nums[1]!).toString(16) + ':'
+      + ((nums[2]! << 8) | nums[3]!).toString(16);
   }
   const groups = addr.split(':');
   let full: string[];
@@ -41,30 +44,63 @@ function mappedV4Address(ip: string): string | null {
     full = groups;
   }
   if (full.length !== 8) return null;
-  if (!full.slice(0, 5).every((group) => parseInt(group, 16) === 0)) return null;
-  if (parseInt(full[5]!, 16) !== 0xffff) return null;
-  const hi = parseInt(full[6]!, 16);
-  const lo = parseInt(full[7]!, 16);
-  if (Number.isNaN(hi) || Number.isNaN(lo)) return null;
+  const parsed = full.map((group) => parseInt(group, 16));
+  if (parsed.some((value) => Number.isNaN(value) || value < 0 || value > 0xffff)) return null;
+  return parsed;
+}
+
+function v4FromGroups(hi: number, lo: number): string {
   return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+}
+
+/** 取内嵌在 IPv6 里的 v4（IPv4-mapped/compat、NAT64、6to4、Teredo），没有返回 null。 */
+function embeddedV4(groups: number[]): string | null {
+  const [g0, g1, , , , g5, g6, g7] = groups as [number, number, number, number, number, number, number, number];
+  // ::/96（含 ::1、::）与 ::ffff:0:0/96 的 IPv4-mapped
+  if (groups.slice(0, 5).every((value) => value === 0) && (g5 === 0 || g5 === 0xffff)) {
+    return v4FromGroups(g6, g7);
+  }
+  // 64:ff9b::/96（NAT64）
+  if (g0 === 0x64 && g1 === 0xff9b && groups.slice(2, 6).every((value) => value === 0)) {
+    return v4FromGroups(g6, g7);
+  }
+  // 2002::/16（6to4，内嵌 v4 在 2、3 组）
+  if (g0 === 0x2002) return v4FromGroups(groups[2]!, groups[3]!);
+  // 2001:0::/32（Teredo，客户端 v4 按位取反）
+  if (g0 === 0x2001 && g1 === 0x0) return v4FromGroups(g6 ^ 0xffff, g7 ^ 0xffff);
+  return null;
 }
 
 export function isPrivateAddress(address: string, family: number): boolean {
   if (family === 6) {
-    const ip = address.toLowerCase();
-    const mapped = mappedV4Address(ip);
-    if (mapped !== null) return isPrivateAddress(mapped, 4);
-    return ip === '::1' || ip.startsWith('fe80:') || ip.startsWith('fc') || ip.startsWith('fd') || ip === '::';
+    const groups = expandV6(address);
+    // 解析不了就按危险处理，宁可误拒。
+    if (groups === null) return true;
+    const embedded = embeddedV4(groups);
+    if (embedded !== null) return isPrivateAddress(embedded, 4);
+    const first = groups[0]!;
+    // ::1 已由 embeddedV4（0.0.0.1）覆盖；fe80::/10 链路本地、fec0::/10 旧站点本地、
+    // fc00::/7 唯一本地、ff00::/8 组播。
+    if ((first & 0xffc0) === 0xfe80) return true;
+    if ((first & 0xffc0) === 0xfec0) return true;
+    if ((first & 0xfe00) === 0xfc00) return true;
+    if ((first & 0xff00) === 0xff00) return true;
+    return false;
   }
   const parts = address.split('.').map((part) => Number(part));
   if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
-  const [a, b] = parts;
+  const [a, b, c] = parts as [number, number, number, number];
   return (
     a === 0 || a === 10 || a === 127 ||
-    (a === 172 && b! >= 16 && b! <= 31) ||
+    (a === 100 && b >= 64 && b <= 127) || // CGNAT 100.64.0.0/10
+    (a === 172 && b >= 16 && b <= 31) ||
     (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && (c === 0 || c === 2)) || // 192.0.0.0/24, TEST-NET-1
+    (a === 198 && (b === 18 || b === 19)) || // benchmarking 198.18.0.0/15
+    (a === 198 && b === 51 && c === 100) || // TEST-NET-2
+    (a === 203 && b === 0 && c === 113) || // TEST-NET-3
     (a === 169 && b === 254) ||
-    a >= 224 // multicast / reserved
+    a >= 224 // multicast / reserved / broadcast
   );
 }
 
@@ -81,7 +117,22 @@ function parseHttpUrl(rawUrl: string): URL {
   return url;
 }
 
-/** Parse + validate a URL, refusing internal destinations. Throws on refusal. */
+/**
+ * Parse + validate a URL, refusing internal destinations. Throws on refusal.
+ *
+ * 注意：校验与 fetch 是两次独立 DNS 解析，理论上存在 DNS rebinding 的
+ * TOCTOU 窗口。这里选择不引入 undici 依赖做 IP 钉扎——调用方都是模型可
+ * 控的公开抓取，且内网服务本身没有凭据；比这更关键的是每次重定向都重查。
+ */
+// 测试缝：单测里把 DNS 解析换成桩（img.example.com 之类假域名现实里解析不到）。
+let dnsLookup: (hostname: string) => Promise<{ address: string; family: number }[]> = (hostname) =>
+  lookup(hostname, { all: true });
+export function setDnsResolverForTests(
+  resolver: ((hostname: string) => Promise<{ address: string; family: number }[]>) | null,
+): void {
+  dnsLookup = resolver ?? ((hostname) => lookup(hostname, { all: true }));
+}
+
 export async function assertPublicUrl(rawUrl: string): Promise<URL> {
   const url = parseHttpUrl(rawUrl);
   const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
@@ -95,7 +146,7 @@ export async function assertPublicUrl(rawUrl: string): Promise<URL> {
   }
   let addresses: { address: string; family: number }[];
   try {
-    addresses = await lookup(hostname, { all: true });
+    addresses = await dnsLookup(hostname);
   } catch {
     throw new Error(`域名解析失败: ${hostname}`);
   }
@@ -106,18 +157,16 @@ export async function assertPublicUrl(rawUrl: string): Promise<URL> {
 }
 
 export async function fetchGuarded(url: URL, init: RequestInit, redirectsLeft = MAX_REDIRECTS, allowInternal = false): Promise<Response> {
-  const response = await fetch(url, {
-    ...init,
-    redirect: 'manual',
-    signal: init.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
-  });
+  // 超时/取消令牌整条重定向链共用：每次跳转都重开计时会让「慢速重定向」无限续命。
+  const signal = init.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS);
+  const response = await fetch(url, { ...init, redirect: 'manual', signal });
   if (response.status >= 300 && response.status < 400) {
     const location = response.headers.get('location');
     if (location && redirectsLeft > 0) {
       const next = allowInternal
         ? parseHttpUrl(new URL(location, url).toString())
         : await assertPublicUrl(new URL(location, url).toString());
-      return fetchGuarded(next, { ...init, signal: init.signal }, redirectsLeft - 1, allowInternal);
+      return fetchGuarded(next, { ...init, signal }, redirectsLeft - 1, allowInternal);
     }
   }
   return response;
@@ -157,7 +206,7 @@ export interface WebFetchResult {
  *  model-supplied URLs. */
 export async function webFetch(
   rawUrl: string,
-  options: { method?: string; headers?: Record<string, string>; body?: string; maxBytes?: number; displayLimit?: number; allowInternal?: boolean } = {},
+  options: { method?: string; headers?: Record<string, string>; body?: string; maxBytes?: number; displayLimit?: number; allowInternal?: boolean; timeoutMs?: number } = {},
 ): Promise<WebFetchResult> {
   const url = options.allowInternal ? parseHttpUrl(rawUrl) : await assertPublicUrl(rawUrl);
   const maxBytes = options.maxBytes ?? 512 * 1024;
@@ -168,6 +217,7 @@ export async function webFetch(
     method,
     headers,
     body: options.body === undefined || method === 'GET' || method === 'HEAD' ? undefined : options.body,
+    signal: options.timeoutMs !== undefined ? AbortSignal.timeout(options.timeoutMs) : undefined,
   }, MAX_REDIRECTS, options.allowInternal === true);
   const contentType = (response.headers.get('content-type') ?? '').split(';', 1)[0].trim();
   const buffer = await readCapped(response, maxBytes);

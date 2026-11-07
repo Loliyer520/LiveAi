@@ -73,6 +73,7 @@ async function makeHarness(opts: HarnessOpts = {}): Promise<Harness> {
     workspace: new Workspace(dir),
     networkBudget: { used: 0 },
     triggerImageRefs: [],
+          triggerVideoRefs: [],
     describeImage: opts.describeImage ?? (async () => ''),
     scopeType: 'private',
     scopeId: '3319085316',
@@ -241,7 +242,7 @@ test('sticker_refresh 仅主AI可用；主AI调用走完整刷新', async () => 
   try {
     const denied = await executeChatTool({ name: 'sticker_refresh', arguments: {} }, asChild.context);
     assert.equal(denied.ok, false);
-    assert.ok(denied.output.includes('仅主AI'), denied.output);
+    assert.ok(denied.output.includes('仅限主AI'), denied.output);
     assert.equal(seen.length, 0, '被拒时不应触发视觉调用');
   } finally {
     await asChild.cleanup();

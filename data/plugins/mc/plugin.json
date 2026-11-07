@@ -1,6 +1,6 @@
 {
   "name": "mc",
-  "description": "真实 Minecraft Java 版：进服务器、看状态、聊天、寻路、挖矿、放方块、打怪、砍树。底层是本机 7660 的 mineflayer 边车服务；工具持有者=Minecraft 中枢（domain:mc）与各 MC client 下级 AI（mcclient:*），主AI 经 delegate_to_child 委派。",
+  "description": "真实 Minecraft Java 版：进服、状态、聊天与游玩。26.2/协议776自动走本机 Rust LiveSession 后端，其他版本走 Mineflayer；仍用同一组 mc_* 工具。Rust 后端当前只接通常用状态/聊天/命令/视角/移动脱困/主手使用/快捷栏/背包/重生，未接入的工具会明确报不支持。工具持有者=Minecraft 中枢（domain:mc）与各 MC client 下级 AI（mcclient:*）。",
   "enabled": true,
   "tools": [
     {
@@ -50,7 +50,7 @@
     },
     {
       "name": "mc_join",
-      "description": "进入真实 Minecraft Java 版服务器。host=地址，port 默认 25565；离线/盗版服 auth=offline，正版服 auth=microsoft（需要账号，首次登录信息会出现在边车日志）。用户名只能 3-16 位字母/数字/下划线（中文名进不去），默认 BingTang。进服后先 mc_status 看位置、mc_events 看聊天。",
+      "description": "进入真实 Minecraft Java 版服务器。version=auto 按协议选后端：26.2/776=Rust，其他=Mineflayer。离线服 auth=offline；微软正版目前仅旧版 Mineflayer 可用。进服后先看 mc_status、mc_events。26.2 的寻路/挖放/打怪等尚在移植，不支持时会明确报错，不要当成成功。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -284,8 +284,197 @@
       }
     },
     {
+      "name": "mc_travel",
+      "description": "行为层赶路（26.2）：给一个坐标，内部自动完成走、跳台阶、挖 1×2 隧道、搭桥过沟；给 y 目标高度时自动上行——实壁挖楼梯（留台阶逐格爬）、禁挖或开阔坑则垫 bridge 方块上拔。规范条件用参数声明：dig=允许挖什么（true=随意挖默认/false=禁挖/逗号清单只挖这些），bridge=搭桥/垫脚方块（不给则遇深沟即停、要上行也垫不了），tool=挖掘工具。途中受击自动反击、饥饿自动进食、低血自动停手（见 mc_behavior）。日常移动一律用它，别用 mc_goto 一步步遥控。掉坑里出不来时：带 y=地表高度+bridge=dirt 调它。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "目标 X 坐标"
+          },
+          "z": {
+            "type": "number",
+            "description": "目标 Z 坐标"
+          },
+          "y": {
+            "type": "number",
+            "description": "目标 Y 坐标。给出后成为到点硬条件（高度差>1.6 不算到达）；明显高于当前时自动上行：实壁挖楼梯、开阔坑垫 bridge 方块上拔",
+            "default": ""
+          },
+          "dig": {
+            "type": "string",
+            "description": "挖掘规范：true=随意挖（默认，床岩类除外）、false=禁挖、或逗号清单如 dirt,stone,gravel",
+            "default": "true"
+          },
+          "bridge": {
+            "type": "string",
+            "description": "搭桥方块 id（如 dirt）；true=自动用 dirt；留空则遇深沟/悬崖即停",
+            "default": ""
+          },
+          "tool": {
+            "type": "string",
+            "description": "挖掘前确保手持的工具 id（如 iron_pickaxe），可省略",
+            "default": ""
+          },
+          "timeout": {
+            "type": "number",
+            "description": "超时秒数，默认 120，范围 10-300",
+            "default": 120
+          }
+        },
+        "required": [
+          "x",
+          "z"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/travel?x={{x}}&z={{z}}&y={{y}}&dig={{dig}}&bridge={{bridge}}&tool={{tool}}&timeout={{timeout}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_mine",
+      "description": "行为层定向采集（26.2）：给一个方块 id，自动环带外扩扫描定位（分三层覆盖头顶山地/脚下洞穴）、寻路过去（挖墙/搭桥照规范）逐块挖掉凑数，挖完可选返程回出发点。block=方块 id；找树砍树一律写 log（=任意原木标签，别猜 oak_log——林子可能是桦木/云杉），也支持逗号多选如 coal_ore,iron_ore。count=数量（默认1）、tool=挖掘工具、range=搜索半径超范围阈值（默认12；扫描走客户端本地世界缓存，毫秒级，24/32 也随便给）、timeout=总超时秒数（默认180，主要留给寻路砍树，扫描几乎不占）、back=true 完工返程。矿脉/树干会成片，挖到一块自动顺藤摸瓜。挖圆石/泥土/木头这类采集活一律用它，别手工 mc_travel+mc_dig 拼。只要知道在哪/数数、不动手挖 → 用 mc_find。目标在头顶够不着（高树残干/崖上矿）或被自己挖的坑挡住时，传 bridge=dirt（背包有土就自动垫块上拔/搭桥）；报「没给搭桥方块」就带 bridge 重试，别直接放弃问人要坐标。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "block": {
+            "type": "string",
+            "description": "要挖的方块 id，如 oak_log / dirt / cobblestone / coal_ore"
+          },
+          "count": {
+            "type": "number",
+            "description": "要挖的数量，默认 1，范围 1-64",
+            "default": 1
+          },
+          "tool": {
+            "type": "string",
+            "description": "挖掘前确保手持的工具 id（如 iron_pickaxe），可省略",
+            "default": ""
+          },
+          "range": {
+            "type": "number",
+            "description": "搜索半径（超范围阈值），默认 12，范围 2-48；扫不到就如实报告",
+            "default": 12
+          },
+          "dig": {
+            "type": "string",
+            "description": "赶路挖掘规范：true=随意挖（默认）/false=禁挖/逗号清单",
+            "default": "true"
+          },
+          "bridge": {
+            "type": "string",
+            "description": "搭桥/垫块方块名（如 dirt）：过深沟、爬上高目标都靠它；目标在头顶或崖上时必传",
+            "default": ""
+          },
+          "back": {
+            "type": "boolean",
+            "description": "true=完工/收工后寻路返回出发点，默认 false",
+            "default": false
+          },
+          "timeout": {
+            "type": "number",
+            "description": "总超时秒数，默认 180，范围 10-600",
+            "default": 180
+          }
+        },
+        "required": [
+          "block"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/mine?block={{block}}&count={{count}}&tool={{tool}}&range={{range}}&dig={{dig}}&bridge={{bridge}}&back={{back}}&timeout={{timeout}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_behavior",
+      "description": "行为层常驻开关与状态（26.2）：auto_retaliate 遇敌自动反击、auto_eat 饥饿自动进食、guard_health 低血停手报警。不带参数=查看当前开关/阈值/进行中任务；name=开关名+on=true/false 切换；radius/eat_below/guard_below 调阈值。受击/低血等触发器会自动变成 mc_events 事件。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "开关名：auto_retaliate / auto_eat / guard_health，留空只查询",
+            "default": ""
+          },
+          "on": {
+            "type": "boolean",
+            "description": "开或关，配 name 用",
+            "default": true
+          },
+          "radius": {
+            "type": "number",
+            "description": "反击索敌半径（格），默认 6",
+            "default": ""
+          },
+          "eat_below": {
+            "type": "number",
+            "description": "饥饿 ≤ 此值自动进食，默认 14",
+            "default": ""
+          },
+          "guard_below": {
+            "type": "number",
+            "description": "生命 ≤ 此值停手报警，默认 8",
+            "default": ""
+          }
+        },
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/behavior?name={{name}}&on={{on}}&radius={{radius}}&eat_below={{eat_below}}&guard_below={{guard_below}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
       "name": "mc_goto",
-      "description": "寻路走到坐标。y 省略时只按 x/z 走到附近；range 是到达半径（默认 1）。会自动绕障碍、跳台阶，超时会尝试脱困。返回实际位置和剩余距离。",
+      "description": "旧式直线寻路走到坐标（会被行为层打断）。y 省略时只按 x/z；range 到达半径（默认 1）。日常移动优先用 mc_travel。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -340,7 +529,7 @@
     },
     {
       "name": "mc_dig",
-      "description": "挖掉指定坐标的方块。太远会自动走近，会换合适工具。挖穿脚下掉进坑里会自动尝试跳出来。",
+      "description": "挖掉指定坐标的方块（26.2：RCON 验证方块消失；需站在 3 格内，等 30s 内挖穿）。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -385,7 +574,7 @@
     },
     {
       "name": "mc_place",
-      "description": "在指定空位放方块。item 可指定物品 id（如 dirt/cobblestone/oak_planks），省略则用背包第一个可放置方块。目标周围必须有实体方块可依附，不能放在自己脚下。",
+      "description": "把背包快捷栏里的 item 放到指定坐标（须为空气且贴着实体面，RCON 复核放置结果）。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -435,7 +624,7 @@
     },
     {
       "name": "mc_block",
-      "description": "查看某个坐标是什么方块：名字、能不能挖、能不能替换、相邻方块。挖矿或放方块前不确定就查。",
+      "description": "查指定坐标方块：空气/非空气，或带 name= 验证是否某方块（支持 #tag）；方块实体（箱子等）可看 NBT。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -480,7 +669,7 @@
     },
     {
       "name": "mc_attack",
-      "description": "攻击附近实体。name 填实体 id（pig/zombie）或玩家名；不填则优先最近敌对生物，没有就打最近生物。count=出手次数（1-20，默认 1）。会先走近到攻击距离。",
+      "description": "攻击附近实体：name=玩家名或生物类型（如 zombie），自动走近并挥刀 count 轮。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -519,7 +708,7 @@
     },
     {
       "name": "mc_follow",
-      "description": "持续跟随某个在线玩家，保持 distance 格（默认 3）。用 mc_stop 停止。",
+      "description": "行为层跟随玩家（寻路版）：自动寻路/挖墙/搭桥跟着走，保持 distance 格，玩家下线或超时自动收尾。跟生物/短距离直线跟用旧 mc_follow_old 没有，直接用这个。规范条件同 mc_travel（dig/bridge/tool）。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -530,12 +719,32 @@
         "properties": {
           "name": {
             "type": "string",
-            "description": "玩家名"
+            "description": "玩家名（必填）"
           },
           "distance": {
             "type": "number",
-            "description": "保持距离（格），默认 3",
+            "description": "保持的距离格数，默认 3，范围 2-16",
             "default": 3
+          },
+          "dig": {
+            "type": "string",
+            "description": "挖掘规范：true=随意挖（默认）/false=禁挖/逗号清单",
+            "default": "true"
+          },
+          "bridge": {
+            "type": "string",
+            "description": "搭桥方块 id；留空遇深沟即停",
+            "default": ""
+          },
+          "tool": {
+            "type": "string",
+            "description": "挖掘工具 id，可省略",
+            "default": ""
+          },
+          "timeout": {
+            "type": "number",
+            "description": "跟随时长秒数，默认 180，范围 10-600",
+            "default": 180
           }
         },
         "required": [
@@ -544,7 +753,7 @@
       },
       "request": {
         "method": "GET",
-        "url": "http://127.0.0.1:7660/follow?name={{name}}&distance={{distance}}",
+        "url": "http://127.0.0.1:7660/follow_player?name={{name}}&distance={{distance}}&dig={{dig}}&bridge={{bridge}}&tool={{tool}}&timeout={{timeout}}",
         "headers": {
           "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
         }
@@ -615,7 +824,7 @@
     },
     {
       "name": "mc_collect",
-      "description": "自动采集附近的某种方块（寻路+挖+捡）。block=方块 id，如 oak_log/coal_ore/iron_ore；count 目标数量（最多 16）；radius 搜索半径默认 32。适合砍树、挖矿。",
+      "description": "自动走向并捡起 24 格内最近的掉落物（循环至没有或超时）。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -688,7 +897,7 @@
     },
     {
       "name": "mc_entities",
-      "description": "列出附近实体（玩家/生物）的名称、类型、距离、坐标、生命。radius 默认 16，最大 64。",
+      "description": "扫描附近 radius 格内的玩家与常见生物/掉落物（26.2 走 RCON，给位置与血量）。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -722,7 +931,7 @@
     },
     {
       "name": "mc_scan",
-      "description": "扫描附近方块分布，并列出值得注意的矿石/树木/水/箱子坐标。找矿、找树、判断地形时用。radius 默认 8，最大 16。",
+      "description": "贴脸探针：以自己为中心仅 ±2×±3 格抽样扫描清单方块（矿/木/箱子/水/岩浆等；普通石土不报）。只够回答「脚边现在有没有」。找树/找矿/数数方位一律用 mc_find（本地世界大范围扫描，毫秒级报坐标）——本工具半径被服务端钳死在 ±2，换方向反复扫永远报空。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -733,8 +942,8 @@
         "properties": {
           "radius": {
             "type": "number",
-            "description": "水平半径（格），默认 8",
-            "default": 8
+            "description": "水平半径（格），服务端钳死上限 2",
+            "default": 2
           }
         },
         "required": []
@@ -755,8 +964,58 @@
       }
     },
     {
+      "name": "mc_find",
+      "description": "行为层勘察（26.2）：大范围找方块只报坐标不动手。给一个方块 id，以自身为圆心环带外扩分层扫描（覆盖头顶山地/脚下洞穴），报告每处的坐标和距离。「附近有没有树/矿」「帮我数数有几棵」走这里。block=方块 id；找树一律写 log（=任意原木标签，别猜 oak_log——林子可能是桦木/云杉），也支持逗号多选如 coal_ore,iron_ore。range=搜索半径（默认12；本地世界扫描毫秒级，24/32 也随便给）、limit=最多报几处（默认10）、timeout=秒（默认60，扫描几乎不占，基本不会超时）。找到后想挖用 mc_mine。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "block": {
+            "type": "string",
+            "description": "要找的方块 id（找任意树写 log；逗号可多选）"
+          },
+          "range": {
+            "type": "number",
+            "description": "搜索半径（格），默认 12，最大 48",
+            "default": 12
+          },
+          "limit": {
+            "type": "number",
+            "description": "最多报告几处，默认 10",
+            "default": 10
+          },
+          "timeout": {
+            "type": "number",
+            "description": "总超时秒数，默认 60（要与 range 匹配：12→≥60、24→≥120）",
+            "default": 60
+          }
+        },
+        "required": [
+          "block"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/find?block={{block}}&range={{range}}&limit={{limit}}&timeout={{timeout}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
       "name": "mc_eat",
-      "description": "吃背包里的食物回复饥饿。生命或饥饿低时用。",
+      "description": "从背包找吃的（面包/熟肉/苹果等）吃一口，报告饥饿变化。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -838,6 +1097,395 @@
       "request": {
         "method": "GET",
         "url": "http://127.0.0.1:7660/use",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_craft",
+      "description": "服务端辅助合成：核对背包原料后 clear 扣料 + give 发产物（26.2 客户端无工作台窗口，等价兑换）。内置配方：木板/木棍/工作台/火把/熔炉/箱子/面包/石制木制工具等，mc_craft 不带参数可问。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "type": "string",
+            "description": "要合成的物品，如 crafting_table"
+          },
+          "count": {
+            "type": "integer",
+            "description": "合成次数（默认 1）"
+          }
+        },
+        "required": [
+          "result"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/craft?result={{result}}&count={{count}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "master_only": true
+    },
+    {
+      "name": "mc_container",
+      "description": "查看当前打开的容器（箱子/熔炉等）：容器区物品 + 容器内背包区物品。对着容器方块 mc_use 打开后用这个看里面有什么。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/container",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_container_take",
+      "description": "从打开的容器拿物品到自己背包（shift 点击整组搬移）。item=物品名或 all；stacks=最多搬几组（默认 36=全拿）。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "item": {
+            "type": "string",
+            "description": "物品名，如 diamond；all=全部"
+          },
+          "stacks": {
+            "type": "integer",
+            "description": "最多搬几组，默认 36"
+          }
+        },
+        "required": [
+          "item"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/container_take?item={{item}}&stacks={{stacks}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_container_put",
+      "description": "把自己背包里的物品放进打开的容器。item=物品名或 all；stacks=最多放几组（默认 36=全放）。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "item": {
+            "type": "string",
+            "description": "物品名；all=全部"
+          },
+          "stacks": {
+            "type": "integer",
+            "description": "最多放几组，默认 36"
+          }
+        },
+        "required": [
+          "item"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/container_put?item={{item}}&stacks={{stacks}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_container_close",
+      "description": "关闭当前打开的容器界面。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/container_close",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_inv_drop",
+      "description": "把背包里某物品丢到地上。whole=true 丢整组（默认），false 只丢 1 个。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "item": {
+            "type": "string",
+            "description": "要丢的物品名"
+          },
+          "whole": {
+            "type": "boolean",
+            "description": "true=整组（默认），false=只丢 1 个"
+          }
+        },
+        "required": [
+          "item"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/inv_drop?item={{item}}&whole={{whole}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_swap_hands",
+      "description": "主副手交换（等价按 F）。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/swap_hands",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_inv_click",
+      "description": "低级背包操作：点击界面槽位。slot=界面槽号（背包界面主背包 9-35、快捷栏 36-44、副手 45；开着容器时 0 起是容器区）；button 0=左键（整组拿起/放下）1=右键（拿一半/放一个）。一般优先用 mc_equip/mc_inv_drop/mc_container_take 这些高层工具。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "slot": {
+            "type": "integer",
+            "description": "界面槽号"
+          },
+          "button": {
+            "type": "integer",
+            "description": "0=左键 1=右键",
+            "default": 0
+          }
+        },
+        "required": [
+          "slot"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/inv_click?slot={{slot}}&button={{button}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_survey",
+      "description": "体素网格勘察（26.2，最快）：一次把周围整盒方块抓下来本地筛，比 mc_find 的逐格扫描快一个量级，几百毫秒出结果。适合「周围是什么环境」「这附近有多少棵树/矿」「有没有水」。block=方块 id，找树写 log（=任意原木）；radius=半径格（最大32）、limit=最多报几处（默认20）、timeout=秒（默认60）。报告每处坐标和距离。只报坐标不动手，想挖用 mc_mine，想盖房用 mc_build。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "block": {
+            "type": "string",
+            "description": "要找的方块 id（找任意树写 log；逗号可多选）"
+          },
+          "radius": {
+            "type": "number",
+            "description": "扫描半径（格），默认 16，最大 32",
+            "default": 16
+          },
+          "limit": {
+            "type": "number",
+            "description": "最多报告几处，默认 20",
+            "default": 20
+          },
+          "timeout": {
+            "type": "number",
+            "description": "总超时秒数，默认 60",
+            "default": 60
+          }
+        },
+        "required": [
+          "block"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/survey?block={{block}}&radius={{radius}}&limit={{limit}}&timeout={{timeout}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_build",
+      "description": "3D 打印建筑（26.2）：按蓝图把方块一块块摆出来（先地板后墙再顶，已有方块自动跳过不浪费材料，缺材料如实报告缺什么）。三种蓝图来源：blueprint=预设名（house 小屋带门洞 / tower 塔 / platform 平台 / pillar 柱子 / wall 带窗墙 / arch 拱门）；shape=solid|solid|cube|hollow 配 w/h/d 尺寸自造方块体；blocks=显式清单 \"x,y,z:stone;x,y,z:dirt\"（相对锚点）。material=材料方块 id（默认stone）、at=锚点坐标 \"x,z\"（不填就在原地往上盖）、timeout=秒（默认300）。盖完汇报放了/跳过/失败多少块。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "blueprint": {
+            "type": "string",
+            "description": "预设蓝图名：house/tower/platform/pillar/wall/arch"
+          },
+          "shape": {
+            "type": "string",
+            "description": "自造形状：solid（实心）/ hollow（空心壳）"
+          },
+          "blocks": {
+            "type": "string",
+            "description": "显式方块清单 \"x,y,z:item;x,y,z:item\"（相对锚点）"
+          },
+          "material": {
+            "type": "string",
+            "description": "材料方块 id，默认 stone",
+            "default": "stone"
+          },
+          "w": {
+            "type": "number",
+            "description": "shape 宽度，最大 32",
+            "default": 5
+          },
+          "h": {
+            "type": "number",
+            "description": "shape 高度，最大 32",
+            "default": 4
+          },
+          "d": {
+            "type": "number",
+            "description": "shape 深度，最大 32",
+            "default": 5
+          },
+          "at": {
+            "type": "string",
+            "description": "锚点坐标 \"x,z\" 或 \"x,y,z\"；不填则原地往上盖"
+          },
+          "timeout": {
+            "type": "number",
+            "description": "总超时秒数，默认 300",
+            "default": 300
+          }
+        },
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/build?blueprint={{blueprint}}&shape={{shape}}&blocks={{blocks}}&material={{material}}&w={{w}}&h={{h}}&d={{d}}&at={{at}}&timeout={{timeout}}",
         "headers": {
           "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
         }

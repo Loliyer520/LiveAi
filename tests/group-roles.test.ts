@@ -131,6 +131,7 @@ async function makeContext(options: {
     sendToScope: async () => '',
     peerInject: () => undefined,
     triggerImageRefs: [],
+          triggerVideoRefs: [],
     describeImage: async () => '',
     getGroupRoles: async () => ({ ...roleInfo, names: { ...roleInfo.names }, admins: [...roleInfo.admins] }),
     scopeType,

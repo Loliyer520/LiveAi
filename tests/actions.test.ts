@@ -36,15 +36,19 @@ test('safeFilename strips paths, control chars and dotfile prefixes', () => {
 // ── SSRF guard ──────────────────────────────────────────────────────────────
 
 test('isPrivateAddress classifies loopback/private/link-local', () => {
-  for (const ip of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.1.1', '169.254.1.1', '0.0.0.0', '224.0.0.1']) {
+  for (const ip of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.1.1', '169.254.1.1', '0.0.0.0', '224.0.0.1', '100.64.0.1', '198.18.0.1', '203.0.113.9']) {
     assert.equal(isPrivateAddress(ip, 4), true, ip);
   }
-  for (const ip of ['8.8.8.8', '172.32.0.1', '203.0.113.9']) {
+  for (const ip of ['8.8.8.8', '172.32.0.1', '1.1.1.1']) {
     assert.equal(isPrivateAddress(ip, 4), false, ip);
   }
   assert.equal(isPrivateAddress('::1', 6), true);
+  assert.equal(isPrivateAddress('0:0:0:0:0:0:0:1', 6), true);
   assert.equal(isPrivateAddress('fe80::1', 6), true);
+  assert.equal(isPrivateAddress('febf::1', 6), true);
   assert.equal(isPrivateAddress('fd12::1', 6), true);
+  assert.equal(isPrivateAddress('::ffff:127.0.0.1', 6), true);
+  assert.equal(isPrivateAddress('64:ff9b::7f00:1', 6), true);
   assert.equal(isPrivateAddress('2606:4700::1', 6), false);
 });
 
@@ -78,7 +82,13 @@ test('parseSearchHtml extracts results and unwraps uddg redirect links', () => {
 
 // ── zip / gzip extraction ───────────────────────────────────────────────────
 
-interface ZipEntrySpec { name: string; data: Buffer; method: 0 | 8 }
+interface ZipEntrySpec {
+  name: string;
+  data: Buffer;
+  method: 0 | 8;
+  /** 伪造中央目录里声明的解压大小（测 zip 炸弹的「谎报大小」路径）。 */
+  declaredSize?: number;
+}
 
 function buildZip(entries: ZipEntrySpec[]): Buffer {
   const chunks: Buffer[] = [];
@@ -86,12 +96,13 @@ function buildZip(entries: ZipEntrySpec[]): Buffer {
   for (const entry of entries) {
     const name = Buffer.from(entry.name, 'utf-8');
     const compressed = entry.method === 0 ? entry.data : deflateRawSync(entry.data);
+    const declared = entry.declaredSize ?? entry.data.length;
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0);
     local.writeUInt16LE(20, 4);
     local.writeUInt16LE(entry.method, 8);
     local.writeUInt32LE(compressed.length, 18);
-    local.writeUInt32LE(entry.data.length, 22);
+    local.writeUInt32LE(declared, 22);
     local.writeUInt16LE(name.length, 26);
     const offset = Buffer.concat(chunks).length;
     chunks.push(local, name, compressed);
@@ -102,7 +113,7 @@ function buildZip(entries: ZipEntrySpec[]): Buffer {
     central.writeUInt16LE(20, 6);
     central.writeUInt16LE(entry.method, 10);
     central.writeUInt32LE(compressed.length, 20);
-    central.writeUInt32LE(entry.data.length, 24);
+    central.writeUInt32LE(declared, 24);
     central.writeUInt16LE(name.length, 28);
     central.writeUInt32LE(offset, 42);
     centrals.push(Buffer.concat([central, name]));
@@ -155,6 +166,27 @@ test('extractGzip writes the decompressed payload', async () => {
   }
 });
 
+test('extractZip aborts a bomb that lies about its uncompressed size', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'liveai-zip-bomb-'));
+  try {
+    // 65MB 零压缩后只有几十 KB；中央目录谎报 1KB，靠 maxOutputLength 在展开中途拒绝。
+    const bomb = buildZip([{ name: 'bomb.bin', data: Buffer.alloc(65 * 1024 * 1024), method: 8, declaredSize: 1024 }]);
+    await assert.rejects(() => extractZip(bomb, dir));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('extractGzip refuses a decompression bomb before expanding it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'liveai-gz-bomb-'));
+  try {
+    const bomb = gzipSync(Buffer.alloc(65 * 1024 * 1024));
+    await assert.rejects(() => extractGzip(bomb, join(dir, 'out.txt')));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 // ── action tools over a fake bot ────────────────────────────────────────────
 
 async function makeActionContext() {
@@ -183,6 +215,7 @@ async function makeActionContext() {
     workspace: new Workspace(join(dir, 'workspace')),
     networkBudget: { used: 0 },
     triggerImageRefs: [],
+          triggerVideoRefs: [],
     describeImage: async () => '',
     scopeType: 'private',
     scopeId: '123',

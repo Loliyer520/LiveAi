@@ -238,6 +238,7 @@ function toolContext(graph: RelationGraph, isMaster = false): ToolContext {
     sendToScope: async () => 'ok',
     peerInject: () => undefined,
     triggerImageRefs: [],
+          triggerVideoRefs: [],
     describeImage: async () => '',
     scopeType: 'group',
     scopeId: '1',

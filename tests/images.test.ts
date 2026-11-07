@@ -15,6 +15,8 @@ import { TaskScheduler } from '../src/chat/scheduler.js';
 import type { ChatMessage } from '../src/chat/types.js';
 import type { NapcatBot } from '../src/bot/napcat.js';
 import { Workspace } from '../src/chat/workspace.js';
+import { configureImageCache, ensureImageCached } from '../src/chat/image-cache.js';
+import { setDnsResolverForTests } from '../src/chat/net.js';
 
 function message(rawMessage: string, rawData: Record<string, unknown> = {}): ChatMessage {
   return {
@@ -81,22 +83,37 @@ interface ToolHarness {
   context: ToolContext;
   described: { url: string; question: string }[];
   sentImages: { targetId: number; file: string }[];
+  getImageCalls: string[];
   cleanup: () => Promise<void>;
 }
 
 async function makeToolHarness(options: {
   triggerImageRefs?: string[];
-  historyEntry?: { message_ref: string; image_refs: string[] };
+  triggerVideoRefs?: string[];
+  historyEntry?: { message_ref: string; image_refs: string[]; raw_message?: string };
+  otherHistoryEntry?: { message_ref: string; image_refs: string[]; raw_message?: string };
+  napcatImageFile?: string;
+  sendImageFailures?: number;
   isMaster?: boolean;
 } = {}): Promise<ToolHarness> {
   const dir = await mkdtemp(join(tmpdir(), 'liveai-images-'));
   const described: { url: string; question: string }[] = [];
   const sentImages: { targetId: number; file: string }[] = [];
+  const getImageCalls: string[] = [];
+  let sendImageFailures = options.sendImageFailures ?? 0;
   const appended: Record<string, unknown>[] = [];
 
   const fakeBot = {
     selfId: 999,
+    async getImage(file: string) {
+      getImageCalls.push(file);
+      return { file: options.napcatImageFile ?? '' };
+    },
     async sendImage(_chatType: string, targetId: number, file: string) {
+      if (sendImageFailures > 0) {
+        sendImageFailures -= 1;
+        throw new Error('temporary NapCat failure');
+      }
       sentImages.push({ targetId, file });
       return { message_id: 4242 };
     },
@@ -111,10 +128,20 @@ async function makeToolHarness(options: {
     },
     recentNotes: () => [],
     addNote: () => {},
-    findEntryByRef: (_t: string, _i: string, ref: string) =>
-      options.historyEntry && ref === options.historyEntry.message_ref
-        ? options.historyEntry
-        : null,
+    recentImageRefs: (_t: string, _i: string, limit: number) =>
+      options.historyEntry && limit > 0
+        ? [
+            { ref: options.historyEntry.message_ref, ageMinutes: 1 },
+            ...(options.otherHistoryEntry && limit > 1
+              ? [{ ref: options.otherHistoryEntry.message_ref, ageMinutes: 2 }]
+              : []),
+          ]
+        : [],
+    findEntryByRef: (_t: string, _i: string, ref: string) => {
+      if (options.historyEntry && ref === options.historyEntry.message_ref) return options.historyEntry;
+      if (options.otherHistoryEntry && ref === options.otherHistoryEntry.message_ref) return options.otherHistoryEntry;
+      return null;
+    },
     lastAppended: appended,
   };
 
@@ -132,6 +159,7 @@ async function makeToolHarness(options: {
       sendToScope: async () => 'ok',
       peerInject: () => undefined,
       triggerImageRefs: options.triggerImageRefs ?? [],
+          triggerVideoRefs: options.triggerVideoRefs ?? [],
       describeImage: async (url, question) => {
         described.push({ url, question });
         return `描述结果：${url} 是一只猫`;
@@ -144,6 +172,7 @@ async function makeToolHarness(options: {
     },
     described,
     sentImages,
+    getImageCalls,
     cleanup: async () => rm(dir, { recursive: true, force: true }),
   };
 }
@@ -214,6 +243,24 @@ test('view_image without any image explains what to do', async () => {
   }
 });
 
+test('view_image_raw reports failure instead of claiming an unavailable image was shown', async () => {
+  const harness = await makeToolHarness({ triggerImageRefs: ['https://img.example.com/missing.png'] });
+  const originalFetch = globalThis.fetch;
+  configureImageCache('');
+  setDnsResolverForTests(async () => [{ address: '93.184.216.34', family: 4 }]);
+  globalThis.fetch = (async () => { throw new Error('expired URL'); }) as typeof fetch;
+  try {
+    const result = await executeChatTool({ name: 'view_image_raw', arguments: {} }, harness.context);
+    assert.equal(result.ok, false);
+    assert.ok(result.output.includes('没有把图片呈现给你'));
+    assert.equal(result.inlineImageUrls, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+    setDnsResolverForTests(null);
+    await harness.cleanup();
+  }
+});
+
 // ── send_image ──────────────────────────────────────────────────────────────
 
 test('send_image passes the file through to the bot and persists an entry', async () => {
@@ -233,6 +280,221 @@ test('send_image passes the file through to the bot and persists an entry', asyn
     );
     assert.equal(rejected.ok, false);
     assert.equal(harness.sentImages.length, 1, 'invalid file never reaches the bot');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('send_image without file returns the current or latest historical image', async () => {
+  const current = await makeToolHarness({ triggerImageRefs: ['https://a.cn/current.jpg'] });
+  const historical = await makeToolHarness({
+    historyEntry: { message_ref: 'A1B2', image_refs: ['https://a.cn/old-1.jpg', 'https://a.cn/old-2.jpg'] },
+  });
+  try {
+    const currentResult = await executeChatTool({ name: 'send_image', arguments: {} }, current.context);
+    assert.equal(currentResult.ok, true);
+    assert.deepEqual(current.sentImages, [{ targetId: 777, file: 'https://a.cn/current.jpg' }]);
+
+    // 「再发给我」通常是没有图片的新回合，应自动回看最近带图消息。
+    const latestResult = await executeChatTool({ name: 'send_image', arguments: {} }, historical.context);
+    assert.equal(latestResult.ok, true);
+    assert.deepEqual(historical.sentImages, [{ targetId: 777, file: 'https://a.cn/old-1.jpg' }]);
+
+    const selectedResult = await executeChatTool(
+      { name: 'send_image', arguments: { message_ref: '[#A1B2]', index: 2 } },
+      historical.context,
+    );
+    assert.equal(selectedResult.ok, true);
+    assert.equal(historical.sentImages[1].file, 'https://a.cn/old-2.jpg');
+  } finally {
+    await current.cleanup();
+    await historical.cleanup();
+  }
+});
+
+test('send_image prefers an explicit current-turn image even with multiple historical candidates', async () => {
+  const harness = await makeToolHarness({
+    triggerImageRefs: ['https://a.cn/current.jpg'],
+    historyEntry: { message_ref: 'ZX42', image_refs: ['https://a.cn/background.jpg'] },
+    otherHistoryEntry: { message_ref: 'PTSR', image_refs: ['https://a.cn/blue-maid.jpg'] },
+  });
+  try {
+    const result = await executeChatTool({ name: 'send_image', arguments: {} }, harness.context);
+    assert.equal(result.ok, true);
+    assert.ok(result.output.includes('本轮消息'));
+    assert.deepEqual(harness.sentImages, [{ targetId: 777, file: 'https://a.cn/current.jpg' }]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('send_image allows retry after failure, then blocks only a successful duplicate', async () => {
+  const harness = await makeToolHarness({ sendImageFailures: 1 });
+  try {
+    const call = { name: 'send_image', arguments: { file: 'https://a.cn/retry.jpg' } };
+    const failed = await executeChatTool(call, harness.context);
+    assert.equal(failed.ok, false);
+    const retried = await executeChatTool(call, harness.context);
+    assert.equal(retried.ok, true, 'a failed send must not be recorded as delivered');
+    const duplicate = await executeChatTool(call, harness.context);
+    assert.equal(duplicate.ok, false);
+    assert.ok(duplicate.output.includes('已经'));
+    assert.equal(harness.sentImages.length, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('send_image NapCat fallback matches the file ID by URL for multi-image messages', async () => {
+  const harness = await makeToolHarness({
+    historyEntry: {
+      message_ref: 'MULT',
+      image_refs: ['https://a.cn/first.jpg', 'https://a.cn/second.jpg'],
+      raw_message: '[CQ:image,file=first-id.jpg,url=https://a.cn/first.jpg][CQ:image,file=second-id.jpg,url=https://a.cn/second.jpg]',
+    },
+    napcatImageFile: '/napcat/cache/second.jpg',
+  });
+  try {
+    configureImageCache('');
+    const result = await executeChatTool(
+      { name: 'send_image', arguments: { message_ref: 'MULT', index: 2 } },
+      harness.context,
+    );
+    assert.equal(result.ok, true);
+    assert.deepEqual(harness.getImageCalls, ['second-id.jpg']);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('send_image refuses ambiguous no-arg selection and sends the explicitly referenced image', async () => {
+  const harness = await makeToolHarness({
+    historyEntry: { message_ref: 'ZX42', image_refs: ['https://a.cn/background.jpg'] },
+    otherHistoryEntry: { message_ref: 'PTSR', image_refs: ['https://a.cn/blue-maid.jpg'] },
+  });
+  try {
+    const ambiguous = await executeChatTool({ name: 'send_image', arguments: {} }, harness.context);
+    assert.equal(ambiguous.ok, false);
+    assert.ok(ambiguous.output.includes('ZX42'));
+    assert.ok(ambiguous.output.includes('PTSR'));
+    assert.equal(harness.sentImages.length, 0, 'ambiguous selection must not silently return the latest image');
+
+    const selected = await executeChatTool(
+      { name: 'send_image', arguments: { message_ref: '#PTSR' } },
+      harness.context,
+    );
+    assert.equal(selected.ok, true);
+    assert.deepEqual(harness.sentImages, [{ targetId: 777, file: 'https://a.cn/blue-maid.jpg' }]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('send_image falls back to the NapCat file id when an old URL and cache are unavailable', async () => {
+  const harness = await makeToolHarness({
+    historyEntry: {
+      message_ref: 'A1B2',
+      image_refs: ['https://multimedia.nt.qq.com.cn/expired'],
+      raw_message: '[CQ:image,file=77A4F54C8D6F9EDCA870BEC7F6158DA2.png,url=https://multimedia.nt.qq.com.cn/expired]',
+    },
+    napcatImageFile: '/napcat/cache/original.png',
+  });
+  try {
+    configureImageCache('');
+    const result = await executeChatTool({ name: 'send_image', arguments: {} }, harness.context);
+    assert.equal(result.ok, true);
+    assert.deepEqual(harness.getImageCalls, ['77A4F54C8D6F9EDCA870BEC7F6158DA2.png']);
+    assert.deepEqual(harness.sentImages, [{ targetId: 777, file: 'file:///napcat/cache/original.png' }]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('send_image without file or any available image fails honestly', async () => {
+  const harness = await makeToolHarness();
+  try {
+    const result = await executeChatTool({ name: 'send_image', arguments: {} }, harness.context);
+    assert.equal(result.ok, false);
+    assert.ok(result.output.includes('没有图片'));
+    assert.equal(harness.sentImages.length, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('send_image sends cached inbound bytes instead of making NapCat download the QQ URL again', async () => {
+  const harness = await makeToolHarness();
+  const cacheDir = await mkdtemp(join(tmpdir(), 'liveai-send-cache-'));
+  const originalFetch = globalThis.fetch;
+  const url = 'https://img.example.com/original.png';
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
+    'base64',
+  );
+  configureImageCache(cacheDir);
+  setDnsResolverForTests(async () => [{ address: '93.184.216.34', family: 4 }]);
+  globalThis.fetch = (async () => new Response(png, {
+    status: 200,
+    headers: { 'content-type': 'image/png' },
+  })) as typeof fetch;
+  try {
+    assert.equal(await ensureImageCached(url), true);
+    globalThis.fetch = (async () => {
+      throw new Error('send_image must not download the cached URL again');
+    }) as typeof fetch;
+    const result = await executeChatTool(
+      { name: 'send_image', arguments: { file: url } },
+      harness.context,
+    );
+    assert.equal(result.ok, true);
+    assert.equal(harness.sentImages.length, 1);
+    assert.ok(harness.sentImages[0].file.startsWith('base64://'));
+    assert.equal(
+      Buffer.from(harness.sentImages[0].file.slice('base64://'.length), 'base64').equals(png),
+      true,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    setDnsResolverForTests(null);
+    configureImageCache('');
+    await rm(cacheDir, { recursive: true, force: true });
+    await harness.cleanup();
+  }
+});
+
+// ── task tools ──────────────────────────────────────────────────────────────
+
+test('schedule_image rejects the exact 24h boundary that would outlive its cache', async () => {
+  const harness = await makeToolHarness({ triggerImageRefs: ['https://a.cn/current.jpg'] });
+  try {
+    const result = await executeChatTool(
+      { name: 'schedule_image', arguments: { at: '+1d' } },
+      harness.context,
+    );
+    assert.equal(result.ok, false);
+    assert.ok(result.output.includes('23 小时 59 分钟'));
+    assert.equal(harness.context.tasks.list().length, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('image tools fail cleanly in virtual scopes instead of sending to NaN', async () => {
+  const harness = await makeToolHarness();
+  harness.context.scopeType = 'domain';
+  harness.context.scopeId = 'mc';
+  try {
+    const sent = await executeChatTool(
+      { name: 'send_image', arguments: { file: 'https://a.cn/image.jpg' } },
+      harness.context,
+    );
+    const scheduled = await executeChatTool(
+      { name: 'schedule_image', arguments: { at: '+10m' } },
+      harness.context,
+    );
+    assert.equal(sent.ok, false);
+    assert.equal(scheduled.ok, false);
+    assert.equal(harness.sentImages.length, 0);
   } finally {
     await harness.cleanup();
   }
@@ -337,7 +599,7 @@ test('child cannot cancel another scope\'s task; master can', async () => {
 test('tool schemas include the image + task tools for both roles', () => {
   for (const isMaster of [false, true]) {
     const names = chatToolSchemas('private:123456789', isMaster).map((schema) => schema.name);
-    for (const expected of ['view_image', 'send_image', 'create_task', 'list_tasks', 'cancel_task']) {
+    for (const expected of ['view_image', 'send_image', 'schedule_image', 'create_task', 'list_tasks', 'cancel_task']) {
       assert.ok(names.includes(expected), `${expected} present (isMaster=${isMaster})`);
     }
   }
