@@ -1,96 +1,51 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { TurnCheckpointStore } from '../src/store/checkpoint.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { HistoryEntry, ModelMessage } from '../src/chat/types.js';
+import { TurnCheckpointStore, type TurnCheckpoint } from '../src/store/checkpoint.js';
 
-test('TurnCheckpointStore: writes and reads checkpoint', async () => {
+function sample(scopeKey: string, at: number): TurnCheckpoint {
+  const [scopeType, scopeId] = scopeKey.split(':');
+  return { scopeKey, scopeType, scopeId, at, executedTools: ['send_message', 'memory_write'], toolRound: 1, triggerPreview: 'hi' };
+}
+
+test('TurnCheckpointStore writes, reads and removes per scope', () => {
   const dir = mkdtempSync(join(tmpdir(), 'checkpoint-'));
-  const store = new TurnCheckpointStore(dir);
-
-  const checkpoint = {
-    scopeKey: 'group:123',
-    at: Date.now(),
-    historyBeforeTrigger: [
-      { message_id: 1, user_id: 100, text: 'hello', timestamp: Date.now() / 1000 } as HistoryEntry,
-    ] as HistoryEntry[],
-    extension: [
-      { role: 'assistant' as const, content: 'I understand' },
-      { role: 'user' as const, content: 'thanks' },
-    ] as ModelMessage[],
-    executedTools: ['send_message', 'memory_write'],
-    toolRound: 2,
-  };
-
-  await store.write(checkpoint);
-  const read = await store.read('group:123');
-
-  assert.ok(read !== null);
-  assert.equal(read.scopeKey, 'group:123');
-  assert.equal(read.toolRound, 2);
-  assert.deepEqual(read.executedTools, ['send_message', 'memory_write']);
-  assert.equal(read.extension.length, 2);
-
-  rmSync(dir, { recursive: true });
+  try {
+    const store = new TurnCheckpointStore(join(dir, 'cp'));
+    assert.equal(store.read('group:1'), null, 'missing dir/file reads as null');
+    store.write(sample('group:1', Date.now()));
+    assert.deepEqual(store.read('group:1')?.executedTools, ['send_message', 'memory_write']);
+    store.remove('group:1');
+    assert.equal(store.read('group:1'), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-test('TurnCheckpointStore: returns null for missing checkpoint', async () => {
+test('TurnCheckpointStore.takeAll returns recent checkpoints, drops stale/corrupt, empties the dir', () => {
   const dir = mkdtempSync(join(tmpdir(), 'checkpoint-'));
-  const store = new TurnCheckpointStore(dir);
-
-  const read = await store.read('nonexistent:999');
-  assert.equal(read, null);
-
-  rmSync(dir, { recursive: true });
+  try {
+    const now = 10 * 24 * 60 * 60 * 1000;
+    const store = new TurnCheckpointStore(join(dir, 'cp'), () => now);
+    store.write(sample('group:1', now - 1000));
+    store.write(sample('private:2', now - 2 * 24 * 60 * 60 * 1000)); // too old
+    writeFileSync(join(dir, 'cp', 'broken.json'), '{not json', 'utf8');
+    const recovered = store.takeAll();
+    assert.deepEqual(recovered.map((c) => c.scopeKey), ['group:1']);
+    assert.deepEqual(store.takeAll(), [], 'everything consumed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-test('TurnCheckpointStore: removes checkpoint', async () => {
+test('TurnCheckpointStore.takeAll tolerates a missing directory', () => {
   const dir = mkdtempSync(join(tmpdir(), 'checkpoint-'));
-  const store = new TurnCheckpointStore(dir);
-
-  const checkpoint = {
-    scopeKey: 'private:456',
-    at: Date.now(),
-    historyBeforeTrigger: [] as HistoryEntry[],
-    extension: [] as ModelMessage[],
-    executedTools: [],
-    toolRound: 0,
-  };
-
-  await store.write(checkpoint);
-  let read = await store.read('private:456');
-  assert.ok(read !== null);
-
-  await store.remove('private:456');
-  read = await store.read('private:456');
-  assert.equal(read, null);
-
-  rmSync(dir, { recursive: true });
-});
-
-test('TurnCheckpointStore: prunes stale checkpoints', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'checkpoint-'));
-  const store = new TurnCheckpointStore(dir);
-
-  // Write an old checkpoint (pretend it's from 15 minutes ago)
-  const oldTime = Date.now() - 15 * 60 * 1000;
-  const checkpoint = {
-    scopeKey: 'group:789',
-    at: oldTime,
-    historyBeforeTrigger: [] as HistoryEntry[],
-    extension: [] as ModelMessage[],
-    executedTools: [],
-    toolRound: 0,
-  };
-
-  await store.write(checkpoint);
-  await store.pruneStale();
-
-  // After pruning, old checkpoint should be gone
-  const read = await store.read('group:789');
-  assert.equal(read, null);
-
-  rmSync(dir, { recursive: true });
+  try {
+    mkdirSync(join(dir, 'other'));
+    assert.deepEqual(new TurnCheckpointStore(join(dir, 'cp')).takeAll(), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

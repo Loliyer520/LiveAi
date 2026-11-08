@@ -1,124 +1,105 @@
 /**
- * Turn checkpoint: persists in-progress turn state to disk so crash recovery
- * can resume with tool results and history intact. Checkpoint files are keyed
- * by scope and auto-pruned on successful turn completion.
+ * Turn checkpoints — evidence of in-flight turns for hard-crash recovery.
+ *
+ * The orchestrator's crash guard (persistInterruptNote) only runs when a turn
+ * throws. If the process itself dies mid-turn (kill, OOM, power loss) the
+ * catch never runs, and the next turn has no idea which side effects already
+ * happened — so it may resend or redo them. Each tool round therefore writes
+ * a tiny per-scope checkpoint; a normal turn end deletes it. Whatever survives
+ * to the next boot belongs to a turn that died, and is turned into an
+ * interrupt note before any new turn starts.
+ *
+ * Writes are synchronous on purpose: they are a few hundred bytes, and an
+ * async write racing the end-of-turn delete could resurrect a finished turn.
  */
 
-import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { HistoryEntry, ModelMessage } from '../chat/types.js';
 
 export interface TurnCheckpoint {
   scopeKey: string;
-  /** Timestamp when this checkpoint was written. */
+  scopeType: string;
+  scopeId: string;
+  /** Epoch ms of the latest write. */
   at: number;
-  /** History entries accumulated before this turn started. */
-  historyBeforeTrigger: HistoryEntry[];
-  /** Tool round extension (assistant + tool_result messages). */
-  extension: ModelMessage[];
-  /** Executed tools log (for crash-recovery note). */
+  /** Tools that really executed before the crash (side-effect inventory). */
   executedTools: string[];
-  /** Last tool round number. */
   toolRound: number;
+  triggerPreview: string;
 }
 
-export class TurnCheckpointStore {
-  constructor(private readonly checkpointDir: string) {
-    if (!existsSync(checkpointDir)) {
-      try {
-        mkdirSync(checkpointDir, { recursive: true });
-      } catch (error) {
-        console.warn(`[checkpoint] failed to create dir ${checkpointDir}:`, error);
-      }
-    }
-  }
+/** Older leftovers are noise, not evidence (e.g. a data dir copied around). */
+const MAX_RECOVER_AGE_MS = 24 * 60 * 60 * 1000;
 
-  /**
-   * Writes a checkpoint for the given scope. Overwrites any existing checkpoint
-   * for that scope (only the latest matters).
-   */
-  async write(checkpoint: TurnCheckpoint): Promise<void> {
-    const filename = this.filenameFor(checkpoint.scopeKey);
-    const path = join(this.checkpointDir, filename);
+export class TurnCheckpointStore {
+  constructor(
+    private readonly dir: string,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  write(checkpoint: TurnCheckpoint): void {
     try {
-      await writeFile(path, JSON.stringify(checkpoint, null, 2), 'utf8');
+      if (!existsSync(this.dir)) mkdirSync(this.dir, { recursive: true });
+      writeFileSync(this.pathFor(checkpoint.scopeKey), JSON.stringify(checkpoint), 'utf8');
     } catch (error) {
       console.warn(`[checkpoint] write failed scope=${checkpoint.scopeKey}:`, error);
     }
   }
 
-  /**
-   * Reads the checkpoint for a scope, if one exists. Returns null if none found
-   * or if the checkpoint is stale (older than 10 minutes, which means the process
-   * hung or the checkpoint is a leftover from a much older crash).
-   */
-  async read(scopeKey: string): Promise<TurnCheckpoint | null> {
-    const filename = this.filenameFor(scopeKey);
-    const path = join(this.checkpointDir, filename);
+  read(scopeKey: string): TurnCheckpoint | null {
+    return parseCheckpoint(this.pathFor(scopeKey));
+  }
+
+  remove(scopeKey: string): void {
     try {
-      const text = await readFile(path, 'utf8');
-      const checkpoint = JSON.parse(text) as TurnCheckpoint;
-      const age = Date.now() - checkpoint.at;
-      const MAX_AGE_MS = 10 * 60 * 1000; // 10 minutes
-      if (age > MAX_AGE_MS) {
-        console.warn(`[checkpoint] stale checkpoint scope=${scopeKey} age=${Math.round(age / 1000)}s, ignoring`);
-        await this.remove(scopeKey); // Clean up
-        return null;
-      }
-      return checkpoint;
+      rmSync(this.pathFor(scopeKey), { force: true });
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        console.warn(`[checkpoint] read failed scope=${scopeKey}:`, error);
-      }
-      return null;
+      console.warn(`[checkpoint] remove failed scope=${scopeKey}:`, error);
     }
   }
 
-  /**
-   * Removes the checkpoint for a scope (called on successful turn completion).
-   */
-  async remove(scopeKey: string): Promise<void> {
-    const filename = this.filenameFor(scopeKey);
-    const path = join(this.checkpointDir, filename);
+  /** Reads and deletes every checkpoint; returns the recent, well-formed ones. */
+  takeAll(): TurnCheckpoint[] {
+    let files: string[];
     try {
-      await rm(path, { force: true });
-    } catch (error) {
-      // Ignore ENOENT
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        console.warn(`[checkpoint] remove failed scope=${scopeKey}:`, error);
-      }
+      files = readdirSync(this.dir).filter((file) => file.endsWith('.json'));
+    } catch {
+      return []; // no dir yet = nothing ever crashed
     }
+    const recovered: TurnCheckpoint[] = [];
+    for (const file of files) {
+      const path = join(this.dir, file);
+      const checkpoint = parseCheckpoint(path);
+      try {
+        rmSync(path, { force: true });
+      } catch {
+        // best-effort
+      }
+      if (checkpoint !== null && this.now() - checkpoint.at <= MAX_RECOVER_AGE_MS) recovered.push(checkpoint);
+    }
+    return recovered;
   }
 
-  /**
-   * Prunes all checkpoints older than 10 minutes (leftover from long-dead processes).
-   */
-  async pruneStale(): Promise<void> {
-    try {
-      const files = await readdir(this.checkpointDir);
-      const now = Date.now();
-      const MAX_AGE_MS = 10 * 60 * 1000;
-      for (const file of files) {
-        if (!file.endsWith('.json')) continue;
-        const path = join(this.checkpointDir, file);
-        try {
-          const text = await readFile(path, 'utf8');
-          const checkpoint = JSON.parse(text) as TurnCheckpoint;
-          if (now - checkpoint.at > MAX_AGE_MS) {
-            await rm(path, { force: true });
-          }
-        } catch {
-          // Ignore read/parse errors
-        }
-      }
-    } catch (error) {
-      console.warn('[checkpoint] pruneStale failed:', error);
-    }
+  private pathFor(scopeKey: string): string {
+    return join(this.dir, `${encodeURIComponent(scopeKey)}.json`);
   }
+}
 
-  private filenameFor(scopeKey: string): string {
-    // Sanitize scope key for filesystem (replace : with _)
-    return `${scopeKey.replace(/:/g, '_')}.json`;
+function parseCheckpoint(path: string): TurnCheckpoint | null {
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as Partial<TurnCheckpoint>;
+    if (typeof raw.scopeKey !== 'string' || typeof raw.scopeType !== 'string' || typeof raw.scopeId !== 'string') return null;
+    if (typeof raw.at !== 'number' || !Array.isArray(raw.executedTools)) return null;
+    return {
+      scopeKey: raw.scopeKey,
+      scopeType: raw.scopeType,
+      scopeId: raw.scopeId,
+      at: raw.at,
+      executedTools: raw.executedTools.map(String),
+      toolRound: Number(raw.toolRound ?? 0),
+      triggerPreview: String(raw.triggerPreview ?? ''),
+    };
+  } catch {
+    return null;
   }
 }

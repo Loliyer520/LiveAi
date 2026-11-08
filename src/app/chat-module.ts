@@ -21,7 +21,48 @@ import { PromptStore } from '../prompt/store.js';
 import { ModelManager } from '../models/manager.js';
 import { AiOrchestrator } from '../chat/orchestrator.js';
 import { NovelCommandHandler } from '../chat/novel-cmd.js';
-import { initPluginRegistry } from '../chat/plugins.js';
+import { initPluginRegistry, pluginRegistry, type PluginEventName, type PluginEventPayload } from '../chat/plugins.js';
+import type { ChatMessage } from '../chat/types.js';
+
+/** 插件事件钩子分发（fire-and-forget：钩子失败只打日志，绝不影响主链路）。 */
+function emitPluginEvent(event: PluginEventName, payload: PluginEventPayload): void {
+  try {
+    pluginRegistry()?.emit(event, payload);
+  } catch (error) {
+    console.warn(`[plugins] emit ${event} failed:`, error);
+  }
+}
+
+function emitPluginMessageEvent(event: 'group_message' | 'private_message', message: ChatMessage): void {
+  const payload: PluginEventPayload = {
+    scopeType: message.chatType,
+    scopeId: String(message.chatId),
+    userId: message.userId,
+    nickname: String(message.sender?.card || message.sender?.nickname || ''),
+    text: message.text,
+    messageId: message.messageId === null || message.messageId === undefined ? null : String(message.messageId),
+    mentionsSelf: message.mentionsSelf,
+    timestamp: message.timestamp,
+  };
+  emitPluginEvent(event, payload);
+  emitPluginEvent('message', payload);
+}
+
+function requestEventPayload(event: Record<string, unknown>): PluginEventPayload {
+  const pick = (key: string): string | number | null => {
+    const value = event[key];
+    return typeof value === 'string' || typeof value === 'number' ? value : null;
+  };
+  return {
+    requestType: pick('request_type'),
+    subType: pick('sub_type'),
+    userId: pick('user_id'),
+    groupId: pick('group_id'),
+    comment: pick('comment'),
+    scopeType: event.group_id !== undefined ? 'group' : 'private',
+    scopeId: String(event.group_id ?? event.user_id ?? ''),
+  };
+}
 import { loadDomains } from '../chat/domains.js';
 import { configureMcBot, configureStickers, configureTts } from '../chat/tools.js';
 import { configureMediaSpool } from '../chat/media-spool.js';
@@ -105,15 +146,34 @@ export class ChatModule implements LiveAiModule {
       reconnectBaseMs: config.napcat.reconnectBaseMs,
       reconnectMaxMs: config.napcat.reconnectMaxMs,
       watchdog: this.bridgeWatchdog ?? undefined,
-      reverseWsPort: this.reverseMode ? config.napcat.reverseWsPort : undefined,      handlers: {
-        onGroupMessage: (message) => this.orchestrator.handleMessage(message),
-        onPrivateMessage: (message) => this.orchestrator.handleMessage(message),
+      reverseWsPort: this.reverseMode ? config.napcat.reverseWsPort : undefined,
+      handlers: {
+        onGroupMessage: (message) => {
+          emitPluginMessageEvent('group_message', message);
+          this.orchestrator.handleMessage(message);
+        },
+        onPrivateMessage: (message) => {
+          emitPluginMessageEvent('private_message', message);
+          this.orchestrator.handleMessage(message);
+        },
         onSelfMessage: (message) => this.orchestrator.handleSelfMessage(message),
         onDatalineMessage: (message) => this.orchestrator.handleDatalineMessage(message),
-        onFriendRequest: (event) => this.orchestrator.handleQqRequestEvent(event),
-        onGroupRequest: (event) => this.orchestrator.handleQqRequestEvent(event),
-        onConnected: () => console.info(`[napcat] websocket connected (${this.bot.selfId || 'self_id 待学习'})`),
-        onDisconnected: (reason) => console.info(`[napcat] websocket disconnected: ${reason}, reconnecting…`),
+        onFriendRequest: (event) => {
+          emitPluginEvent('friend_request', requestEventPayload(event));
+          this.orchestrator.handleQqRequestEvent(event);
+        },
+        onGroupRequest: (event) => {
+          emitPluginEvent('group_request', requestEventPayload(event));
+          this.orchestrator.handleQqRequestEvent(event);
+        },
+        onConnected: () => {
+          console.info(`[napcat] websocket connected (${this.bot.selfId || 'self_id 待学习'})`);
+          emitPluginEvent('connected', { self_id: this.bot.selfId });
+        },
+        onDisconnected: (reason) => {
+          console.info(`[napcat] websocket disconnected: ${reason}, reconnecting…`);
+          emitPluginEvent('disconnected', { reason });
+        },
       },
     });
     this.orchestrator = new AiOrchestrator({

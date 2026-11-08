@@ -7,7 +7,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AiOrchestrator } from '../src/chat/orchestrator.js';
@@ -71,8 +72,14 @@ function anthropicResponse(script: ScriptedReply): Record<string, unknown> {
   };
 }
 
-async function makeHarness(replies: ScriptedReply[], onFirstModelCall?: () => void): Promise<Harness> {
+async function makeHarness(
+  replies: ScriptedReply[],
+  onFirstModelCall?: () => void,
+  /** Runs against the temp dir before the orchestrator starts (seed state). */
+  beforeStart?: (dir: string) => Promise<void>,
+): Promise<Harness> {
   const dir = await mkdtemp(join(tmpdir(), 'liveai-test-'));
+  await beforeStart?.(dir);
   const stateDir = join(dir, 'state');
   configureImageCache(join(stateDir, 'imgcache'));
   const modelsJson = join(dir, 'models_config.json');
@@ -456,6 +463,57 @@ test('crash guard: failed model call persists an interrupt note', async () => { 
     assert.ok(note !== undefined, 'interrupt note persisted');
   } finally {
     globalThis.fetch = originalFetch;
+    await harness.cleanup();
+  }
+});
+
+test('crash recovery: a checkpoint left by a dead process becomes an interrupt note on boot', async () => {
+  const harness = await makeHarness([{ tool: 'stay_silent', input: {} }], undefined, async (dir) => {
+    await mkdir(join(dir, '.checkpoint'), { recursive: true });
+    await writeFile(join(dir, '.checkpoint', `${encodeURIComponent('private:131')}.json`), JSON.stringify({
+      scopeKey: 'private:131', scopeType: 'private', scopeId: '131', at: Date.now(),
+      executedTools: ['send_message'], toolRound: 0, triggerPreview: '在吗',
+    }), 'utf-8');
+  });
+  try {
+    const history = harness.repo.getMessages('private', '131');
+    const note = history.find((entry) => String(entry.text).includes('上轮 AI 处理异常中断'));
+    assert.ok(note !== undefined, 'interrupt note written at start()');
+    assert.ok(String(note.text).includes('send_message'), 'note lists the side effects that happened');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('checkpoint is cleared when a turn completes normally', async () => {
+  let checkpointDir = '';
+  const harness = await makeHarness([
+    { tool: 'send_message', input: { content: '收到' } },
+    { tool: 'stay_silent', input: {} },
+  ], undefined, async (dir) => {
+    checkpointDir = join(dir, '.checkpoint');
+  });
+  try {
+    harness.orchestrator.handleMessage(makeMessage(132, '在吗', 100, 41));
+    await waitFor(() => harness.modelRequests.length >= 2);
+    await waitFor(() => !existsSync(checkpointDir) || readdirSync(checkpointDir).length === 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('send ledger: identical send_message within TTL is refused, not double-sent', async () => {
+  const harness = await makeHarness([
+    { tool: 'send_message', input: { content: '同一句话' } },
+    { tool: 'send_message', input: { content: '同一句话' } },
+    { tool: 'stay_silent', input: {} },
+  ]);
+  try {
+    harness.orchestrator.handleMessage(makeMessage(133, '在吗', 100, 51));
+    await waitFor(() => harness.modelRequests.length >= 3);
+    assert.deepEqual(harness.sent.map((entry) => entry.text), ['同一句话']);
+    assert.ok(JSON.stringify(harness.modelRequests).includes('系统拦截了本次重复发送'));
+  } finally {
     await harness.cleanup();
   }
 });

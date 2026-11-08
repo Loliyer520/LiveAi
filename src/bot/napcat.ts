@@ -13,7 +13,6 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import type { ChatMessage } from '../chat/types.js';
 import type { BridgeWatchdog } from './bridge-watchdog.js';
 import { WsServer, type WsServerConnection } from './ws-server.js';
-import { IdempotencyLedger } from './idempotency.js';
 
 export interface NapcatHandlers {
   onGroupMessage?: (message: ChatMessage) => void;
@@ -73,8 +72,6 @@ export class NapcatBot {
   private pendingSelfSent = new Map<string, PendingSelfSent>();
   private recentSelfSentIds = new Map<string, number>();
   private readonly pendingRequestEvents = new Map<string, { event: Record<string, unknown>; receivedAt: number }>();
-  /** Idempotency ledger: prevents duplicate sends during crash recovery / retries. */
-  private readonly idempotency = new IdempotencyLedger();
   // 反向 WS 模式：NapCat 主动连进来的那条连接 + 在途动作的 echo 匹配表。
   private wsServer: WsServer | null = null;
   private reverseConn: WsServerConnection | null = null;
@@ -779,36 +776,26 @@ export class NapcatBot {
   }
 
   async sendReplyText(message: ChatMessage, content: string): Promise<Record<string, unknown>> {
-    const chatType = message.chatType as 'group' | 'private';
-    const targetId = Number(message.chatId);
-    // Idempotency: skip if we sent this exact message recently (crash recovery / retry)
-    if (this.idempotency.isDuplicate(chatType, targetId, 'text', content)) {
-      return { message_id: -1 }; // Sentinel: suppressed duplicate
-    }
     const segments: Record<string, unknown>[] = [];
     if (message.messageId !== null && message.messageId !== undefined) {
       segments.push({ type: 'reply', data: { id: String(message.messageId) } });
     }
     segments.push({ type: 'text', data: { text: content } });
-    this.markPendingSelfSent(chatType, targetId, content);
+    this.markPendingSelfSent(message.chatType as 'group' | 'private', Number(message.chatId), content);
     const action = message.chatType === 'group' ? 'send_group_msg' : 'send_private_msg';
     const params: Record<string, unknown> =
       message.chatType === 'group'
-        ? { group_id: targetId, message: segments }
-        : { user_id: targetId, message: segments };
+        ? { group_id: Number(message.chatId), message: segments }
+        : { user_id: Number(message.chatId), message: segments };
     const result = await this.post(action, params);
     const messageId = (result as { message_id?: number | string }).message_id;
     if (messageId !== undefined && messageId !== null && messageId !== -1) {
       this.rememberSelfSent(messageId);
     }
-    this.idempotency.record(chatType, targetId, 'text', content);
     return result;
   }
 
   async sendImage(chatType: 'group' | 'private', targetId: number, file: string): Promise<Record<string, unknown>> {
-    if (this.idempotency.isDuplicate(chatType, targetId, 'image', file)) {
-      return { message_id: -1 };
-    }
     const message = [{ type: 'image', data: { file, subType: 0 } }];
     const action = chatType === 'group' ? 'send_group_msg' : 'send_private_msg';
     const params: Record<string, unknown> =
@@ -820,7 +807,6 @@ export class NapcatBot {
     if (messageId !== undefined && messageId !== null && messageId !== -1) {
       this.rememberSelfSent(messageId);
     }
-    this.idempotency.record(chatType, targetId, 'image', file);
     return result;
   }
 
@@ -829,9 +815,6 @@ export class NapcatBot {
    * 大图。file 传表情的 p.qpic.cn URL（fetch_custom_face 拉到的收藏表情）。
    */
   async sendSticker(chatType: 'group' | 'private', targetId: number, file: string): Promise<Record<string, unknown>> {
-    if (this.idempotency.isDuplicate(chatType, targetId, 'sticker', file)) {
-      return { message_id: -1 };
-    }
     const message = [{ type: 'image', data: { file, subType: 1 } }];
     const action = chatType === 'group' ? 'send_group_msg' : 'send_private_msg';
     const params: Record<string, unknown> =
@@ -843,7 +826,6 @@ export class NapcatBot {
     if (messageId !== undefined && messageId !== null && messageId !== -1) {
       this.rememberSelfSent(messageId);
     }
-    this.idempotency.record(chatType, targetId, 'sticker', file);
     return result;
   }
 
@@ -893,9 +875,6 @@ export class NapcatBot {
    * 先下载到本地再走这里，不把裸 URL 丢给 NapCat。
    */
   async sendVideo(chatType: 'group' | 'private', targetId: number, file: string): Promise<Record<string, unknown>> {
-    if (this.idempotency.isDuplicate(chatType, targetId, 'video', file)) {
-      return { message_id: -1 };
-    }
     const message = [{ type: 'video', data: { file } }];
     const action = chatType === 'group' ? 'send_group_msg' : 'send_private_msg';
     const params: Record<string, unknown> =
@@ -907,7 +886,6 @@ export class NapcatBot {
     if (messageId !== undefined && messageId !== null && messageId !== -1) {
       this.rememberSelfSent(messageId);
     }
-    this.idempotency.record(chatType, targetId, 'video', file);
     return result;
   }
 

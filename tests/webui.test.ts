@@ -23,7 +23,7 @@ interface Fixture {
   cleanup: () => Promise<void>;
 }
 
-async function makeFixture(token = ''): Promise<Fixture> {
+async function makeFixture(token = '', readonlyToken = ''): Promise<Fixture> {
   const dir = await mkdtemp(join(tmpdir(), 'liveai-webui-'));
   const promptDir = join(dir, 'prompt');
   await mkdir(join(promptDir, 'staff'), { recursive: true });
@@ -67,6 +67,7 @@ async function makeFixture(token = ''): Promise<Fixture> {
     masterQq: 123456789,
     promptDir,
     token,
+    readonlyToken,
     bot: { selfId: 987654321, selfNickname: '测试号', connected: true },
     repo,
     models: {
@@ -299,6 +300,66 @@ test('token auth gates page and api when configured', async () => {
     const background = await call(fixture.port, 'GET', '/assets/console-bg.jpg');
     assert.equal(background.statusCode, 200, 'CSS 背景图无需 token 查询参数');
     assert.equal(background.body.length > 0, true);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('readonly token: GET allowed, writes and sensitive reads 403, admin unaffected', async () => {
+  const fixture = await makeFixture('admin-tok', 'view-tok');
+  try {
+    const status = await call(fixture.port, 'GET', '/api/status', undefined, 'view-tok');
+    assert.equal(status.statusCode, 200);
+    assert.equal(JSON.parse((await call(fixture.port, 'GET', '/api/whoami', undefined, 'view-tok')).body).role, 'readonly');
+    assert.equal(JSON.parse((await call(fixture.port, 'GET', '/api/whoami', undefined, 'admin-tok')).body).role, 'admin');
+    const write = await call(fixture.port, 'POST', '/api/scope', { scopeType: 'group', scopeId: '777', enabled: false }, 'view-tok');
+    assert.equal(write.statusCode, 403);
+    for (const path of ['/api/napcat/runtime/qrcode', '/api/napcat/config', '/api/models/config', '/api/napcat/runtime/logs']) {
+      assert.equal((await call(fixture.port, 'GET', path, undefined, 'view-tok')).statusCode, 403, path);
+    }
+    assert.equal((await call(fixture.port, 'GET', '/api/models/config', undefined, 'admin-tok')).statusCode, 200);
+    assert.equal((await call(fixture.port, 'GET', '/api/status', undefined, 'wrong')).statusCode, 401);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('readonly token alone does not unlock the loopback no-token mode for writes', async () => {
+  const fixture = await makeFixture('', 'view-tok');
+  try {
+    // 本机免鉴权仍是 admin；带只读 token 的请求按只读处理
+    assert.equal(JSON.parse((await call(fixture.port, 'GET', '/api/whoami')).body).role, 'admin');
+    const write = await call(fixture.port, 'POST', '/api/scope', { scopeType: 'group', scopeId: '777', enabled: false }, 'view-tok');
+    assert.equal(write.statusCode, 200, 'loopback no-token mode wins: presenting a token does not downgrade');
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('status stream pushes SSE frames', async () => {
+  const fixture = await makeFixture();
+  try {
+    const first = await new Promise<string>((resolvePromise, reject) => {
+      const req = request({ hostname: '127.0.0.1', port: fixture.port, path: '/api/status/stream', method: 'GET' }, (response) => {
+        assert.equal(response.headers['content-type'], 'text/event-stream');
+        response.once('data', (chunk: Buffer) => {
+          resolvePromise(chunk.toString('utf8'));
+          req.destroy();
+        });
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    assert.match(first, /^data: \{.*"connected":true/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('stickers endpoints: 404 when not wired', async () => {
+  const fixture = await makeFixture();
+  try {
+    assert.equal((await call(fixture.port, 'GET', '/api/stickers')).statusCode, 404);
   } finally {
     await fixture.cleanup();
   }

@@ -135,13 +135,52 @@ export interface PluginManifest {
   /** manifest v2：面板自动生成配置表单。 */
   config?: Record<string, PluginConfigField>;
   tools: PluginToolDef[];
+  /** 事件钩子（webhook）：QQ 事件发生时把事件推给外部服务；可无 tools 只挂钩子。 */
+  hooks?: PluginHookDef[];
 }
+
+export const PLUGIN_EVENTS = [
+  'message',
+  'group_message',
+  'private_message',
+  'friend_request',
+  'group_request',
+  'connected',
+  'disconnected',
+] as const;
+export type PluginEventName = (typeof PLUGIN_EVENTS)[number];
+
+/**
+ * 声明式事件钩子（legacy plugin_manager 的 on_<event> 在声明式体系里的对应物）：
+ * 不执行插件代码，只把事件 POST 给声明的 URL——观测/转发/联动外部服务用。
+ * 发送是 fire-and-forget：钩子慢或挂掉都不会拖住聊天主链路。
+ */
+export interface PluginHookDef {
+  event: PluginEventName;
+  /** 默认 POST，body 缺省为 {"event","plugin","data"} 的 JSON；模板里 {{event.字段}} 取事件数据。 */
+  request: PluginToolRequest;
+  /** 与工具同义：允许打本机/内网地址（只能写在磁盘清单里）。 */
+  allow_internal?: boolean;
+  filter?: {
+    /** scope 白名单（同工具 scopes 语法：精确 key 或裸类型名）。 */
+    scopes?: string[];
+    /** 消息文本须包含其一（仅消息类事件）。 */
+    contains?: string[];
+  };
+}
+
+/** 事件数据：消息类带会话/发送者/文本，请求类带原始 OneBot 字段。 */
+export type PluginEventPayload = Record<string, string | number | boolean | null>;
+
+const HOOK_TIMEOUT_MS = 5000;
 
 export interface PluginInfo {
   name: string;
   description: string;
   enabled: boolean;
   tools: string[];
+  /** 已挂的事件钩子（事件名，可重复=同事件多个钩子）。 */
+  hooks?: string[];
   error?: string;
 }
 
@@ -239,7 +278,16 @@ export class PluginRegistry {
   private validate(raw: PluginManifest): PluginManifest {
     const name = String(raw.name ?? '').trim();
     if (!NAME_PATTERN.test(name)) throw new Error(`插件名不合法: ${name || '(空)'}（小写字母开头的标识符）`);
-    if (!Array.isArray(raw.tools) || raw.tools.length === 0) throw new Error('tools 为空');
+    const hooks = raw.hooks ?? [];
+    if (!Array.isArray(hooks)) throw new Error('hooks 必须是数组');
+    for (const [index, hook] of hooks.entries()) {
+      if (!(PLUGIN_EVENTS as readonly string[]).includes(String(hook?.event))) {
+        throw new Error(`hooks[${index}].event 不合法: ${String(hook?.event)}（可用: ${PLUGIN_EVENTS.join(' / ')}）`);
+      }
+      if (!String(hook.request?.url ?? '').trim()) throw new Error(`hooks[${index}] 缺 request.url`);
+    }
+    if (raw.tools === undefined && hooks.length > 0) raw = { ...raw, tools: [] };
+    if (!Array.isArray(raw.tools) || (raw.tools.length === 0 && hooks.length === 0)) throw new Error('tools 与 hooks 都为空');
     const seen = new Set<string>();
     for (const tool of raw.tools) {
       const toolName = String(tool?.name ?? '').trim();
@@ -316,6 +364,7 @@ export class PluginRegistry {
         description: manifest.description ?? '',
         enabled: this.isEnabled(manifest),
         tools: manifest.tools.map((tool) => tool.name),
+        ...(manifest.hooks && manifest.hooks.length > 0 ? { hooks: manifest.hooks.map((hook) => hook.event) } : {}),
       });
     }
     for (const [folder, error] of [...this.errors.entries()].sort()) {
@@ -782,6 +831,80 @@ export class PluginRegistry {
     return Object.values(this.secrets)
       .filter((value) => value.trim().length >= 4)
       .flatMap((value) => [value, encodeURIComponent(value)]);
+  }
+
+  /**
+   * 分发事件给所有启用插件里匹配的钩子。不 await 外部请求：返回值只是
+   * 「派发了几个」，测试可 await settled 拿到全部结果。
+   */
+  emit(event: PluginEventName, payload: PluginEventPayload): { dispatched: number; settled: Promise<{ plugin: string; ok: boolean; error?: string }[]> } {
+    const jobs: Promise<{ plugin: string; ok: boolean; error?: string }>[] = [];
+    const scopeKey = payload.scopeType != null && payload.scopeId != null ? `${String(payload.scopeType)}:${String(payload.scopeId)}` : '';
+    for (const manifest of this.manifests.values()) {
+      if (!this.isEnabled(manifest)) continue;
+      for (const hook of manifest.hooks ?? []) {
+        if (hook.event !== event) continue;
+        if (hook.filter?.scopes !== undefined && !hook.filter.scopes.some((entry) => scopeEntryMatches(entry, scopeKey, false))) continue;
+        const contains = hook.filter?.contains;
+        if (contains !== undefined && contains.length > 0 && !contains.some((word) => String(payload.text ?? '').includes(word))) continue;
+        jobs.push(this.fireHook(manifest.name, hook, event, payload));
+      }
+    }
+    return { dispatched: jobs.length, settled: Promise.all(jobs) };
+  }
+
+  private async fireHook(
+    pluginName: string,
+    hook: PluginHookDef,
+    event: PluginEventName,
+    payload: PluginEventPayload,
+  ): Promise<{ plugin: string; ok: boolean; error?: string }> {
+    const started = Date.now();
+    const resolve = (key: string, encode: boolean): string => {
+      let raw: string;
+      if (key.startsWith('event.')) {
+        const value = payload[key.slice('event.'.length)];
+        raw = value === undefined || value === null ? '' : String(value);
+      } else if (key.startsWith('secrets.')) {
+        const value = this.secrets[key.slice('secrets.'.length)];
+        if (value === undefined) throw new Error(`secrets.json 里没有 ${key}`);
+        raw = value;
+      } else if (key.startsWith('config.')) {
+        const value = this.configValues[pluginName]?.[key.slice('config.'.length)];
+        if (value === undefined) throw new Error(`配置项 ${key} 没有值`);
+        return String(value);
+      } else {
+        throw new Error(`钩子模板只支持 event.* / secrets.* / config.*，不认识 ${key}`);
+      }
+      return encode ? encodeURIComponent(raw) : raw;
+    };
+    try {
+      const url = interpolate(hook.request.url, (key) => resolve(key, true));
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      for (const [name, value] of Object.entries(hook.request.headers ?? {})) {
+        headers[name] = interpolate(value, (key) => resolve(key, false));
+      }
+      const body = hook.request.body !== undefined
+        ? interpolateJsonBody(hook.request.body, (key) => resolve(key, false))
+        : JSON.stringify({ event, plugin: pluginName, data: payload });
+      const result = await webFetch(url, {
+        method: hook.request.method ?? 'POST',
+        headers,
+        body,
+        maxBytes: 64 * 1024,
+        allowInternal: hook.allow_internal === true,
+        timeoutMs: Math.min(hook.request.timeout_ms ?? HOOK_TIMEOUT_MS, 30_000),
+      });
+      const ok = result.status < 400;
+      probeRecord('plugin.hook', Date.now() - started, { plugin: pluginName, event, ok: ok ? 1 : 0 });
+      if (!ok) console.warn(`[plugins] hook ${pluginName}/${event} HTTP ${result.status}`);
+      return ok ? { plugin: pluginName, ok } : { plugin: pluginName, ok, error: `HTTP ${result.status}` };
+    } catch (error) {
+      const message = this.scrub(error instanceof Error ? error.message : String(error), this.secretValuesForScrub());
+      probeRecord('plugin.hook', Date.now() - started, { plugin: pluginName, event, ok: 0 });
+      console.warn(`[plugins] hook ${pluginName}/${event} failed: ${message}`);
+      return { plugin: pluginName, ok: false, error: message };
+    }
   }
 
   /** Resolve a {{placeholder}}: secrets.*, config.*, scope.*, then tool params. */

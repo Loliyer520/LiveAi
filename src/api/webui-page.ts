@@ -654,6 +654,7 @@ var FIXED_NAV = [
   { route: "persona", title: "人设编辑", icon: "users", render: renderPersona },
   { route: "probes", title: "性能", icon: "activity", render: renderProbes },
   { route: "logs", title: "回合日志", icon: "activity", render: renderLogs },
+  { route: "stickers", title: "表情包", icon: "spark", render: renderStickers },
 ];
 
 function toggleDrawer() {
@@ -709,6 +710,7 @@ function markNav(route) {
 
 function route() {
   closeDrawer();
+  closeHomeStream();
   var r = currentRoute();
   state.route = r;
   markNav(r);
@@ -738,9 +740,28 @@ function cardTitle(name, title) {
 }
 
 // ─── 首页 ────────────────────────────────────────────────────────────────────
+// 首页实时刷新：订阅 /api/status/stream（SSE，服务端 2s 推一次）；离开首页即关流。
+// EventSource 不能带 Authorization 头，token 走 query（与 api() 一致）。
+var homeStream = null;
+function closeHomeStream() {
+  if (homeStream) { homeStream.close(); homeStream = null; }
+}
 function renderHome(main) {
   main.innerHTML = pageHead("首页", "机器人、会话和模型的运行概况");
   api("/api/status").then(function (s) {
+    paintHome(main, s);
+    if (typeof EventSource === "undefined") return;
+    closeHomeStream();
+    var stream = new EventSource("/api/status/stream?token=" + encodeURIComponent(TOKEN));
+    homeStream = stream;
+    stream.onmessage = function (ev) {
+      if (state.route !== "home" || homeStream !== stream) { stream.close(); return; }
+      try { paintHome(main, Object.assign({}, s, JSON.parse(ev.data))); } catch (e) { /* 坏帧忽略，等下一帧 */ }
+    };
+  }).catch(function (e) { main.innerHTML = pageHead("首页", "") + '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
+}
+function paintHome(main, s) {
+  {
     var usage = s.usage || {};
     var total = usage.total || {};
     main.innerHTML = pageHead("首页", "机器人、会话和模型的运行概况") +
@@ -775,7 +796,7 @@ function renderHome(main) {
       "<tr><th>输出 Token</th><td>" + (total.outputTokens || 0).toLocaleString() + "</td></tr>" +
       (usage.lastError ? '<tr><th>最近错误</th><td class=mono style="color:var(--bad)">' + h(usage.lastError.message || usage.lastError) + "</td></tr>" : "") +
       "</table></div>";
-  }).catch(function (e) { main.innerHTML = pageHead("首页", "") + '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
+  }
 }
 
 // ─── 知识 ────────────────────────────────────────────────────────────────────
@@ -1678,7 +1699,7 @@ function logsReload() {
       html += '<div class="card"><h2 style="margin-top:0">' + icon("cpu") + '工具调用（最近 ' + tools.length + ' 条）</h2>';
       if (!tools.length) html += '<p class=dim>还没有工具调用记录。</p>';
       else {
-        html += '<table><tr><th>时间</th><th>工具</th><th>参数</th><th>结果</th><th>结果</th></tr>';
+        html += '<table><tr><th>时间</th><th>工具</th><th>参数</th><th>结果</th><th>状态</th></tr>';
         for (var j = tools.length - 1; j >= 0; j--) {
           var tl = tools[j];
           html += '<tr><td class=dim style="font-size:12px">' + fmtTime(Math.floor(tl.at / 1000)) + '</td>' +
@@ -1695,6 +1716,84 @@ function logsReload() {
       var body = document.getElementById("logBody");
       if (body) body.innerHTML = '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>";
     });
+}
+
+// ─── 表情包收藏 ──────────────────────────────────────────────────────────────
+// 号主 QQ 收藏表情 + 视觉打标的索引：改描述/标签（人工修订刷新不覆盖）、停用（AI 不再挑它）。
+var stickerView = { list: [], q: "" };
+function renderStickers(main) {
+  main.innerHTML = pageHead("表情包", "AI 发表情时挑选的收藏库");
+  api("/api/stickers").then(function (d) {
+    stickerView.list = d.stickers || [];
+    paintStickers(main);
+  }).catch(function (e) { main.innerHTML = pageHead("表情包", "") + '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
+}
+function paintStickers(main) {
+  var list = stickerView.list;
+  var off = 0;
+  for (var i = 0; i < list.length; i++) if (list[i].disabled) off += 1;
+  var q = stickerView.q.toLowerCase();
+  var html = pageHead("表情包", list.length + " 张收藏 · " + off + " 张停用") +
+    '<div class="card"><div class="row" style="gap:10px;align-items:center">' +
+    '<input id="stickerQ" placeholder="按描述或标签筛选" aria-label="筛选表情" value="' + h(stickerView.q) + '" style="flex:1;min-width:200px">' +
+    '<button class="btn" id="stickerSync">' + icon("refresh") + '同步收藏</button></div>' +
+    '<p class=help>同步会拉取 QQ 收藏表情，新表情由视觉模型自动打标；人工改过的描述和标签不会被覆盖。停用的表情 AI 不会再发。</p></div>';
+  if (!list.length) html += '<div class="card"><p class=dim>表情库还是空的。点「同步收藏」拉取 QQ 收藏表情（需要 NapCat 已登录）。</p></div>';
+  else {
+    html += '<div class="card"><table><tr><th>预览</th><th>描述</th><th>标签</th><th>状态</th><th></th></tr>';
+    for (var j = 0; j < list.length; j++) {
+      var s = list[j];
+      var hay = (s.desc + " " + (s.tags || []).join(" ")).toLowerCase();
+      if (q && hay.indexOf(q) === -1) continue;
+      html += '<tr data-md5="' + h(s.md5) + '"' + (s.disabled ? ' style="opacity:.55"' : "") + '>' +
+        '<td><img src="' + h(s.url) + '" alt="' + h(s.desc) + '" loading="lazy" referrerpolicy="no-referrer" style="width:56px;height:56px;object-fit:contain;border-radius:6px"></td>' +
+        '<td><input class="st-desc" aria-label="描述" value="' + h(s.desc) + '" style="width:100%"></td>' +
+        '<td><input class="st-tags" aria-label="标签（逗号分隔）" value="' + h((s.tags || []).join("，")) + '" style="width:100%"></td>' +
+        '<td>' + (s.disabled ? '<span class="pill bad">停用</span>' : '<span class="pill ok">启用</span>') + (s.edited ? ' <span class="pill">已修订</span>' : "") + '</td>' +
+        '<td style="white-space:nowrap"><button class="btn st-save">保存</button> ' +
+        '<button class="btn st-toggle">' + (s.disabled ? "启用" : "停用") + '</button></td></tr>';
+    }
+    html += "</table></div>";
+  }
+  main.innerHTML = html;
+  var qInput = document.getElementById("stickerQ");
+  qInput.oninput = function () {
+    stickerView.q = qInput.value;
+    paintStickers(main);
+    var again = document.getElementById("stickerQ");
+    again.focus();
+    again.setSelectionRange(again.value.length, again.value.length);
+  };
+  document.getElementById("stickerSync").onclick = function () {
+    var btn = this;
+    btn.disabled = true;
+    toast("正在同步收藏表情，新表情多时打标要一会儿…");
+    api("/api/stickers/refresh", "POST", {}).then(function (r) {
+      toast(r.message || "同步完成", !r.ok);
+      renderStickers(main);
+    }).catch(function (e) { btn.disabled = false; toast(e.message, true); });
+  };
+  var rows = main.querySelectorAll("tr[data-md5]");
+  for (var k = 0; k < rows.length; k++) bindStickerRow(main, rows[k]);
+}
+function bindStickerRow(main, row) {
+  var md5 = row.getAttribute("data-md5");
+  var current = null;
+  for (var i = 0; i < stickerView.list.length; i++) if (stickerView.list[i].md5 === md5) current = stickerView.list[i];
+  var apply = function (patch, okMsg) {
+    patch.md5 = md5;
+    api("/api/stickers/update", "POST", patch).then(function (r) {
+      for (var j = 0; j < stickerView.list.length; j++) if (stickerView.list[j].md5 === md5) stickerView.list[j] = r.sticker;
+      toast(okMsg);
+      paintStickers(main);
+    }).catch(function (e) { toast(e.message, true); });
+  };
+  row.querySelector(".st-save").onclick = function () {
+    apply({ desc: row.querySelector(".st-desc").value, tags: row.querySelector(".st-tags").value }, "已保存");
+  };
+  row.querySelector(".st-toggle").onclick = function () {
+    apply({ disabled: !(current && current.disabled) }, current && current.disabled ? "已启用" : "已停用");
+  };
 }
 
 // ─── 设置 ────────────────────────────────────────────────────────────────────
@@ -2206,6 +2305,12 @@ function boot() {
   document.getElementById("app").style.display = "flex";
   hydrateIcons();
   buildNav();
+  // 只读 token 登录时在侧栏标注身份（写操作服务端会 403，toast 里给出原因）。
+  api("/api/whoami").then(function (w) {
+    if (w.role !== "readonly") return;
+    var cap = document.querySelector(".side-caption");
+    if (cap) cap.insertAdjacentHTML("beforeend", "<b>只读</b>");
+  }).catch(function () {});
   document.querySelector("aside").addEventListener("click", function (e) {
     if (e.target.closest("a")) closeDrawer();
   });

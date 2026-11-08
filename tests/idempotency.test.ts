@@ -1,26 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { IdempotencyLedger } from '../src/bot/idempotency.js';
+import { ScopeSendLedger, sendActionKey } from '../src/bot/idempotency.js';
 
-test('IdempotencyLedger: detects duplicate sends within TTL', () => {
-  const ledger = new IdempotencyLedger();
-  assert.equal(ledger.isDuplicate('group', 123, 'text', 'hello'), false);
-  ledger.record('group', 123, 'text', 'hello');
-  assert.equal(ledger.isDuplicate('group', 123, 'text', 'hello'), true);
-  ledger.destroy();
+test('sendActionKey normalizes whitespace and keys on the reply target', () => {
+  assert.equal(sendActionKey(['  你好 ', '', '在吗'], null), sendActionKey(['你好', '在吗'], undefined));
+  assert.notEqual(sendActionKey(['你好'], null), sendActionKey(['你好'], 42));
+  assert.equal(sendActionKey(['', '  '], null), '');
 });
 
-test('IdempotencyLedger: different targets are independent', () => {
-  const ledger = new IdempotencyLedger();
-  ledger.record('group', 123, 'text', 'hello');
-  assert.equal(ledger.isDuplicate('group', 456, 'text', 'hello'), false);
-  assert.equal(ledger.isDuplicate('private', 123, 'text', 'hello'), false);
-  ledger.destroy();
+test('ScopeSendLedger blocks the same key within TTL, per scope', () => {
+  let now = 1_000;
+  const ledger = new ScopeSendLedger(5_000, () => now);
+  const key = sendActionKey(['hello'], null);
+  assert.equal(ledger.has('group:1', key), false);
+  ledger.add('group:1', key);
+  assert.equal(ledger.has('group:1', key), true);
+  assert.equal(ledger.has('group:2', key), false, 'scopes are independent');
+  now += 5_001;
+  assert.equal(ledger.has('group:1', key), false, 'expired after TTL');
 });
 
-test('IdempotencyLedger: different types are independent', () => {
-  const ledger = new IdempotencyLedger();
-  ledger.record('group', 123, 'text', 'hello');
-  assert.equal(ledger.isDuplicate('group', 123, 'image', 'hello'), false);
-  ledger.destroy();
+test('ScopeSendLedger discard releases a reserved key', () => {
+  const ledger = new ScopeSendLedger();
+  ledger.add('private:9', 'k');
+  ledger.discard('private:9', 'k');
+  assert.equal(ledger.has('private:9', 'k'), false);
 });

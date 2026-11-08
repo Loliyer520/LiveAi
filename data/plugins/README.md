@@ -76,5 +76,26 @@ data/plugins/
 - 响应超 512KB 拒收；单插件加载失败只隔离它自己，`plugin_manage list` 里能看到原因
 - 工具名与内置工具冲突时插件工具被跳过（内置优先）
 
+## 事件钩子（hooks 段，可省）
+
+QQ 事件发生时把事件推给外部服务（webhook），用于转发、打卡统计、联动其他系统。插件可以只有
+`hooks` 没有 `tools`。钩子是 fire-and-forget：慢了、挂了都不会拖住聊天，只记日志和性能探针 `plugin.hook`。
+
+```json
+"hooks": [
+  {
+    "event": "group_message",
+    "request": { "url": "https://hook.example.com/qq?g={{event.scopeId}}", "headers": { "x-key": "{{secrets.HOOK_KEY}}" } },
+    "filter": { "scopes": ["group:777"], "contains": ["打卡"] }
+  }
+]
+```
+
+- `event`：`message`（群聊+私聊）/ `group_message` / `private_message` / `friend_request` / `group_request` / `connected` / `disconnected`
+- `request`：默认 `POST`，body 缺省为 `{"event","plugin","data"}`；自定义 body/URL/headers 用 `{{event.字段}}`、`{{secrets.KEY}}`、`{{config.KEY}}`
+- 消息事件字段：`scopeType` `scopeId` `userId` `nickname` `text` `messageId` `mentionsSelf` `timestamp`；请求事件：`requestType` `subType` `userId` `groupId` `comment`
+- `filter.scopes` 同工具 `scopes` 语法；`filter.contains` 文本须包含其一
+- 同样走 SSRF 检查（`allow_internal: true` 放行本机），单次超时默认 5s、封顶 30s
+
 现成示例：`weather/`（wttr.in 免 key 天气）、`novel/`（本机 7910 番茄小说：搜索/目录/正文，
 演示 allow_internal、list 展平、code_path 业务错误、save 存盘 + html_to_text + send 一键转发）。

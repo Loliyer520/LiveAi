@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { executeChatTool, configureStickers, parseStickerCaption, refreshStickerIndex, type ToolContext } from '../src/chat/tools.js';
+import { executeChatTool, configureStickers, listStickers, parseStickerCaption, refreshStickerIndex, updateSticker, type ToolContext } from '../src/chat/tools.js';
 import type { NapcatBot } from '../src/bot/napcat.js';
 import { Workspace } from '../src/chat/workspace.js';
 import { TaskScheduler } from '../src/chat/scheduler.js';
@@ -282,4 +282,45 @@ test('parseStickerCaption 兼容 JSON / 代码块 / 字段正则 / 两行 / 单�
   assert.ok(merged.desc.startsWith('粉发女孩'), merged.desc);
   assert.ok(merged.tags.includes('拍手'));
   assert.equal(parseStickerCaption('   \n ').desc, '');
+});
+
+test('updateSticker: 人工修订描述/标签，停用后 send_sticker 不再挑它', async () => {
+  const harness = await makeHarness({ indexEntries: STICKERS });
+  try {
+    const edited = updateSticker('A'.repeat(32), { desc: '橘猫白眼', tags: ['无语', ' 白眼 ', '无语', ''] });
+    assert.equal(edited?.desc, '橘猫白眼');
+    assert.deepEqual(edited?.tags, ['无语', '白眼']);
+    assert.equal(edited?.edited, true);
+    assert.equal(updateSticker('Z'.repeat(32), { disabled: true }), null);
+    assert.throws(() => updateSticker('A'.repeat(32), { desc: '  ' }), /描述不能为空/);
+
+    updateSticker('A'.repeat(32), { disabled: true });
+    assert.equal(listStickers().find((s) => s.md5 === 'A'.repeat(32))?.disabled, true);
+    const result = await executeChatTool({ name: 'send_sticker', arguments: { query: '无语' } }, harness.context);
+    assert.equal(result.ok, false, '唯一匹配的那张被停用了');
+    assert.equal(harness.sentStickers.length, 0);
+
+    updateSticker('A'.repeat(32), { disabled: false });
+    assert.equal(listStickers().find((s) => s.md5 === 'A'.repeat(32))?.disabled, undefined);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('refreshStickerIndex 保留人工修订与停用标记，只刷新 URL', async () => {
+  const harness = await makeHarness({
+    indexEntries: STICKERS,
+    fetchCustomFace: STICKERS.map((s) => `${s.url}?v=2`),
+  });
+  try {
+    updateSticker('B'.repeat(32), { desc: '人工描述', disabled: true });
+    const result = await refreshStickerIndex(harness.context.bot, async () => '{"desc":"不该用到","tags":[]}');
+    assert.equal(result.ok, true, result.message);
+    const b = listStickers().find((s) => s.md5 === 'B'.repeat(32));
+    assert.equal(b?.desc, '人工描述');
+    assert.equal(b?.disabled, true);
+    assert.ok(b?.url.endsWith('?v=2'));
+  } finally {
+    await harness.cleanup();
+  }
 });

@@ -91,6 +91,8 @@ export interface LiveAiConfig extends LiveAiRuntimeConfig {
   readonly logLevel: LogLevel;
   /** 管理面板鉴权 token，空串 = 不鉴权（仅适合绑 127.0.0.1）。 */
   readonly webuiToken: string;
+  /** 只读 token：只能看（GET），敏感接口也不给；空串 = 不启用。 */
+  readonly webuiReadonlyToken: string;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, projectRoot: string = process.cwd()): LiveAiConfig {
@@ -172,9 +174,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, projectRoot: st
   const host = env.LIVEAI_HOST?.trim() || str(webuiFile.host) || '127.0.0.1';
   const port = parsePort(env.LIVEAI_PORT ?? str(webuiFile.port) ?? undefined);
   const webuiToken = env.LIVEAI_WEBUI_TOKEN ?? str(webuiFile.token) ?? '';
+  const webuiReadonlyToken = env.LIVEAI_WEBUI_READONLY_TOKEN ?? str(webuiFile.readonly_token) ?? '';
   const logLevel = parseLogLevel(env.LIVEAI_LOG_LEVEL);
 
-  return Object.freeze({ host, port, logLevel, webuiToken, napcat, ai, storage, tts, novelCmd });
+  return Object.freeze({ host, port, logLevel, webuiToken, webuiReadonlyToken, napcat, ai, storage, tts, novelCmd });
 }
 
 function readJsonConfig(path: string): Record<string, unknown> {

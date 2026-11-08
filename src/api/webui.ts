@@ -30,6 +30,7 @@ import type { NapcatActionResult, NapcatQrcode, NapcatRuntimeStatus } from '../n
 import { isMasterScope } from '../chat/types.js';
 
 import type { ToolLogEntry, TurnLogEntry } from '../store/turn-log.js';
+import type { StickerEntry } from '../chat/tools.js';
 
 export interface WebuiDeps {
   /** 号主 QQ（号主身份；主AI 是 master:core，与此无关）：对话页区分号主消息。 */
@@ -38,6 +39,8 @@ export interface WebuiDeps {
   readonly promptDir: string;
   /** 空串 = 不鉴权（仅监听 127.0.0.1 时的默认姿态）。 */
   readonly token: string;
+  /** 只读 token（可选）：只放行 GET，且不含 READONLY_DENIED 里的敏感接口。 */
+  readonly readonlyToken?: string;
   readonly bot: {
     readonly selfId: number;
     readonly selfNickname: string;
@@ -137,6 +140,13 @@ export interface WebuiDeps {
   /** /my/run/mcbot 边车目录（账号配置落 mc-accounts.json）。 */
   readonly mcbotDir: string;
 
+  // ── 表情包收藏（表情包页） ────────────────────────────────────────────────
+  readonly stickers?: {
+    list(): StickerEntry[];
+    update(md5: string, patch: { desc?: string; tags?: string[]; disabled?: boolean }): StickerEntry | null;
+    refresh(): Promise<{ ok: boolean; message: string }>;
+  };
+
   // ── 检查更新 ────────────────────────────────────────────────────────────
   /** bot 仓根目录（git fetch/ls-remote 的工作目录）。 */
   readonly repoDir: string;
@@ -178,8 +188,18 @@ export async function handleWebui(
     return;
   }
 
-  if (!authorized(request, url, deps)) {
+  const role = authorize(request, url, deps);
+  if (role === null) {
     sendJson(response, 401, { error: 'unauthorized' });
+    return;
+  }
+  // 只读身份：只能看；写操作和敏感读（登录二维码=账号接管、连接/模型配置、桥日志）一律 403。
+  if (role === 'readonly' && (request.method !== 'GET' || READONLY_DENIED.has(url.pathname))) {
+    sendJson(response, 403, { error: 'readonly token: 只读身份无权执行此操作' });
+    return;
+  }
+  if (request.method === 'GET' && url.pathname === '/api/whoami') {
+    sendJson(response, 200, { role });
     return;
   }
   // 跨站写请求护栏：面板自身/curl 不受影响，恶意网页的表单或 fetch 会被挡。
@@ -246,10 +266,8 @@ export async function handleWebui(
       const interval = setInterval(() => {
         send(getStatus());
       }, 2000); // 2 秒推送一次
-      request.on('close', () => {
-        clearInterval(interval);
-        response.end();
-      });
+      // 监听 response 而非 request：node ≥16 的 IncomingMessage 'close' 在 GET 体读完即触发，会立刻断流。
+      response.on('close', () => clearInterval(interval));
       return;
     }
 
@@ -991,6 +1009,43 @@ export async function handleWebui(
       return;
     }
 
+    // ── 表情包收藏 ──────────────────────────────────────────────────────────
+    if (url.pathname.startsWith('/api/stickers') && deps.stickers === undefined) {
+      sendJson(response, 404, { error: '表情包功能未启用' });
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/api/stickers' && deps.stickers) {
+      const stickers = deps.stickers.list();
+      sendJson(response, 200, { stickers, total: stickers.length, disabled: stickers.filter((s) => s.disabled === true).length });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/stickers/update' && deps.stickers) {
+      const body = (await readBody(request)) as Record<string, unknown>;
+      const md5 = String(body.md5 ?? '').trim();
+      if (md5 === '') {
+        sendJson(response, 400, { error: 'md5 必填' });
+        return;
+      }
+      const patch: { desc?: string; tags?: string[]; disabled?: boolean } = {};
+      if (body.desc !== undefined) patch.desc = String(body.desc);
+      if (body.tags !== undefined) {
+        patch.tags = Array.isArray(body.tags) ? body.tags.map(String) : String(body.tags).split(/[,，、\s]+/);
+      }
+      if (body.disabled !== undefined) patch.disabled = body.disabled === true;
+      try {
+        const updated = deps.stickers.update(md5, patch);
+        if (updated === null) sendJson(response, 404, { error: '找不到该表情' });
+        else sendJson(response, 200, { ok: true, sticker: updated });
+      } catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/stickers/refresh' && deps.stickers) {
+      sendJson(response, 200, await deps.stickers.refresh());
+      return;
+    }
+
     // ── 哔哩桥 · 统计 ──────────────────────────────────────────────────────
     if (request.method === 'GET' && url.pathname === '/api/bili/stats') {
       const agents = deps.repo.listAgents();
@@ -1131,17 +1186,32 @@ export async function handleWebui(
   }
 }
 
-function authorized(request: IncomingMessage, url: URL, deps: WebuiDeps): boolean {
+export type WebuiRole = 'admin' | 'readonly';
+
+/** 只读 token 也拿不到的 GET：账号接管/凭据/可能带凭据的日志。 */
+const READONLY_DENIED = new Set([
+  '/api/napcat/runtime/qrcode',
+  '/api/napcat/runtime/logs',
+  '/api/napcat/config',
+  '/api/models/config',
+]);
+
+function authorize(request: IncomingMessage, url: URL, deps: WebuiDeps): WebuiRole | null {
+  const bearer = /^Bearer (.+)$/.exec(String(request.headers.authorization ?? ''));
+  const presented = bearer?.[1] ?? url.searchParams.get('token') ?? '';
+  const readonlyToken = deps.readonlyToken ?? '';
   if (deps.token === '') {
     // 未配 token 的免鉴权模式只对本机开放：服务默认监听 127.0.0.1 时是便利，
     // 一旦有人把监听改成 0.0.0.0，原来的 `return true` 就是整个面板裸奔。
-    if (!isLoopbackAddress(request.socket.remoteAddress)) return false;
-    const host = String(request.headers.host ?? '').toLowerCase().replace(/:\d+$/, '');
-    return host === '' || host === 'localhost' || host.startsWith('127.') || host === '[::1]';
+    if (isLoopbackAddress(request.socket.remoteAddress)) {
+      const host = String(request.headers.host ?? '').toLowerCase().replace(/:\d+$/, '');
+      if (host === '' || host === 'localhost' || host.startsWith('127.') || host === '[::1]') return 'admin';
+    }
+  } else if (presented !== '' && constantTimeEqual(presented, deps.token)) {
+    return 'admin';
   }
-  const bearer = /^Bearer (.+)$/.exec(String(request.headers.authorization ?? ''));
-  const presented = bearer?.[1] ?? url.searchParams.get('token') ?? '';
-  return presented !== '' && constantTimeEqual(presented, deps.token);
+  if (readonlyToken !== '' && presented !== '' && constantTimeEqual(presented, readonlyToken)) return 'readonly';
+  return null;
 }
 
 function isLoopbackAddress(address: string | undefined): boolean {

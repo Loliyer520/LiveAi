@@ -581,3 +581,78 @@ test('JSON body 插值：模板原有转义与占位符相邻时仍合法', () =
   const body = interpolateJsonBody('{"text":"前缀\\n{{value}}后缀","n":{{n}}}', (key) => key === 'value' ? '"中"' : '2');
   assert.deepEqual(JSON.parse(body), { text: '前缀\n"中"后缀', n: 2 });
 });
+
+test('event hooks: hook-only manifest loads; emit posts matching events with filters and templates', async () => {
+  const { dir, cleanup } = await makePluginDir({
+    'relay/plugin.json': JSON.stringify({
+      name: 'relay',
+      description: '事件转发',
+      hooks: [
+        { event: 'group_message', request: { url: 'https://93.184.216.34/hook?g={{event.scopeId}}' }, filter: { scopes: ['group:777'], contains: ['打卡'] } },
+        { event: 'friend_request', request: { url: 'https://93.184.216.34/req', body: '{"who":"{{event.userId}}","k":"{{secrets.HOOK_KEY}}"}' } },
+      ],
+    }),
+    'secrets.json': JSON.stringify({ HOOK_KEY: 'hk-999' }),
+    'broken/plugin.json': JSON.stringify({ name: 'broken', hooks: [{ event: 'nope', request: { url: 'https://x.test' } }] }),
+  });
+  const originalFetch = globalThis.fetch;
+  const calls: { url: string; body: string }[] = [];
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    calls.push({ url: String(input instanceof Request ? input.url : input), body: String(init?.body ?? '') });
+    return new Response('ok', { status: 200 });
+  }) as typeof fetch;
+  try {
+    const registry = new PluginRegistry(dir);
+    registry.load();
+    const infos = registry.listInfo();
+    assert.deepEqual(infos.find((i) => i.name === 'relay')?.hooks, ['group_message', 'friend_request']);
+    assert.match(infos.find((i) => i.name === 'broken')?.error ?? '', /event 不合法/);
+
+    // 过滤：scope 不在白名单 / 文本不含关键词 → 不派发
+    assert.equal(registry.emit('group_message', { scopeType: 'group', scopeId: '888', text: '打卡' }).dispatched, 0);
+    assert.equal(registry.emit('group_message', { scopeType: 'group', scopeId: '777', text: '早上好' }).dispatched, 0);
+
+    const hit = registry.emit('group_message', { scopeType: 'group', scopeId: '777', userId: 5, text: '今日打卡' });
+    assert.equal(hit.dispatched, 1);
+    assert.deepEqual((await hit.settled).map((r) => r.ok), [true]);
+    assert.ok(calls[0].url.endsWith('/hook?g=777'), calls[0].url);
+    const defaultBody = JSON.parse(calls[0].body);
+    assert.equal(defaultBody.event, 'group_message');
+    assert.equal(defaultBody.data.text, '今日打卡');
+
+    await registry.emit('friend_request', { userId: 42 }).settled;
+    assert.deepEqual(JSON.parse(calls[1].body), { who: '42', k: 'hk-999' });
+
+    // 关闭插件后不再派发
+    registry.setEnabled('relay', false);
+    assert.equal(registry.emit('friend_request', { userId: 1 }).dispatched, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanup();
+  }
+});
+
+test('event hooks: failures and SSRF refusals resolve as errors, never throw', async () => {
+  const { dir, cleanup } = await makePluginDir({
+    'relay/plugin.json': JSON.stringify({
+      name: 'relay',
+      hooks: [
+        { event: 'connected', request: { url: 'http://127.0.0.1:9/hook' } },
+        { event: 'connected', request: { url: 'https://93.184.216.34/h', headers: { 'x-k': '{{secrets.MISSING}}' } } },
+      ],
+    }),
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('nope', { status: 500 })) as typeof fetch;
+  try {
+    const registry = new PluginRegistry(dir);
+    registry.load();
+    const results = await registry.emit('connected', { self_id: 1 }).settled;
+    assert.equal(results.length, 2);
+    assert.ok(results.every((r) => r.ok === false));
+    assert.ok(results.some((r) => /secrets\.json 里没有/.test(r.error ?? '')));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanup();
+  }
+});

@@ -10,6 +10,7 @@ import { NapcatRuntime } from './napcat/runtime.js';
 import { usageStats } from './models/usage.js';
 import { createLogger, errorContext } from './observability/logger.js';
 import { pluginRegistry } from './chat/plugins.js';
+import { listStickers, updateSticker } from './chat/tools.js';
 import { MASTER_SCOPE_ID, MASTER_SCOPE_KEY, MASTER_SCOPE_TYPE, isMasterScope } from './chat/types.js';
 
 /**
@@ -52,6 +53,7 @@ export async function createApplication(env: NodeJS.ProcessEnv = process.env): P
       masterQq: config.ai.masterQq,
       promptDir: config.storage.promptDir,
       token: config.webuiToken,
+      readonlyToken: config.webuiReadonlyToken,
       bot: chat.bot,
       repo: chat.repo,
       models: chat.models,
@@ -101,6 +103,12 @@ export async function createApplication(env: NodeJS.ProcessEnv = process.env): P
         }
       },
       mcbotDir: '/my/run/mcbot',
+      // 表情包页：浏览/改标签/停用 + 手动同步收藏
+      stickers: {
+        list: () => listStickers(),
+        update: (md5, patch) => updateSticker(md5, patch),
+        refresh: () => chat.orchestrator.refreshStickerLibrary(),
+      },
       repoDir: PROJECT_ROOT,
       packageVersion,
     },

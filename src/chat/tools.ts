@@ -9,6 +9,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { copyFile, mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
 import type { ToolSchema } from '../models/types.js';
 import type { NapcatBot } from '../bot/napcat.js';
+import { sendActionKey, type ScopeSendLedger } from '../bot/idempotency.js';
 import type { ScopeRepository } from '../store/repository.js';
 import type { MessageArchive } from '../store/archive.js';
 import type { RelationGraph } from '../relations/graph.js';
@@ -95,6 +96,47 @@ export interface StickerEntry {
   url: string;
   desc: string;
   tags: string[];
+  /** 面板停用：仍留在索引（刷新不重打标），但 send_sticker 不会挑它。 */
+  disabled?: boolean;
+  /** 人工改过描述/标签：刷新保留，不被视觉打标覆盖。 */
+  edited?: boolean;
+}
+
+/** 面板读：整库（含停用）。 */
+export function listStickers(): StickerEntry[] {
+  return loadStickerIndex().map((entry) => ({ ...entry, tags: [...entry.tags] }));
+}
+
+/** 面板改：修描述/标签或停用/启用；返回更新后的条目，找不到返回 null。 */
+export function updateSticker(
+  md5: string,
+  patch: { desc?: string; tags?: string[]; disabled?: boolean },
+): StickerEntry | null {
+  if (stickerIndexPath === null) throw new Error('表情包索引路径未配置');
+  const list = loadStickerIndex();
+  const index = list.findIndex((entry) => entry.md5 === md5);
+  if (index === -1) return null;
+  const next: StickerEntry = { ...list[index], tags: [...list[index].tags] };
+  if (patch.desc !== undefined) {
+    const desc = String(patch.desc).trim().slice(0, 60);
+    if (desc === '') throw new Error('描述不能为空');
+    next.desc = desc;
+    next.edited = true;
+  }
+  if (patch.tags !== undefined) {
+    next.tags = [...new Set(patch.tags.map((tag) => String(tag).trim()).filter((tag) => tag !== '' && tag.length <= 20))].slice(0, 12);
+    next.edited = true;
+  }
+  if (patch.disabled !== undefined) {
+    if (patch.disabled) next.disabled = true;
+    else delete next.disabled;
+  }
+  const updated = [...list];
+  updated[index] = next;
+  mkdirSync(dirname(stickerIndexPath), { recursive: true });
+  writeFileSync(stickerIndexPath, `${JSON.stringify(updated, null, 2)}\n`, 'utf-8');
+  stickerIndexCache = updated;
+  return next;
 }
 
 let stickerIndexPath: string | null = null;
@@ -241,6 +283,7 @@ async function doRefreshStickerIndex(
     const md5 = extractStickerMd5(url);
     const prev = md5 === null ? undefined : byMd5.get(md5);
     if (prev !== undefined) {
+      // 已打标（含面板人工修订/停用标记）原样保留，只刷新会变的 CDN URL
       next.push({ ...prev, url });
       continue;
     }
@@ -314,6 +357,8 @@ export interface ToolContext {
   scopeId: string;
   /** Per-turn successfully sent image fingerprints; shared across tool rounds. */
   sentImageKeys?: Set<string>;
+  /** scope 级发送账本：TTL 内同 payload 的 send_message 拒发（legacy ScopeSendLedger）。 */
+  sendLedger?: ScopeSendLedger;
   executedTools: string[];
 }
 
@@ -1110,6 +1155,21 @@ export async function executeChatTool(
           };
         }
       }
+      // 发送幂等：同 scope、TTL 内完全相同的可见内容（含引用目标）拒发。
+      // 先占坑再发送——逐行发到一半失败时前几行已真发出，不占坑重试会整条重发；
+      // 仅在一条都没发出去时释放，保留全失败可重试。
+      const ledgerScope = `${context.scopeType}:${context.scopeId}`;
+      const actionKey = context.sendLedger ? sendActionKey(lines, replyToMessage?.messageId) : '';
+      if (context.sendLedger && actionKey !== '') {
+        if (context.sendLedger.has(ledgerScope, actionKey)) {
+          return {
+            ok: false,
+            output: '这条内容刚刚已经发过了，系统拦截了本次重复发送。'
+              + '不要重复发送同样的话；要补充新内容请换一句，没有新内容要说就调用 stay_silent 结束本回合。',
+          };
+        }
+        context.sendLedger.add(ledgerScope, actionKey);
+      }
       // Reply quote anchors to the first line only; the rest go out plain.
       // sendTextOverride (dataline master channel) has no quote support.
       const refs: string[] = [];
@@ -1140,7 +1200,10 @@ export async function executeChatTool(
           break;
         }
       }
-      if (refs.length === 0) return { ok: false, output: `send_message 发送失败: ${failure}` };
+      if (refs.length === 0) {
+        if (context.sendLedger && actionKey !== '') context.sendLedger.discard(ledgerScope, actionKey);
+        return { ok: false, output: `send_message 发送失败: ${failure}` };
+      }
       const interrupted = failure ? `（后续行发送中断: ${failure}）` : '';
       return {
         ok: true,
@@ -1681,7 +1744,7 @@ export async function executeChatTool(
     case 'send_sticker': {
       const query = String(args.query ?? '').trim();
       if (!query) return { ok: false, output: 'query 为空。' };
-      const list = loadStickerIndex();
+      const list = loadStickerIndex().filter((entry) => entry.disabled !== true);
       if (list.length === 0) {
         return { ok: false, output: '表情包索引还没建好（收藏表情还没同步打标完，启动后会自动同步），先用文字回，别硬发表情。' };
       }

@@ -44,6 +44,7 @@ import { MASTER_SCOPE_ID, MASTER_SCOPE_KEY, MASTER_SCOPE_TYPE, isInternalReportE
 import { cleanText, markMentionsSelf, shouldIgnoreMessage, sourceKindOf, sourceLabelOf } from './source.js';
 import { GroupReplyWindows, buildDebounceTriggerMessage, shouldTrigger } from './trigger.js';
 import { TurnCheckpointStore } from '../store/checkpoint.js';
+import { ScopeSendLedger } from '../bot/idempotency.js';
 import { GroupRolesCache } from './group-roles.js';
 import { chatToolSchemas, executeChatTool, refreshStickerIndex, type StickerRefreshResult, type ToolContext, type ToolResult } from './tools.js';
 import { TaskScheduler, type ScheduledTask } from './scheduler.js';
@@ -92,6 +93,8 @@ export class AiOrchestrator {
   private readonly turnLog: TurnLogStore;
   /** Checkpoint store: crash recovery for in-progress turns. */
   private readonly checkpoint: TurnCheckpointStore;
+  /** scope 级 send_message 幂等账本（跨回合存活，TTL 5 分钟）。 */
+  private readonly sendLedger = new ScopeSendLedger();
 
   private messageEpoch = 0;
   private readonly recentMessageKeys = new Map<string, number>();
@@ -155,7 +158,20 @@ export class AiOrchestrator {
   start(): void {
     this.running = true;
     this.tasks.start(); // recovers persisted alarms/recurring tasks (fires overdue)
-    void this.checkpoint.pruneStale(); // Clear stale checkpoints from dead processes
+    this.recoverInterruptedTurns();
+  }
+
+  /**
+   * 上个进程在回合中途死掉（kill / OOM / 断电）时 catch 没机会写中断便签；
+   * 残留的 checkpoint 就是证据——补写便签后删除。同步执行，赶在任何新回合前。
+   */
+  private recoverInterruptedTurns(): void {
+    for (const checkpoint of this.checkpoint.takeAll()) {
+      console.warn(`[orchestrator] recovered interrupted turn scope=${checkpoint.scopeKey} tools=${checkpoint.executedTools.join(',')}`);
+      const crash = new Error('process exited mid-turn');
+      crash.name = '进程中断';
+      this.persistInterruptNote(checkpoint.scopeType, checkpoint.scopeId, crash, checkpoint.executedTools);
+    }
   }
 
   /** Per-scope tool-call / turn-summary logs (panel reads these). */
@@ -425,22 +441,7 @@ export class AiOrchestrator {
     const domain = domainDefForScope(`${scopeType}:${scopeId}`);
     let cleaned = item.cleaned || message.text;
     this.models.beginRequest('main');
-    let executedTools: string[] = [];
-    let extension: ModelMessage[] = [];
-    let historyBeforeTrigger: HistoryEntry[] = [];
-    let triggerMessages: TriggerEntry[] = [];
-    let toolRound = 0;
-
-    // 尝试从 checkpoint 恢复（上轮回合中断时的中间态）
-    const savedCheckpoint = await this.checkpoint.read(scopeKey);
-    if (savedCheckpoint !== null) {
-      console.info(`[orchestrator] resuming from checkpoint scope=${scopeKey} toolRound=${savedCheckpoint.toolRound}`);
-      executedTools = savedCheckpoint.executedTools.slice();
-      extension = JSON.parse(JSON.stringify(savedCheckpoint.extension)) as ModelMessage[];
-      historyBeforeTrigger = JSON.parse(JSON.stringify(savedCheckpoint.historyBeforeTrigger)) as HistoryEntry[];
-      toolRound = savedCheckpoint.toolRound;
-    }
-
+    const executedTools: string[] = [];
     /** 回合开始时间（用于回合摘要的耗时统计）。 */
     const turnStartedAt = Date.now();
     /** 本回合触发消息文本（摘要日志用）。 */
@@ -698,6 +699,7 @@ export class AiOrchestrator {
           scopeId,
           executedTools,
           sentImageKeys,
+          sendLedger: this.sendLedger,
         };
 
         let sawStaySilent = false;
@@ -759,6 +761,19 @@ export class AiOrchestrator {
             ok: result.ok,
             durationMs: Date.now() - turnStartedAt,
           });
+          // 逐工具 checkpoint：进程在回合中途被杀（catch 不会跑）时，下次启动
+          // 据此补写中断便签，让下一回合知道哪些副作用真的发生过。
+          if (executedTools.length > 0) {
+            this.checkpoint.write({
+              scopeKey,
+              scopeType,
+              scopeId,
+              at: Date.now(),
+              executedTools: executedTools.slice(),
+              toolRound,
+              triggerPreview: (triggerTexts[0] ?? '').slice(0, 120),
+            });
+          }
           // 请示回执：主级回话/委派/直达工具命中来源会话即算已回执。
           if (result.ok && pendingAcks.size > 0) {
             const ackTarget = this.ackTargetOfCall(call);
@@ -790,19 +805,6 @@ export class AiOrchestrator {
 
         toolRound += 1;
 
-        // 工具轮后 checkpoint 保存（崩溃恢复用）
-        if (toolRound > 0 && !this.isEpochStale(runEpoch)) {
-          void this.checkpoint.write({
-            scopeKey,
-            at: Date.now(),
-            historyBeforeTrigger,
-            extension,
-            executedTools,
-            toolRound,
-          }).catch((error) => {
-            console.warn(`[orchestrator] checkpoint write failed scope=${scopeKey}:`, error);
-          });
-        }
 
         if (toolRound >= MAX_TOOL_ITERATIONS) break;
 
@@ -861,6 +863,7 @@ export class AiOrchestrator {
       // 中断便签又只记 error.name——不打这条日志，协议层报错无从排查。
       console.error('[orchestrator] turn failed:', error);
       this.persistInterruptNote(scopeType, scopeId, error, executedTools);
+      this.checkpoint.remove(scopeKey); // 便签已落盘，不再需要启动时补写
       this.notifyAdminIfNeeded(scopeType, scopeId, error, executedTools);
     }
 
@@ -879,13 +882,36 @@ export class AiOrchestrator {
       durationMs: Date.now() - turnStartedAt,
     });
 
-    // 成功完成：删除 checkpoint（下次不用恢复）
-    const completed = !this.isEpochStale(runEpoch);
-    if (completed) {
-      void this.checkpoint.remove(scopeKey).catch((error) => {
-        console.warn(`[orchestrator] checkpoint remove failed scope=${scopeKey}:`, error);
-      });
+    // 主AI回传闭环: master's plain-text conclusion goes back to the child that
+    // reported, as an internal intel note (legacy "直接输出普通文本回传"语义).
+    // Only for internally-triggered turns — a reply to the master himself must
+    // never leak into a child scope.
+    if (isMasterScope && message.userId === 0 && lastModelText && relayFromScope && !isSilenceConclusion(lastModelText)) {
+      this.relayBackToChild(relayFromScope, lastModelText);
+      pendingAcks.delete(relayFromScope);
     }
+
+    // 请示回执兜底：带 need_reply 的上报在本回合没有得到任何回话（没调
+    // domain_message/message_scope/delegate_to_child 命中来源会话，也没走
+    // 主AI回传闭环），追问一次。提醒自身不带 ack 标记，不会连环自激。
+    if (pendingAcks.size > 0 && this.running && !this.isEpochStale(runEpoch)) {
+      const lines = [...pendingAcks.entries()]
+        .map(([from, snippet]) => `- ${from}：${snippet}`)
+        .join('\n');
+      console.warn(`[orchestrator] ack reminder scope=${scopeKey} pending=${[...pendingAcks.keys()].join(',')}`);
+      this.injectInternalMessage(
+        scopeKey,
+        `[回执提醒] 本轮收到的请示类上报（带 need_reply 标记）到现在还没有任何回执：\n${lines}\n`
+          + '请示方还在等结论。请逐条给出明确答复：用 domain_message(target="<来源会话>"，如 "private:123456") '
+          + '把结论（批准/驳回/暂缓及原因）回给来源会话；主AI也可以直接 delegate_to_child 委派来源会话的子AI执行（委派即算回执）。'
+          + '有意不回复的极少数情况，用 memory_write 记一句「不回执+理由」，别让来源会话干等。',
+        { ack_reminder: true },
+      );
+    }
+
+    // 回合正常结束（含 epoch 作废）：进程没死，checkpoint 作废
+    this.checkpoint.remove(scopeKey);
+    const completed = !this.isEpochStale(runEpoch);
     return this.mergeFollowupAfterTurn(scopeKey, item, completed);
   }
 
