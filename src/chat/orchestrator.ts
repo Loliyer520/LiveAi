@@ -43,6 +43,7 @@ import type { ChatMessage, HistoryEntry, ModelMessage, ToolCall, TriggerEntry } 
 import { MASTER_SCOPE_ID, MASTER_SCOPE_KEY, MASTER_SCOPE_TYPE, isInternalReportEntry, isMasterScope as isMasterScopeOf, messageNickname } from './types.js';
 import { cleanText, markMentionsSelf, shouldIgnoreMessage, sourceKindOf, sourceLabelOf } from './source.js';
 import { GroupReplyWindows, buildDebounceTriggerMessage, shouldTrigger } from './trigger.js';
+import { TurnCheckpointStore } from '../store/checkpoint.js';
 import { GroupRolesCache } from './group-roles.js';
 import { chatToolSchemas, executeChatTool, refreshStickerIndex, type StickerRefreshResult, type ToolContext, type ToolResult } from './tools.js';
 import { TaskScheduler, type ScheduledTask } from './scheduler.js';
@@ -89,6 +90,8 @@ export class AiOrchestrator {
   private readonly novelCmd: NovelCommandHandler | null;
   /** Per-scope tool-call and turn-summary logs (browsable in WebUI). */
   private readonly turnLog: TurnLogStore;
+  /** Checkpoint store: crash recovery for in-progress turns. */
+  private readonly checkpoint: TurnCheckpointStore;
 
   private messageEpoch = 0;
   private readonly recentMessageKeys = new Map<string, number>();
@@ -131,6 +134,7 @@ export class AiOrchestrator {
     this.novelCmd = deps.novelCmd ?? null;
     this.workspaceDir = deps.workspaceDir ?? join(dirname(deps.tasksPath), 'workspace');
     this.turnLog = new TurnLogStore(join(dirname(deps.tasksPath), 'turn-logs'));
+    this.checkpoint = new TurnCheckpointStore(join(dirname(deps.tasksPath), '.checkpoint'));
     this.groupRoles = new GroupRolesCache(deps.bot);
     this.sessions = new CharacterSessionRegistry(this.mailbox);
     this.coordinator = new AtomicTurnBatchCoordinator(this.mailbox);
@@ -151,6 +155,7 @@ export class AiOrchestrator {
   start(): void {
     this.running = true;
     this.tasks.start(); // recovers persisted alarms/recurring tasks (fires overdue)
+    void this.checkpoint.pruneStale(); // Clear stale checkpoints from dead processes
   }
 
   /** Per-scope tool-call / turn-summary logs (panel reads these). */
@@ -420,7 +425,22 @@ export class AiOrchestrator {
     const domain = domainDefForScope(`${scopeType}:${scopeId}`);
     let cleaned = item.cleaned || message.text;
     this.models.beginRequest('main');
-    const executedTools: string[] = [];
+    let executedTools: string[] = [];
+    let extension: ModelMessage[] = [];
+    let historyBeforeTrigger: HistoryEntry[] = [];
+    let triggerMessages: TriggerEntry[] = [];
+    let toolRound = 0;
+
+    // 尝试从 checkpoint 恢复（上轮回合中断时的中间态）
+    const savedCheckpoint = await this.checkpoint.read(scopeKey);
+    if (savedCheckpoint !== null) {
+      console.info(`[orchestrator] resuming from checkpoint scope=${scopeKey} toolRound=${savedCheckpoint.toolRound}`);
+      executedTools = savedCheckpoint.executedTools.slice();
+      extension = JSON.parse(JSON.stringify(savedCheckpoint.extension)) as ModelMessage[];
+      historyBeforeTrigger = JSON.parse(JSON.stringify(savedCheckpoint.historyBeforeTrigger)) as HistoryEntry[];
+      toolRound = savedCheckpoint.toolRound;
+    }
+
     /** 回合开始时间（用于回合摘要的耗时统计）。 */
     const turnStartedAt = Date.now();
     /** 本回合触发消息文本（摘要日志用）。 */
@@ -769,6 +789,21 @@ export class AiOrchestrator {
         if (sawStaySilent) break;
 
         toolRound += 1;
+
+        // 工具轮后 checkpoint 保存（崩溃恢复用）
+        if (toolRound > 0 && !this.isEpochStale(runEpoch)) {
+          void this.checkpoint.write({
+            scopeKey,
+            at: Date.now(),
+            historyBeforeTrigger,
+            extension,
+            executedTools,
+            toolRound,
+          }).catch((error) => {
+            console.warn(`[orchestrator] checkpoint write failed scope=${scopeKey}:`, error);
+          });
+        }
+
         if (toolRound >= MAX_TOOL_ITERATIONS) break;
 
         // ── mid-turn pickup (插队): fold what arrived while we were working.
@@ -844,34 +879,13 @@ export class AiOrchestrator {
       durationMs: Date.now() - turnStartedAt,
     });
 
-    // 主AI回传闭环: master's plain-text conclusion goes back to the child that
-    // reported, as an internal intel note (legacy "直接输出普通文本回传"语义).
-    // Only for internally-triggered turns — a reply to the master himself must
-    // never leak into a child scope.
-    if (isMasterScope && message.userId === 0 && lastModelText && relayFromScope && !isSilenceConclusion(lastModelText)) {
-      this.relayBackToChild(relayFromScope, lastModelText);
-      pendingAcks.delete(relayFromScope);
-    }
-
-    // 请示回执兜底：带 need_reply 的上报在本回合没有得到任何回话（没调
-    // domain_message/message_scope/delegate_to_child 命中来源会话，也没走
-    // 主AI回传闭环），追问一次。提醒自身不带 ack 标记，不会连环自激。
-    if (pendingAcks.size > 0 && this.running && !this.isEpochStale(runEpoch)) {
-      const lines = [...pendingAcks.entries()]
-        .map(([from, snippet]) => `- ${from}：${snippet}`)
-        .join('\n');
-      console.warn(`[orchestrator] ack reminder scope=${scopeKey} pending=${[...pendingAcks.keys()].join(',')}`);
-      this.injectInternalMessage(
-        scopeKey,
-        `[回执提醒] 本轮收到的请示类上报（带 need_reply 标记）到现在还没有任何回执：\n${lines}\n`
-          + '请示方还在等结论。请逐条给出明确答复：用 domain_message(target="<来源会话>"，如 "private:123456") '
-          + '把结论（批准/驳回/暂缓及原因）回给来源会话；主AI也可以直接 delegate_to_child 委派来源会话的子AI执行（委派即算回执）。'
-          + '有意不回复的极少数情况，用 memory_write 记一句「不回执+理由」，别让来源会话干等。',
-        { ack_reminder: true },
-      );
-    }
-
+    // 成功完成：删除 checkpoint（下次不用恢复）
     const completed = !this.isEpochStale(runEpoch);
+    if (completed) {
+      void this.checkpoint.remove(scopeKey).catch((error) => {
+        console.warn(`[orchestrator] checkpoint remove failed scope=${scopeKey}:`, error);
+      });
+    }
     return this.mergeFollowupAfterTurn(scopeKey, item, completed);
   }
 
