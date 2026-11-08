@@ -218,6 +218,41 @@ export async function handleWebui(
       return;
     }
 
+    // ── 状态流（SSE 实时刷新） ──────────────────────────────────────────────
+    if (request.method === 'GET' && url.pathname === '/api/status/stream') {
+      response.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+        'connection': 'keep-alive',
+      });
+      const send = (data: unknown) => {
+        response.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+      const getStatus = () => {
+        const agents = deps.repo.listAgents();
+        return {
+          uptimeSec: Math.floor(process.uptime()),
+          bot: {
+            connected: deps.bot.connected,
+            selfId: deps.bot.selfId,
+            nickname: deps.bot.selfNickname || '（昵称待学习）',
+            mode: deps.bot.connectionMode ?? 'client',
+          },
+          scopes: { total: agents.length, enabled: agents.filter((a) => a.enabled !== false).length },
+          usage: deps.usage.snapshot(),
+        };
+      };
+      send(getStatus());
+      const interval = setInterval(() => {
+        send(getStatus());
+      }, 2000); // 2 秒推送一次
+      request.on('close', () => {
+        clearInterval(interval);
+        response.end();
+      });
+      return;
+    }
+
     // ── 会话（Onebot 桥 · 会话管控选项卡；也供设置页总开关统计） ─────────────
     if (request.method === 'GET' && url.pathname === '/api/scopes') {
       const agents = deps.repo.listAgents();
