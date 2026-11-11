@@ -10,6 +10,7 @@ import { copyFile, mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
 import type { ToolSchema } from '../models/types.js';
 import type { NapcatBot } from '../bot/napcat.js';
 import { sendActionKey, type ScopeSendLedger } from '../bot/idempotency.js';
+import { parseSleepUntil } from './private-idle.js';
 import type { ScopeRepository } from '../store/repository.js';
 import type { MessageArchive } from '../store/archive.js';
 import type { RelationGraph } from '../relations/graph.js';
@@ -359,6 +360,8 @@ export interface ToolContext {
   sentImageKeys?: Set<string>;
   /** scope 级发送账本：TTL 内同 payload 的 send_message 拒发（legacy ScopeSendLedger）。 */
   sendLedger?: ScopeSendLedger;
+  /** Persist this private conversation's next autonomous wake time. */
+  privateSleep?: (wakeAt: number | null, reason: string) => void;
   executedTools: string[];
 }
 
@@ -1073,6 +1076,18 @@ export function chatToolSchemas(scopeKey: string, isMaster: boolean): ToolSchema
         ...HUB_TOOL_SCHEMAS,
       ]
       : [...CHAT_TOOL_SCHEMAS, ...QQ_CHAT_TOOL_SCHEMAS, ...ACTION_TOOL_SCHEMAS];
+  if (scopeKey.startsWith('private:')) builtin.push({
+    name: 'sleep',
+    description: '私聊休眠：没有需要行动的事项时明确决定下一次自主思考时间，并结束本轮。until 支持 +1h、+1d、带时区的 ISO 时间、Unix 秒或 forever。forever 表示不再自主唤醒，适用于明确不再主动联系。真人新消息会解除休眠；不影响已设闹钟/任务。重启后仍有效。',
+    parameters: {
+      type: 'object',
+      properties: {
+        until: { type: 'string', description: '+1h / +1d / 2026-11-10T09:00:00+08:00 / Unix秒 / forever' },
+        reason: { type: 'string', description: '为什么现在不行动、下次醒来考虑什么' },
+      },
+      required: ['until', 'reason'],
+    },
+  });
   const reserved = new Set(builtin.map((schema) => schema.name));
   const pluginSchemas = pluginRegistry()?.toolSchemas(scopeKey, isMaster, reserved) ?? [];
   return [...builtin, ...pluginSchemas];
@@ -1124,6 +1139,18 @@ export async function executeChatTool(
   const args = call.arguments ?? {};
   const toolName = call.name;
   switch (call.name) {
+    case 'sleep': {
+      if (context.scopeType !== 'private' || !context.privateSleep) return { ok: false, output: 'sleep 仅限私聊。' };
+      const reason = String(args.reason ?? '').trim();
+      if (!reason) return { ok: false, output: '请说明休眠原因。' };
+      const at = parseSleepUntil(String(args.until ?? ''));
+      if (at === undefined) return { ok: false, output: '时间无效：用 +1h、+1d、带时区的 ISO 时间、未来 Unix 秒或 forever。' };
+      try { context.privateSleep(at, reason); }
+      catch (error) { return { ok: false, output: `未设置休眠：${error instanceof Error ? error.message : String(error)}` }; }
+      return { ok: true, staySilent: true, output: at === null
+        ? '已永久休眠，不再自主联系；真人新消息仍会唤醒。本轮结束。'
+        : `已持久化休眠至 ${new Date(at).toISOString()}，到点自动决策，真人新消息可提前唤醒。本轮结束。` };
+    }
     case 'send_message': {
       // Never "chat" with the bot's own account (self-chat is not a scope).
       if (context.scopeType === 'private' && botIsSelfId(context.bot, context.scopeId)) {

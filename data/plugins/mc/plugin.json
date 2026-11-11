@@ -5,7 +5,7 @@
   "tools": [
     {
       "name": "mc_ping",
-      "description": "进服前查服务器：是否在线、版本、MOTD、在线人数、延迟。只知道地址不确定版本时先用它。",
+      "description": "进服前查服务器：是否在线、版本、MOTD、在线人数、延迟。host 可写域名/IP，也可直接写 host:port；只知道地址、不确定版本时先用它。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -16,7 +16,7 @@
         "properties": {
           "host": {
             "type": "string",
-            "description": "服务器地址（域名或 IP）"
+            "description": "服务器地址（域名或 IP，也可 host:port）"
           },
           "port": {
             "type": "number",
@@ -50,7 +50,7 @@
     },
     {
       "name": "mc_join",
-      "description": "进入真实 Minecraft Java 版服务器。version=auto 按协议选后端：26.2/776=Rust，其他=Mineflayer。离线服 auth=offline；微软正版目前仅旧版 Mineflayer 可用。进服后先看 mc_status、mc_events。26.2 的寻路/挖放/打怪等尚在移植，不支持时会明确报错，不要当成成功。",
+      "description": "自主进入任意 Minecraft Java 服务器：version=auto 先探测协议再选后端（26.2/776=Rust，其他=Mineflayer），探测失败会自动退回 Mineflayer 尝试。AuthMe 类登录插件会自动识别「注册/登录/已注册/密码错误」提示并自动 /register 或 /login；密码可按 host:port 记住，首次自动生成。掉线自动重连（封禁/白名单等终止性原因不再重试）。进服后先看 mc_status、mc_events。",
       "scopes": [
         "domain:mc",
         "mcclient"
@@ -61,7 +61,7 @@
         "properties": {
           "host": {
             "type": "string",
-            "description": "服务器地址（域名或 IP）"
+            "description": "服务器地址（域名或 IP，也可 host:port）"
           },
           "port": {
             "type": "number",
@@ -75,7 +75,7 @@
           },
           "version": {
             "type": "string",
-            "description": "版本，默认 auto；连不上时手填服务器版本",
+            "description": "版本，默认 auto 自动探测；连不上时手填服务器版本",
             "default": "auto"
           },
           "auth": {
@@ -85,18 +85,23 @@
           },
           "password": {
             "type": "string",
-            "description": "登录插件密码（AuthMe 等），没有就留空",
+            "description": "该服登录插件的密码；留空则用档案里记住的，首次需要注册时自动生成并记住",
             "default": ""
           },
           "register": {
             "type": "string",
-            "description": "需要注册时填要设置的密码，没有就留空",
+            "description": "兼容参数：需要注册时用这个密码；留空等同 password",
             "default": ""
           },
           "auto_reconnect": {
             "type": "boolean",
             "description": "掉线自动重连，默认 true",
             "default": true
+          },
+          "backend": {
+            "type": "string",
+            "description": "后端，默认 auto；可强制 rust（26.2）或 mineflayer（旧版本）",
+            "default": "auto"
           }
         },
         "required": [
@@ -105,7 +110,7 @@
       },
       "request": {
         "method": "GET",
-        "url": "http://127.0.0.1:7660/join?host={{host}}&port={{port}}&username={{username}}&version={{version}}&auth={{auth}}&password={{password}}&register={{register}}&auto_reconnect={{auto_reconnect}}",
+        "url": "http://127.0.0.1:7660/join?host={{host}}&port={{port}}&username={{username}}&version={{version}}&auth={{auth}}&password={{password}}&register={{register}}&backend={{backend}}&auto_reconnect={{auto_reconnect}}",
         "headers": {
           "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
         }
@@ -1486,6 +1491,130 @@
       "request": {
         "method": "GET",
         "url": "http://127.0.0.1:7660/build?blueprint={{blueprint}}&shape={{shape}}&blocks={{blocks}}&material={{material}}&w={{w}}&h={{h}}&d={{d}}&at={{at}}&timeout={{timeout}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_task_create",
+      "description": "创建一个后台调度任务（可并行、可组合，任务自己按 tick 推进，不阻塞对话）。单任务 type：follow(跟人/生物，params={name,distance})、mine(定量采集，{block,count,range,back})、build(按蓝图盖，{shape|blueprint,material,w,h,d,hollow,at})、build_with_materials(备料建房：自动清点库存→采够材料→开盖，参数同 build 另加 mine_block/per_unit)、collect(捡掉落物，{radius})、attack(定量攻击，{name,count})、eat(饿了才吃，{below})、retaliate(巡敌反击，{radius})。复合 type：follow_and_mine（跟我走顺便挖：{name,block,count,stayWithin}——离跟随目标超过 stayWithin 格自动停手先跟上）。priority 越大越优先（100+=紧急/50-99 重要/10-49 主任务/1-9 辅助）。要「一边跟我走一边挖点木头」就用 follow_and_mine，别拆成两次阻塞调用。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "任务类型：follow / mine / build / build_with_materials / collect / attack / eat / retaliate / follow_and_mine"
+          },
+          "priority": {
+            "type": "number",
+            "description": "优先级，默认 10",
+            "default": 10
+          },
+          "params": {
+            "type": "object",
+            "description": "任务参数对象，按 type 取用；如 {\"name\":\"主人\",\"block\":\"oak_log\",\"count\":10,\"stayWithin\":8}",
+            "default": {}
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/schedule/create?type={{type}}&priority={{priority}}&params={{params}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_task_status",
+      "description": "查调度任务：不带 id 列出全部活跃任务 + 最近结束的任务（含状态/备注/进度 state）；带 id 查单个（活跃或历史）。任务用 note/state 汇报进度，如 mine 的 {mined,target}、build 的 {placed,total}、备料建房的 {phase,have,missing}。想知道「派出去的活干到哪了/成没成」就查这个。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "任务 id（可选；不传=全部活跃+最近结束）",
+            "default": ""
+          },
+          "limit": {
+            "type": "number",
+            "description": "历史条数，默认 5",
+            "default": 5
+          }
+        },
+        "required": []
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/schedule/tasks?id={{id}}&limit={{limit}}",
+        "headers": {
+          "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
+        }
+      },
+      "response": {
+        "format": "json",
+        "code_path": "ok",
+        "ok_value": true,
+        "msg_path": "message",
+        "template": "{{message}}"
+      }
+    },
+    {
+      "name": "mc_task_cancel",
+      "description": "取消一个调度任务（按 id）。/stop 也能一次取消全部任务。",
+      "scopes": [
+        "domain:mc",
+        "mcclient"
+      ],
+      "allow_internal": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "taskId": {
+            "type": "string",
+            "description": "要取消的任务 id"
+          },
+          "reason": {
+            "type": "string",
+            "description": "取消原因（写进任务备注），默认「手动取消」",
+            "default": "手动取消"
+          }
+        },
+        "required": [
+          "taskId"
+        ]
+      },
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:7660/schedule/cancel?taskId={{taskId}}&reason={{reason}}",
         "headers": {
           "Authorization": "Bearer {{secrets.MCBOT_TOKEN}}"
         }

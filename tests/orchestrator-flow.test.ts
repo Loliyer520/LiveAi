@@ -8,9 +8,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { AiOrchestrator } from '../src/chat/orchestrator.js';
 import { setDnsResolverForTests } from '../src/chat/net.js';
 import { RelationGraph } from '../src/relations/graph.js';
@@ -77,6 +77,8 @@ async function makeHarness(
   onFirstModelCall?: () => void,
   /** Runs against the temp dir before the orchestrator starts (seed state). */
   beforeStart?: (dir: string) => Promise<void>,
+  messageDebounceMs = 0,
+  privateIdleMs = 0,
 ): Promise<Harness> {
   const dir = await mkdtemp(join(tmpdir(), 'liveai-test-'));
   await beforeStart?.(dir);
@@ -170,6 +172,8 @@ async function makeHarness(
   }) as typeof fetch;
 
   const orchestrator = new AiOrchestrator({
+    messageDebounceMs,
+    privateIdleMs,
     bot: fakeBot,
     repo,
     promptStore: prompts,
@@ -210,6 +214,95 @@ async function makeHarness(
     },
   };
 }
+
+test('user burst waits for quiet then reaches the model as one batch', async () => {
+  const harness = await makeHarness([
+    { tool: 'stay_silent', input: {} },
+  ], undefined, undefined, 100);
+  try {
+    harness.orchestrator.handleMessage(makeMessage(123, '第一段转发', 100, 801));
+    await sleep(60);
+    assert.equal(harness.modelRequests.length, 0);
+    harness.orchestrator.handleMessage(makeMessage(123, '第二段转发', 100, 802));
+    await sleep(60);
+    assert.equal(harness.modelRequests.length, 0, 'new message resets the deadline');
+    await waitFor(() => harness.modelRequests.length === 1);
+    const request = JSON.stringify(harness.modelRequests[0]);
+    assert.ok(request.includes('第一段转发'));
+    assert.ok(request.includes('第二段转发'));
+    await sleep(150);
+    assert.equal(harness.modelRequests.length, 1, 'one burst starts one model turn');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('private quiet wake asks for a decision, rejects bare silence, persists sleep', async () => {
+  const harness = await makeHarness([
+    { tool: 'stay_silent', input: {} },
+    { tool: 'stay_silent', input: {} },
+    { tool: 'sleep', input: { until: '+1h', reason: '没有需要处理的事项，一小时后再考虑' } },
+  ], undefined, undefined, 0, 80);
+  try {
+    harness.orchestrator.handleMessage(makeMessage(123, '暂时没事', 100, 901));
+    await waitFor(() => harness.modelRequests.length === 3);
+    const wake = JSON.stringify(harness.modelRequests[1]);
+    assert.ok(wake.includes('防死寂决策'));
+    await waitFor(() => {
+      const path = join(dirname(harness.modelsJson), 'private-idle.json');
+      return existsSync(path) && JSON.parse(readFileSync(path, 'utf8')).scopes['private:123'].mode === 'sleep';
+    });
+    await sleep(180);
+    assert.equal(harness.modelRequests.length, 3);
+    assert.equal(harness.sent.length, 0, 'decision trigger is internal, not a forced message');
+  } finally { await harness.cleanup(); }
+});
+
+test('forever sleep stops autonomous contact, real incoming messages still wake the model', async () => {
+  const harness = await makeHarness([
+    { tool: 'sleep', input: { until: 'forever', reason: '用户明确不再主动联系' } },
+    { tool: 'sleep', input: { until: '+1d', reason: '新消息已处理，明天再考虑' } },
+  ], undefined, undefined, 0, 80);
+  try {
+    harness.orchestrator.handleMessage(makeMessage(123, '不要主动联系我', 100, 911));
+    await waitFor(() => harness.modelRequests.length === 1);
+    await sleep(180);
+    assert.equal(harness.modelRequests.length, 1);
+    harness.orchestrator.handleMessage(makeMessage(123, '我回来问一下', 100, 912));
+    await waitFor(() => harness.modelRequests.length === 2);
+    await sleep(180);
+    assert.equal(harness.modelRequests.length, 2);
+  } finally { await harness.cleanup(); }
+});
+
+test('non-triggering group messages extend an already triggered quiet window', async () => {
+  const harness = await makeHarness([{ tool: 'stay_silent', input: {} }], undefined, undefined, 100);
+  try {
+    harness.orchestrator.handleMessage({
+      ...makeMessage(555, '先看这些', 100, 811), chatType: 'group', mentionsSelf: true,
+    });
+    await sleep(60);
+    harness.orchestrator.handleMessage({
+      ...makeMessage(555, '补充材料', 100, 812), chatType: 'group',
+    });
+    await sleep(60);
+    assert.equal(harness.modelRequests.length, 0);
+    await waitFor(() => harness.modelRequests.length === 1);
+    assert.ok(JSON.stringify(harness.modelRequests[0]).includes('补充材料'));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('internal request events do not wait for the user-message quiet interval', async () => {
+  const harness = await makeHarness([{ tool: 'stay_silent', input: {} }], undefined, undefined, 10_000);
+  try {
+    harness.orchestrator.handleQqRequestEvent({ request_type: 'friend', user_id: 100, comment: '申请' });
+    await waitFor(() => harness.modelRequests.length === 1, 1000);
+  } finally {
+    await harness.cleanup();
+  }
+});
 
 test('simple private reply: one model call, send_message sends and persists', async () => {
   const harness = await makeHarness([

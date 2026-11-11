@@ -114,14 +114,6 @@ function bm25Score(haystack: string[], terms: string[], avgdl: number): number {
   return score;
 }
 
-/** Compute average document length (in tokens) over the corpus. O(N) but
- *  called once per search across all scopes that match the time/user filter. */
-function avgDl(entries: HistoryEntry[]): number {
-  if (entries.length === 0) return 100;
-  const total = entries.reduce((sum, entry) => sum + (String(entry.text ?? '').length / CHARS_PER_TOKEN), 0);
-  return Math.max(1, total / entries.length);
-}
-
 export function entryMatches(entry: HistoryEntry, terms: string[]): boolean {
   if (terms.length === 0) return false;
   const haystack = `${String(entry.text ?? '')}\n${String(entry.nickname ?? '')}\n${String(entry.raw_message ?? '')}`.toLowerCase();
@@ -190,11 +182,13 @@ export class MessageArchive {
     }
     const candidates: Candidate[] = [];
     let totalEntries = 0;
+    let totalLength = 0;
     for (const { scopeKey, path } of scopeFiles) {
       const entries = await this.loadLines(scopeKey, path);
       totalEntries += entries.length;
       for (let index = 0; index < entries.length; index += 1) {
         const entry = entries[index];
+        totalLength += String(entry.text ?? '').length / CHARS_PER_TOKEN;
         if (query.userId !== undefined && Number(entry.user_id) !== query.userId) continue;
         const timestamp = Number(entry.timestamp ?? 0);
         if (query.from !== undefined && timestamp < query.from) continue;
@@ -204,15 +198,9 @@ export class MessageArchive {
     }
     if (candidates.length === 0) return [];
 
-    // Estimate avgdl from the full corpus (all entries, not just candidates).
-    const allEntries = await (async () => {
-      const result: HistoryEntry[] = [];
-      for (const { scopeKey, path } of scopeFiles) {
-        result.push(...(await this.loadLines(scopeKey, path)));
-      }
-      return result;
-    })();
-    const avdl = avgDl(allEntries.length > 0 ? allEntries : candidates.flatMap((c) => c.entries));
+    // Compute over the full corpus without spreading a potentially huge
+    // archive into function arguments (V8's argument limit causes RangeError).
+    const avdl = totalEntries === 0 ? 100 : Math.max(1, totalLength / totalEntries);
 
     // Pass 2: score each candidate with BM25; hard-filter on phrases.
     interface Scored {

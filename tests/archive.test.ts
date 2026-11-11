@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MessageArchive, parseSearchQuery, entryMatches } from '../src/store/archive.js';
@@ -94,6 +94,23 @@ test('archive search returns [] for empty terms', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('cross-scope search handles an archive larger than the V8 argument limit', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'liveai-archive-large-'));
+  const archive = new MessageArchive(dir);
+  try {
+    const filler = JSON.stringify(entry('普通记录')) + '\n';
+    await writeFile(join(dir, 'private_777.jsonl'), filler.repeat(200_000)
+      + JSON.stringify(entry('雪球发来的消息', 777, 1_700_000_300)) + '\n');
+    await writeFile(join(dir, 'group_888.jsonl'), JSON.stringify(entry('雪球的另一条消息', 888, 1_700_000_400)) + '\n');
+    const hits = await archive.search({ query: '雪球' });
+    assert.equal(hits.length, 2);
+    assert.deepEqual(new Set(hits.map((hit) => hit.scopeKey)), new Set(['private:777', 'group:888']));
+    const filtered = await archive.search({ query: '雪球', userId: 777 });
+    assert.equal(filtered.length, 1);
+    assert.equal(filtered[0].contextBefore.length, 1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test('memory_search tool queries the archive and formats hits with context', async () => {

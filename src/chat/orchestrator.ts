@@ -45,6 +45,8 @@ import { cleanText, markMentionsSelf, shouldIgnoreMessage, sourceKindOf, sourceL
 import { GroupReplyWindows, buildDebounceTriggerMessage, shouldTrigger } from './trigger.js';
 import { TurnCheckpointStore } from '../store/checkpoint.js';
 import { ScopeSendLedger } from '../bot/idempotency.js';
+import { MessageDebounce } from './message-debounce.js';
+import { PrivateIdle } from './private-idle.js';
 import { GroupRolesCache } from './group-roles.js';
 import { chatToolSchemas, executeChatTool, refreshStickerIndex, type StickerRefreshResult, type ToolContext, type ToolResult } from './tools.js';
 import { TaskScheduler, type ScheduledTask } from './scheduler.js';
@@ -74,6 +76,8 @@ export class AiOrchestrator {
   private readonly coordinator: AtomicTurnBatchCoordinator;
   private readonly dispatcher: ScopeActorDispatcher;
   private readonly groupWindows: GroupReplyWindows;
+  private readonly messageDebounce: MessageDebounce;
+  private readonly privateIdle: PrivateIdle;
   private readonly promptStore: PromptStore;
   private readonly repo: ScopeRepository;
   private readonly models: ModelManager;
@@ -122,8 +126,15 @@ export class AiOrchestrator {
     workspaceDir?: string;
     /** 小说阅读指令机（可选）：指定 scope 的整句指令直接应答，跳过模型。 */
     novelCmd?: NovelCommandHandler | null;
+    /** Quiet interval before user-message turns; production default is 2s. */
+    messageDebounceMs?: number;
+    /** Production default: 2 minutes. Zero disables autonomous wakeups in tests. */
+    privateIdleMs?: number;
   }) {
     this.bot = deps.bot;
+    this.messageDebounce = new MessageDebounce(deps.messageDebounceMs);
+    this.privateIdle = new PrivateIdle(join(dirname(deps.tasksPath), 'private-idle.json'),
+      (scopeKey, revision) => this.firePrivateIdle(scopeKey, revision), deps.privateIdleMs);
     this.repo = deps.repo;
     this.promptStore = deps.promptStore;
     this.models = deps.models;
@@ -159,6 +170,13 @@ export class AiOrchestrator {
     this.running = true;
     this.tasks.start(); // recovers persisted alarms/recurring tasks (fires overdue)
     this.recoverInterruptedTurns();
+    this.privateIdle.start();
+    for (const agent of this.repo.listAgents()) {
+      if (agent.scopeType !== 'private' || agent.enabled === false || this.isCurrentSelf(agent.scopeId)) continue;
+      if (this.repo.getMessages('private', agent.scopeId).some((entry) => entry.user_id > 0)) {
+        this.recordPrivateActivity(`private:${agent.scopeId}`, false, true);
+      }
+    }
   }
 
   /**
@@ -181,6 +199,7 @@ export class AiOrchestrator {
 
   async stop(): Promise<void> {
     this.running = false;
+    this.privateIdle.stop();
     this.bumpEpoch();
     this.groupWindows.cancelAll();
     this.tasks.stop(); // timers cleared; tasks.json persists for next boot
@@ -262,6 +281,7 @@ export class AiOrchestrator {
     const text = (message.text || '').trim();
     if (!text) return;
     if (this.isDuplicateEvent(message)) return;
+    if (message.chatType === 'private') this.recordPrivateActivity(`private:${message.chatId}`, false);
     console.info(
       `[orchestrator] self-event scope=${message.chatType}:${String(message.chatId)} mid=${String(message.messageId ?? '')}`
       + ` text=${text.slice(0, 40).replace(/\n/g, ' ')}`,
@@ -361,6 +381,7 @@ export class AiOrchestrator {
         console.info(`[orchestrator] stale message dropped scope=${scopeKey}`);
         return;
       }
+      if (scopeType === 'private' && message.userId > 0) this.recordPrivateActivity(scopeKey, true);
 
       // 小说阅读指令机：启用 scope 里的整句指令（搜书/选/目录/看/下一章）
       // 直接应答并记历史，跳过触发门与模型——指令以外的消息照常往下走 AI。
@@ -373,6 +394,10 @@ export class AiOrchestrator {
       }
 
       const triggered = shouldTrigger(message, cleaned, agent);
+      // Even a non-triggering group message extends an already waiting batch.
+      if ((message.userId > 0 || sourceKind === 'admin_webui') && sourceKind !== 'internal_task') {
+        this.messageDebounce.touch(scopeKey);
+      }
       this.touchGroupWindow(message, scopeKey, scopeId);
       if (!triggered) return;
 
@@ -404,6 +429,21 @@ export class AiOrchestrator {
   private async consumeTurn(scopeKey: string, item: TurnItem): Promise<void> {
     let current: TurnItem | null = item;
     while (current !== null) {
+      if (current.kind === 'message' && current.message !== null
+        && (current.message.userId > 0 || sourceKindOf(current.message) === 'admin_webui') && !current.silentEvent
+        && sourceKindOf(current.message) !== 'internal_task') {
+        const quiet = this.messageDebounce.wait(scopeKey);
+        if (quiet) {
+          await quiet;
+          if (this.isEpochStale(this.resolveEpoch(current.messageEpoch))) return;
+          const batch = this.coordinator.drainScopeFollowup(
+            scopeKey, current.historySeed ?? [], null,
+            (pending) => this.isMessageStale(pending.message),
+          );
+          current = mergeFollowupItems(scopeKey, current, batch?.turnItem ?? null);
+          if (current === null) return;
+        }
+      }
       if (!hasActionableEvent(current)) {
         // 纯静默批次（其他设备的本人消息等）：内容已在入队时写进历史，
         // 永不单独触发生成。先并入此刻排队的后续——有真实消息就一起走，
@@ -424,7 +464,13 @@ export class AiOrchestrator {
       const turnStart = Date.now();
       console.info(`[orchestrator] turn start scope=${scopeKey}`);
       const turnItem: TurnItem = current;
-      const followup = await withProbe('chat.turn', () => this.runMessageTurn(scopeKey, turnItem), { scope: scopeKey });
+      const idleDecisionRevision = this.idleRevision(turnItem.message);
+      let followup: TurnItem | null;
+      try {
+        followup = await withProbe('chat.turn', () => this.runMessageTurn(scopeKey, turnItem), { scope: scopeKey });
+      } finally {
+        if (idleDecisionRevision !== null) this.privateIdle.finish(scopeKey, idleDecisionRevision, turnItem.privateIdleActed === true);
+      }
       console.info(`[orchestrator] turn done scope=${scopeKey} took=${Math.round((Date.now() - turnStart) / 1000)}s`);
       current = followup;
     }
@@ -593,7 +639,7 @@ export class AiOrchestrator {
             tools: chatToolSchemas(scopeKey, isMasterScope),
             temperature: 0.85,
             maxTokens: 2048,
-            thinkingLevel: 'off',
+            thinkingLevel: 'low',
             onDelta: () => {
               if (firstTokenMs === null) firstTokenMs = Date.now() - startedAt;
             },
@@ -627,6 +673,13 @@ export class AiOrchestrator {
         // 赋值挪进下面的结论分支：要走重发救援的散文不能当结论——它被丢弃、
         // 用户没看到，若记成 lastModelText 还会被当 [主AI回传] 转播给下级。
         if (reply.toolCalls.length === 0) {
+          if (this.idleRevision(item.message) !== null && !item.privateIdleActed && fallbackPrompts < 2) {
+            fallbackPrompts += 1;
+            extension.push({ role: 'assistant', content: reply.text || '（未选择行动）' });
+            extension.push({ role: 'user', content: '防死寂决策尚未完成：有事请调用实际工具，没有事项请调用 sleep 指定下次时间或 forever；普通文字和 stay_silent 都不等于安排了休眠。' });
+            toolRound += 1;
+            continue;
+          }
           // Plain text without a tool call: the user saw nothing of it. Legacy
           // re-prompted once ("重新决策") before giving up, so a model that
           // answered in prose (e.g. homework it just viewed) gets one chance
@@ -700,6 +753,12 @@ export class AiOrchestrator {
           executedTools,
           sentImageKeys,
           sendLedger: this.sendLedger,
+          privateSleep: scopeType === 'private' ? (wakeAt, reason) => {
+            const revision = this.idleRevision(item.message);
+            if (revision !== null && !this.privateIdle.isCurrent(scopeKey, revision)
+              && this.unseenUserMessages(scopeKey).length > 0) throw new Error('已收到更新消息，旧决策不得覆盖新的会话状态');
+            this.privateIdle.sleep(scopeKey, wakeAt, reason);
+          } : undefined,
         };
 
         let sawStaySilent = false;
@@ -713,6 +772,13 @@ export class AiOrchestrator {
         // 同一批 tool calls 里拦了一个发送就全拦：提示还没被模型读到，不能让后半批漏发。
         let sendBlockedThisBatch = false;
         for (const call of calls) {
+          if (call.name === 'stay_silent' && this.idleRevision(item.message) !== null && !item.privateIdleActed) {
+            if (fallbackPrompts >= 2) { sawStaySilent = true; break; }
+            fallbackPrompts += 1;
+            extension.push({ role: 'tool_result', toolCallId: call.id,
+              content: '防死寂决策不能只 stay_silent：无事项请调用 sleep 设 +1h/+1d/指定时间/forever；有事项调用实际工具。' });
+            continue;
+          }
           // ── 发送拦截：模型没看过的真人新消息躺在 mailbox 里时，第一次发送
           // 不执行，换成提示让模型先「看到」新消息再决定（下轮 fold 会把它们
           // 带进上下文）。重调（水位相同）或 fold 后 mailbox 已空则正常发送。
@@ -780,7 +846,11 @@ export class AiOrchestrator {
             if (ackTarget !== '') pendingAcks.delete(ackTarget);
           }
           if (result.staySilent) sawStaySilent = true;
-          if (result.ok && (result.sentToUser || call.name === 'send_message')) sentThisTurn = true;
+          if (result.ok && call.name !== 'stay_silent' && call.name !== 'sleep') item.privateIdleActed = true;
+          if (result.ok && (result.sentToUser || call.name === 'send_message')) {
+            sentThisTurn = true;
+            if (scopeType === 'private') this.recordPrivateActivity(scopeKey, false);
+          }
           extension.push({ role: 'tool_result', toolCallId: call.id, content: result.output });
           // view_image_raw：原图内联成图像块，紧随 tool_result 的一条 user 消息，
           // 仅下一轮请求可见（再往后被替换成过期标记，不进 repo 历史）。
@@ -800,6 +870,7 @@ export class AiOrchestrator {
               liveImageOnce.push(extension.length - 1);
             }
           }
+          if (result.ok && call.name === 'sleep') break;
         }
         if (sawStaySilent) break;
 
@@ -813,6 +884,11 @@ export class AiOrchestrator {
         // see the tool results and finish deciding (legacy continued on
         // tool_result blocks; breaking here stranded query tools like
         // view_image with their result discarded).
+        const quiet = this.messageDebounce.wait(scopeKey);
+        if (quiet) {
+          await quiet;
+          if (this.isEpochStale(runEpoch)) break;
+        }
         const pending = this.drainLiveTool(scopeKey);
         if (pending !== null) {
           const folded = mergeFollowupItems(scopeKey, pending);
@@ -1001,6 +1077,7 @@ export class AiOrchestrator {
 
   private bumpEpoch(): void {
     this.messageEpoch += 1;
+    this.messageDebounce.clear();
     this.dispatcher.clearRuntimeState();
     this.groupWindows.cancelAll();
   }
@@ -1015,6 +1092,9 @@ export class AiOrchestrator {
 
   private isMessageStale(message: ChatMessage | null): boolean {
     if (message === null) return false;
+    const revision = this.idleRevision(message);
+    if (revision !== null && (!this.privateIdle.isCurrent(`private:${message.chatId}`, revision)
+      || this.repo.getOrCreateAgent('private', String(message.chatId)).enabled === false)) return true;
     // An alarm/delegation is durable work, not an old QQ message. A busy scope
     // must not discard it after five minutes; the scheduler already decides
     // when it should fire, and retries may legitimately arrive later still.
@@ -1065,6 +1145,33 @@ export class AiOrchestrator {
   private fireGroupDebounce(scopeKey: string, scopeId: string, epoch: number): void {
     const synthetic = buildDebounceTriggerMessage(scopeId, epoch, this.bot.selfId);
     this.handleMessage(synthetic);
+  }
+
+  private idleRevision(message: ChatMessage | null): number | null {
+    const raw = message?.rawData as Record<string, unknown> | undefined;
+    return raw?.source === 'private_idle_decision' && typeof raw.idle_revision === 'number' ? raw.idle_revision : null;
+  }
+
+  private recordPrivateActivity(scopeKey: string, incoming: boolean, enroll = false): void {
+    try {
+      if (enroll) this.privateIdle.enroll(scopeKey);
+      else this.privateIdle.activity(scopeKey, incoming);
+    } catch (error) { console.error('[private-idle] activity persistence failed:', error); }
+  }
+
+  private firePrivateIdle(scopeKey: string, revision: number): boolean {
+    const scopeId = scopeKey.slice('private:'.length);
+    if (!this.running || this.bot.connected === false || this.scopeBusy(scopeKey)
+      || this.isCurrentSelf(scopeId) || this.repo.getOrCreateAgent('private', scopeId).enabled === false) return false;
+    const state = this.privateIdle.get(scopeKey);
+    const text = '[防死寂决策] 私聊已经安静至少两分钟，或你设置的休眠已到期。现在自主判断是否有值得处理的事项：可以查证、继续任务、联系对方或作其他真实行动，不要求为了开口而开口。'
+      + '没有事项必须调用 sleep，明确下次决策时间（+1h、+1d、带时区时间）；明确不再主动联系时用 forever。不要仅 stay_silent，也不要循环发“在吗/怎么不说话”。旧口头承诺不是正在执行的证据。'
+      + (state?.reason ? `\n上次休眠原因：${state.reason}` : '');
+    this.handleMessage({ chatType: 'private', chatId: Number(scopeId), userId: 0, text, rawMessage: text,
+      sender: { nickname: '自主决策', user_id: 0 }, messageId: `idle_${scopeId}_${revision}`,
+      mentionsSelf: false, timestamp: Date.now() / 1000,
+      rawData: { source: 'private_idle_decision', idle_revision: revision, system_event: 'alarm' } });
+    return true;
   }
 
   // ── master relay / scheduled tasks ─────────────────────────────────────────
@@ -1156,6 +1263,7 @@ export class AiOrchestrator {
       const warning = '定时图片发送失败：本地原图已失效，且原链接无法重新下载。请重新发图后再安排。';
       console.warn(`[scheduler] ${task.taskId} cancelled: cached original is unavailable`);
       const notice = await this.bot.sendText(scopeType, Number(scopeId), warning);
+      if (scopeType === 'private') this.recordPrivateActivity(task.originScope, false);
       const noticeId = (notice as { message_id?: number | string }).message_id;
       const noticeRef = this.repo.registerMessageRef(scopeType, scopeId, noticeId ?? null);
       this.repo.appendMessage(scopeType, scopeId, {
@@ -1173,6 +1281,7 @@ export class AiOrchestrator {
       ? `base64://${cached.slice(cached.indexOf(',') + 1)}`
       : cached;
     const result = await this.bot.sendImage(scopeType, Number(scopeId), file);
+    if (scopeType === 'private') this.recordPrivateActivity(task.originScope, false);
     const sentId = (result as { message_id?: number | string }).message_id;
     const ref = this.repo.registerMessageRef(scopeType, scopeId, sentId ?? null);
     this.repo.appendMessage(scopeType, scopeId, {
@@ -1343,6 +1452,7 @@ export class AiOrchestrator {
     for (const line of lines) {
       try {
         const result = await this.bot.sendText(targetScopeType as 'group' | 'private', Number(targetScopeId), line);
+        if (targetScopeType === 'private') this.recordPrivateActivity(`private:${targetScopeId}`, false);
         const sentId = (result as { message_id?: number | string }).message_id;
         const ref = this.repo.registerMessageRef(targetScopeType, targetScopeId, sentId ?? null);
         refs.push(ref);

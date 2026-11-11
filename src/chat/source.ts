@@ -13,6 +13,7 @@ export function sourceKindOf(message: ChatMessage): SourceKind {
   if (message.userId === 0 && raw.source === 'dev_agent_task_report') return 'internal_task';
   if (message.userId === 0 && raw.source === 'agent_message') return 'internal_task';
   if (message.userId === 0 && raw.source === 'qq_request_event') return 'internal_task';
+  if (message.userId === 0 && raw.source === 'private_idle_decision') return 'internal_task';
   if (raw.source === 'self_other_device') return 'self_other_device';
   // QQ 数据线（我的电脑/我的手机）：同账号手机端发来的消息，桥侧打 sub_type
   // 标记；orchestrator 注入主AI会话时再放 source=dataline。两条路都认。
