@@ -96,7 +96,7 @@ export interface PluginToolDef {
   /**
    * true = this tool's URL may point at loopback/private addresses (skips the
    * SSRF address check). Only settable in the on-disk manifest — never from
-   * model input — so it stays a master decision (e.g. local novel API).
+   * model input — so it stays a master decision (e.g. local document API).
    */
   allow_internal?: boolean;
   /**
@@ -736,7 +736,7 @@ export class PluginRegistry {
           output = `接口返回的不是 JSON（HTTP ${result.status}）：\n${result.body.slice(0, 1000)}`;
           return { ok: result.status < 400, output: this.scrub(output, secretValues) };
         }
-        // In-band error codes (e.g. novel API: code=1 success / code=0 failure).
+        // In-band error codes (e.g. document API: code=1 success / code=0 failure).
         if (response.code_path) {
           const code = extractPath(parsed, response.code_path);
           const okValue = response.ok_value ?? 0;
@@ -1189,7 +1189,7 @@ function resolveList(value: unknown, path: string): unknown[] {
   return head.flatMap((item) => resolveList(item, rest));
 }
 
-/** Light HTML→plain-text for API bodies like novel chapters: <p>/<br> → newlines, tags stripped, entities decoded. */
+/** Light HTML→plain-text for API bodies like document sections: <p>/<br> → newlines, tags stripped, entities decoded. */
 function htmlToText(html: string): string {
   return html
     // style/script CONTENT survives plain tag-stripping — drop the blocks first

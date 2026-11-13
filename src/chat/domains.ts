@@ -21,7 +21,7 @@
  * 领域有两层来源：
  *   1. 代码内置（下方 CODE_DOMAINS，含 builtinTools——工具实现只能在代码里）；
  *   2. data/domains/<id>.json 声明式覆盖/新增：
- *      { "title": "小说中枢", "description": "…", "child_types": ["novel"] }
+ *      { "title": "文档中枢", "description": "…", "child_types": ["document"] }
  *      JSON 不能携带 builtinTools（那需要代码），但足够注册一个由插件工具
  *      驱动的新领域：改 title/description/childTypes、挂汇报路由，零代码。
  * 加新 JSON + initDomainRegistry 重扫即可，与插件 manifest 同范式。

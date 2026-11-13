@@ -26,7 +26,7 @@ test('workspace resolves inside paths and refuses traversal', () => {
 });
 
 test('safeFilename strips paths, control chars and dotfile prefixes', () => {
-  assert.equal(safeFilename('小说.txt'), '小说.txt');
+  assert.equal(safeFilename('文档.txt'), '文档.txt');
   assert.equal(safeFilename('a/b/c.txt'), 'c.txt');
   assert.equal(safeFilename('..\\..\\evil'), 'evil');
   assert.equal(safeFilename('.hidden'), 'hidden');
@@ -231,16 +231,16 @@ test('file_write → file_read → file_search round trip inside the sandbox', a
   const { context, cleanup } = await makeActionContext();
   try {
     const written = await executeActionTool(
-      { name: 'file_write', arguments: { path: 'novel.txt', content: '第一章 风起\n\n他走进雨里。\n第二章 灯火' } },
+      { name: 'file_write', arguments: { path: 'document.txt', content: '第一章 风起\n\n他走进雨里。\n第二章 灯火' } },
       context,
     );
     assert.ok(written?.ok);
 
-    const read = await executeActionTool({ name: 'file_read', arguments: { path: 'novel.txt', from: 1, to: 3 } }, context);
+    const read = await executeActionTool({ name: 'file_read', arguments: { path: 'document.txt', from: 1, to: 3 } }, context);
     assert.ok(read?.output.includes('1: 第一章 风起'));
     assert.ok(read?.output.includes('3: 他走进雨里。'));
 
-    const found = await executeActionTool({ name: 'file_search', arguments: { path: 'novel.txt', pattern: '第.章' } }, context);
+    const found = await executeActionTool({ name: 'file_search', arguments: { path: 'document.txt', pattern: '第.章' } }, context);
     assert.ok(found?.output.includes('1: 第一章 风起'));
     assert.ok(found?.output.includes('4: 第二章 灯火'));
   } finally {
@@ -263,11 +263,11 @@ test('send_file_excerpt delivers verbatim lines packed into one message and pers
   const { context, repo, sent, cleanup } = await makeActionContext();
   try {
     await executeActionTool(
-      { name: 'file_write', arguments: { path: 'novel.txt', content: '他走进雨里，没有回头。\n\n灯火在远处亮了。' } },
+      { name: 'file_write', arguments: { path: 'document.txt', content: '他走进雨里，没有回头。\n\n灯火在远处亮了。' } },
       context,
     );
     const result = await executeActionTool(
-      { name: 'send_file_excerpt', arguments: { path: 'novel.txt', from: 1, to: 3 } },
+      { name: 'send_file_excerpt', arguments: { path: 'document.txt', from: 1, to: 3 } },
       context,
     );
     assert.ok(result?.ok);

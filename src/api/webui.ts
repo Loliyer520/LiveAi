@@ -724,7 +724,7 @@ export async function handleWebui(
       return;
     }
 
-    // ── 插件子页面：详情（工具规格 + 服务健康 + novel 指令机会话） ────────────
+    // ── 插件子页面：详情（工具规格 + 服务健康） ───────────────────────────
     const pluginDetailMatch = url.pathname.match(/^\/api\/plugins\/([\w-]+)\/detail$/);
     if (request.method === 'GET' && pluginDetailMatch) {
       if (deps.plugins === null) {
@@ -754,17 +754,9 @@ export async function handleWebui(
           service = { url: origin.url, ok: false, ms: Date.now() - started, error: error instanceof Error ? error.message : String(error) };
         }
       }
-      // novel 附加：指令模式会话（novel_command.scopes，已切流到 deeplive-novel 时为空）。
-      const extras: Record<string, unknown> = {};
-      if (name === 'novel') {
-        const config = await readConfigJson(deps.configPath);
-        const novelCmd = (config.novel_command ?? {}) as Record<string, unknown>;
-        extras.commandScopes = Array.isArray(novelCmd.scopes) ? novelCmd.scopes.map((value) => String(value)) : [];
-        extras.commandBaseUrl = typeof novelCmd.base_url === 'string' ? novelCmd.base_url : '';
-      }
       // manifest v2 配置声明 + 生效值（面板自动表单）。
       const pluginConfig = deps.plugins.getConfig(name);
-      sendJson(response, 200, { ...detail, service, extras, config: pluginConfig ?? { spec: {}, values: {} } });
+      sendJson(response, 200, { ...detail, service, config: pluginConfig ?? { spec: {}, values: {} } });
       return;
     }
 

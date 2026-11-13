@@ -1,10 +1,10 @@
 /**
  * Autonomous-action tool set — the general-purpose capability layer. Instead
- * of hardcoding features (weather, novel excerpts, …), these primitives let
+ * of hardcoding features (weather, document excerpts, …), these primitives let
  * the model compose them itself inside one turn:
  *
  *   查天气      web_search → web_fetch
- *   发小说段落  download_file → file_search → file_read → send_file_excerpt
+ *   发文档段落  download_file → file_search → file_read → send_file_excerpt
  *   收文件研究  download_qq_file → extract_archive → file_list/file_read
  *
  * All filesystem access is sandboxed to the per-scope workspace; all network
@@ -61,7 +61,7 @@ export const ACTION_TOOL_SCHEMAS: ToolSchema[] = [
       '抓取一个 http(s) 网页或调用公开 API，返回状态码和正文（超长截断）。'
       + '支持 method/headers/body 调 REST 接口（body 传字符串，如 JSON）。'
       + '例：查天气可抓 https://wttr.in/北京?format=j1 。内网地址禁止访问。'
-      + '要保存大文件（小说 txt、压缩包等）请改用 download_file。',
+      + '要保存大文件（文档 txt、压缩包等）请改用 download_file。',
     parameters: {
       type: 'object',
       properties: {
@@ -124,7 +124,7 @@ export const ACTION_TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'file_search',
     description:
-      '在工作区文件里按正则搜索，返回命中行号和该行内容（最多 30 条）。找小说章节/关键词位置用它，拿到行号后再 file_read 或 send_file_excerpt。',
+      '在工作区文件里按正则搜索，返回命中行号和该行内容（最多 30 条）。找文档章节/关键词位置用它，拿到行号后再 file_read 或 send_file_excerpt。',
     parameters: {
       type: 'object',
       properties: {
@@ -160,8 +160,8 @@ export const ACTION_TOOL_SCHEMAS: ToolSchema[] = [
     name: 'send_file_excerpt',
     description:
       '把工作区文件的指定行区间【原文】直接发给用户，不需要你复述内容。'
-      + '配合 file_search 定位行号后使用（如发小说选段）。单次最多 30 行；from/to 为 1 起始的行号（含两端）。'
-      + '要发整个文件（整章小说）改用 send_file。',
+      + '配合 file_search 定位行号后使用（如发文档选段）。单次最多 30 行；from/to 为 1 起始的行号（含两端）。'
+      + '要发整个文件（整章文档）改用 send_file。',
     parameters: {
       type: 'object',
       properties: {
@@ -176,7 +176,7 @@ export const ACTION_TOOL_SCHEMAS: ToolSchema[] = [
     name: 'send_file',
     description:
       '把工作区文件【整个】原文发给用户，不需要你复述内容。'
-      + '发整章小说、整份文档用它（比 send_file_excerpt 省得数行号）。单次最多 150 行，'
+      + '发整章文档、整份文档用它（比 send_file_excerpt 省得数行号）。单次最多 150 行，'
       + '文件更长时会告知剩余行数，用 from 参数续发。',
     parameters: {
       type: 'object',

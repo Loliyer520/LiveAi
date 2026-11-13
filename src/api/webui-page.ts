@@ -641,10 +641,9 @@ var PLUGIN_PAGES = {
   onebot: { title: "QQ 机器人", icon: "bot", render: renderOnebot },
   mc: { title: "Minecraft 陪玩", icon: "game", render: renderMc },
   bili: { title: "哔哩哔哩", icon: "tv", render: renderBili },
-  novel: { title: "小说工具", icon: "book", render: function (main) { renderToolPlugin(main, "novel"); } },
   weather: { title: "天气工具", icon: "cloud", render: function (main) { renderToolPlugin(main, "weather"); } },
 };
-var PLUGIN_TITLES = { novel: "小说工具", weather: "天气工具", bili: "B 站视频工具", mc: "Minecraft 游戏工具" };
+var PLUGIN_TITLES = { weather: "天气工具", bili: "B 站视频工具", mc: "Minecraft 游戏工具" };
 var FIXED_NAV = [
   { route: "home", title: "首页", icon: "home", render: renderHome },
   { route: "kb", title: "知识库", icon: "book", render: renderKb },
@@ -1459,7 +1458,7 @@ function renderBili(main) {
   }).catch(function (e) { main.innerHTML = pageHead("哔哩哔哩", "") + '<div class="card" style="color:var(--bad)">' + h(e.message) + "</div>"; });
 }
 
-// ─── 通用工具插件页（小说/天气等无专属页面的插件） ────────────────────────────
+// ─── 通用工具插件页（天气等无专属页面的插件） ────────────────────────────
 var tryState = { plugin: "", tools: [] };
 
 function renderToolPlugin(main, name) {
@@ -1502,15 +1501,6 @@ function renderToolPlugin(main, name) {
         '<tr><th>可达性</th><td>' + (d.service.ok
           ? '<span class="pill ok">在线</span> <span class=dim style="font-size:12px">HTTP ' + h(d.service.status) + ' · ' + d.service.ms + 'ms</span>'
           : '<span class="pill bad">不可达</span> <span class=dim style="font-size:12px">' + h(d.service.error || "") + '</span>') + '</td></tr></table></div>';
-    }
-
-    if (d.extras && d.extras.commandScopes) {
-      html += '<div class="card"><h2 style="margin-top:0">指令模式会话</h2>' +
-        '<p class=help>这些会话不经过模型，搜书/看章指令直接应答。独立小说 bot（deeplive-novel）接管后这里可以留空。</p>' +
-        (d.extras.commandScopes.length === 0
-          ? '<p class=dim>没有配置指令模式会话' + (d.extras.commandBaseUrl ? '，指令服务：' + h(d.extras.commandBaseUrl) : "") + '。</p>'
-          : '<table><tr><th>会话标识</th></tr>' + d.extras.commandScopes.map(function (s) { return '<tr><td class=mono>' + h(s) + '</td></tr>'; }).join("") + '</table>') +
-        '</div>';
     }
 
     if (name === "image") {
@@ -2076,17 +2066,16 @@ function renderSettings(main) {
       '<div class="row"><button class="btn primary" onclick="identitySave()">' + icon("update") + '保存</button>' +
       '<span class=dim style="font-size:12px">写入 config.json，重启 deeplive-bot 后生效（保存前自动留 .bak 备份）</span></div></div>';
 
-    html += '<div class="card"><h2 style="margin-top:0">工具插件</h2><p class=help>插件为 AI 提供查天气、搜小说等额外能力，停用后不影响其他功能。</p>';
+    html += '<div class="card"><h2 style="margin-top:0">工具插件</h2><p class=help>插件为 AI 提供查天气、查询资料等额外能力，停用后不影响其他功能。</p>';
     if (s.plugins.length === 0) html += '<p class=dim>还没有安装工具插件。</p>';
     else {
       html += "<table><tr><th>插件</th><th>工具</th><th>启用</th><th>状态</th></tr>";
       for (var i = 0; i < s.plugins.length; i++) {
         var p = s.plugins[i];
-        var pluginNames = { bili: "B 站视频工具", mc: "Minecraft 游戏工具", novel: "小说工具", weather: "天气工具" };
+        var pluginNames = { bili: "B 站视频工具", mc: "Minecraft 游戏工具", weather: "天气工具" };
         var pluginHelp = {
           bili: "搜索视频、查看视频信息，并把视频发给用户。",
           mc: "让 AI 进入 Minecraft 服务器，移动、聊天、挖掘和放置方块。",
-          novel: "搜索番茄小说、查看目录并阅读章节。",
           weather: "查询指定城市的天气，无需申请密钥。",
         };
         html += "<tr><td>" + h(pluginNames[p.name] || p.name) + '<div class=dim style="font-size:12px">' + h(pluginHelp[p.name] || p.description) + "</div></td>" +

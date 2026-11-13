@@ -20,7 +20,6 @@ import { IntelCollector } from '../relations/collector.js';
 import { PromptStore } from '../prompt/store.js';
 import { ModelManager } from '../models/manager.js';
 import { AiOrchestrator } from '../chat/orchestrator.js';
-import { NovelCommandHandler } from '../chat/novel-cmd.js';
 import { initPluginRegistry, pluginRegistry, type PluginEventName, type PluginEventPayload } from '../chat/plugins.js';
 import type { ChatMessage } from '../chat/types.js';
 
@@ -190,16 +189,6 @@ export class ChatModule implements LiveAiModule {
       intel: this.intel,
       kb: this.kb,
       tasksPath: join(config.storage.stateDir, 'tasks.json'),
-      novelCmd: config.novelCmd.scopes.length > 0
-        ? new NovelCommandHandler({
-          scopes: config.novelCmd.scopes,
-          baseUrl: config.novelCmd.baseUrl,
-          fallbackBaseUrls: config.novelCmd.fallbackBaseUrls,
-          statePath: join(config.storage.stateDir, 'novel-cmd.json'),
-          bot: this.bot,
-          repo: this.repo,
-        })
-        : null,
     });
     initPluginRegistry(process.env.LIVEAI_PLUGIN_DIR ?? join(config.storage.stateDir, '..', 'plugins'));
     loadDomains(process.env.LIVEAI_DOMAIN_DIR ?? join(config.storage.stateDir, '..', 'domains'));

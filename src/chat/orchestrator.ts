@@ -50,7 +50,6 @@ import { PrivateIdle } from './private-idle.js';
 import { GroupRolesCache } from './group-roles.js';
 import { chatToolSchemas, executeChatTool, refreshStickerIndex, sendMinecraftText, type StickerRefreshResult, type ToolContext, type ToolResult } from './tools.js';
 import { TaskScheduler, type ScheduledTask } from './scheduler.js';
-import type { NovelCommandHandler } from './novel-cmd.js';
 import { embedImageAsDataUrl, extractImageRefs } from './images.js';
 import { cacheImage, cachedImageUri, ensureImageCached } from './image-cache.js';
 import { extractFileRefs, extractVideoRefs } from './files.js';
@@ -91,8 +90,6 @@ export class AiOrchestrator {
   private readonly tasks: TaskScheduler;
   private readonly workspaceDir: string;
   private readonly groupRoles: GroupRolesCache;
-  /** 小说阅读指令机（不走模型；null = 未配置启用 scope）。 */
-  private readonly novelCmd: NovelCommandHandler | null;
   /** Per-scope tool-call and turn-summary logs (browsable in WebUI). */
   private readonly turnLog: TurnLogStore;
   /** Checkpoint store: crash recovery for in-progress turns. */
@@ -124,8 +121,6 @@ export class AiOrchestrator {
     tasksPath: string;
     /** Root of per-scope file workspaces (defaults to <stateDir>/workspace). */
     workspaceDir?: string;
-    /** 小说阅读指令机（可选）：指定 scope 的整句指令直接应答，跳过模型。 */
-    novelCmd?: NovelCommandHandler | null;
     /** Quiet interval before user-message turns; production default is 2s. */
     messageDebounceMs?: number;
     /** Production default: 2 minutes. Zero disables autonomous wakeups in tests. */
@@ -145,7 +140,6 @@ export class AiOrchestrator {
     this.intel = deps.intel;
     this.kb = deps.kb;
     this.tasks = new TaskScheduler(deps.tasksPath, (task) => this.fireTask(task));
-    this.novelCmd = deps.novelCmd ?? null;
     this.workspaceDir = deps.workspaceDir ?? join(dirname(deps.tasksPath), 'workspace');
     this.turnLog = new TurnLogStore(join(dirname(deps.tasksPath), 'turn-logs'));
     this.checkpoint = new TurnCheckpointStore(join(dirname(deps.tasksPath), '.checkpoint'));
@@ -383,16 +377,6 @@ export class AiOrchestrator {
       }
       if (scopeType === 'private' && message.userId > 0) this.recordPrivateActivity(scopeKey, true);
 
-      // 小说阅读指令机：启用 scope 里的整句指令（搜书/选/目录/看/下一章）
-      // 直接应答并记历史，跳过触发门与模型——指令以外的消息照常往下走 AI。
-      if (this.novelCmd !== null && this.novelCmd.handles(scopeKey) && message.userId > 0) {
-        try {
-          if (await this.novelCmd.tryHandle(message, cleaned)) return;
-        } catch (error) {
-          console.warn('[novel-cmd] handle failed:', error instanceof Error ? error.message : String(error));
-        }
-      }
-
       const triggered = shouldTrigger(message, cleaned, agent);
       // Even a non-triggering group message extends an already waiting batch.
       if ((message.userId > 0 || sourceKind === 'admin_webui' || sourceKind === 'mobile_app' || sourceKind === 'minecraft_chat') && sourceKind !== 'internal_task') {
@@ -608,7 +592,7 @@ export class AiOrchestrator {
           chatMode: true,
           masterMode: isMasterScope,
           // 真实用户消息触发的回合：在触发消息尾部钉一条工具协议提醒。
-          // 小说/闲聊-heavy 的会话里散文"重力"会淹没 system 里的协议，
+          // 长文/闲聊-heavy 的会话里散文"重力"会淹没 system 里的协议，
           // deepseek-flash 这类指令遵循偏弱的模型就只用文字描述动作
           //（"我取90到94章"）而不调工具（2026-10-02 雪球会话实锤）。
           modeHint:
@@ -688,7 +672,7 @@ export class AiOrchestrator {
           // 面板控制台消息（userId=0 的 admin_webui）也是主人在敲字——同样
           // 给重发机会，不然她回纯文本时主人永远看不到（2026-10-02 面板
           // 有回合无回复之鉴：turn done 17s 却零输出）。
-          // 重发救援放宽到 2 次：deepseek-flash 在小说-heavy 会话里会连续
+          // 重发救援放宽到 2 次：deepseek-flash 在长文-heavy 会话里会连续
           // 散文回复（甚至说「我重发一下」也还是散文），1 次救不回来
           //（2026-10-02 雪球连续 7 个回合零输出之鉴）。
           const rescuable = message.userId !== 0 || sourceKindOf(message) === 'admin_webui' || isDebounceMessage(message);

@@ -225,7 +225,7 @@ test('production prompts explain Bilibili routing without stale tool names', asy
 });
 
 test('transcript block caps at ~60k chars, keeps the tail, notes the omission', () => {
-  // 超长会话（小说陪读型）500 条历史渲染出 20 万+ 字符短聊，占掉每轮
+  // 超长会话（长文阅读型）500 条历史渲染出 20 万+ 字符短聊，占掉每轮
   // prompt 八成且每轮全量重读。转写封顶保尾；更早的交给分段摘要 +
   // memory_search（背景块每轮都注入摘要），不丢事实渠道。
   const input = assembleInput('在吗');

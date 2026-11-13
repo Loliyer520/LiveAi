@@ -18,20 +18,20 @@ test('声明式领域注册表：data/domains/*.json 可覆盖内置并新增领
   try {
     // 覆盖内置（改 title）+ 新增（child_types 挂路由）
     await writeFile(join(dir, 'mc.json'), JSON.stringify({ title: 'MC 大脑' }), 'utf-8');
-    await writeFile(join(dir, 'novel.json'), JSON.stringify({
-      title: '小说中枢',
-      description: '每本书一个下级 AI',
-      child_types: ['novelbook'],
+    await writeFile(join(dir, 'document.json'), JSON.stringify({
+      title: '文档中枢',
+      description: '每份文档一个下级 AI',
+      child_types: ['documentitem'],
     }), 'utf-8');
     await writeFile(join(dir, 'Bad_Id.json'), '{}', 'utf-8');
     loadDomains(dir);
 
     assert.equal(domainDefForScope('domain:mc')?.title, 'MC 大脑', 'JSON 覆盖内置 title');
-    const novel = domainDefForScope('domain:novel');
-    assert.ok(novel, 'JSON 新增领域生效');
-    assert.equal(novel?.custom, true);
-    assert.equal(novel?.description, '每本书一个下级 AI');
-    assert.equal(hubForScope('novelbook:BV1', 'private:1'), 'domain:novel', 'child_types 挂进汇报路由');
+    const document = domainDefForScope('domain:document');
+    assert.ok(document, 'JSON 新增领域生效');
+    assert.equal(document?.custom, true);
+    assert.equal(document?.description, '每份文档一个下级 AI');
+    assert.equal(hubForScope('documentitem:BV1', 'private:1'), 'domain:document', 'child_types 挂进汇报路由');
     assert.equal(hubForScope('mcclient:a', 'private:1'), 'domain:mc', '内置路由不变');
     assert.equal(hubForScope('group:1', 'private:1'), 'domain:onebot');
     await writeFile(join(dir, 'broken.json'), 'not json', 'utf-8');

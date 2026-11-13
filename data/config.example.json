@@ -25,9 +25,5 @@
   "webui": {
     "host": "127.0.0.1",
     "token": ""
-  },
-  "novel_command": {
-    "scopes": [],
-    "base_url": "http://127.0.0.1:7640"
   }
 }

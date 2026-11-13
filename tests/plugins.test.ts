@@ -247,19 +247,19 @@ test('chatToolSchemas merges plugin tools after initPluginRegistry', async () =>
   }
 });
 
-const NOVEL_PLUGIN = JSON.stringify({
-  name: 'novel',
-  description: '小说',
+const DOCUMENT_PLUGIN = JSON.stringify({
+  name: 'document',
+  description: '文档',
   tools: [
     {
-      name: 'novel_directory',
+      name: 'document_directory',
       description: '目录',
       parameters: {
         type: 'object',
         properties: { book_id: { type: 'string' }, count: { type: 'number', default: 2 } },
         required: ['book_id'],
       },
-      request: { method: 'GET', url: 'https://93.184.216.34/novel/directory/{{book_id}}' },
+      request: { method: 'GET', url: 'https://93.184.216.34/document/directory/{{book_id}}' },
       response: {
         format: 'json',
         code_path: 'code',
@@ -271,11 +271,11 @@ const NOVEL_PLUGIN = JSON.stringify({
           separator: '\n',
           item: '{{title}}｜{{item_id}}',
         },
-        save: { from: 'data', path: 'novels/{{book_id}}_directory.json' },
+        save: { from: 'data', path: 'documents/{{book_id}}_directory.json' },
       },
     },
     {
-      name: 'novel_content',
+      name: 'document_content',
       description: '正文',
       parameters: {
         type: 'object',
@@ -286,18 +286,18 @@ const NOVEL_PLUGIN = JSON.stringify({
         },
         required: ['book_id', 'item_id'],
       },
-      request: { method: 'GET', url: 'https://93.184.216.34/novel/content?tab={{book_id}}&item_id={{item_id}}' },
+      request: { method: 'GET', url: 'https://93.184.216.34/document/content?tab={{book_id}}&item_id={{item_id}}' },
       response: {
         format: 'json',
         code_path: 'code',
         ok_value: 1,
         msg_path: 'error',
         template: '已取到（{{data.item_id}}）。',
-        save: { from: 'data.content', path: 'novels/{{book_id}}/{{item_id}}.txt', html_to_text: true, send: '{{forward}}' },
+        save: { from: 'data.content', path: 'documents/{{book_id}}/{{item_id}}.txt', html_to_text: true, send: '{{forward}}' },
       },
     },
     {
-      name: 'novel_chapters',
+      name: 'document_chapters',
       description: '批量正文',
       parameters: {
         type: 'object',
@@ -308,14 +308,14 @@ const NOVEL_PLUGIN = JSON.stringify({
         },
         required: ['book_id', 'item_ids'],
       },
-      request: { method: 'GET', url: 'https://93.184.216.34/novel/chapters?ids={{item_ids}}&book_id={{book_id}}' },
+      request: { method: 'GET', url: 'https://93.184.216.34/document/chapters?ids={{item_ids}}&book_id={{book_id}}' },
       response: {
         format: 'json',
         code_path: 'code',
         ok_value: 1,
         msg_path: 'error',
         template: '批量取章完成，逐章结果：',
-        save_each: { from: 'data', path: 'novels/{{book_id}}/{{__key}}.txt', html_to_text: true, send: '{{forward}}' },
+        save_each: { from: 'data', path: 'documents/{{book_id}}/{{__key}}.txt', html_to_text: true, send: '{{forward}}' },
       },
     },
   ],
@@ -346,14 +346,14 @@ function stubFetch(body: unknown): () => void {
 }
 
 test('list flattens volumes[].chapters, applies schema default max, saves full JSON', async () => {
-  const { dir, cleanup } = await makePluginDir({ 'novel/plugin.json': NOVEL_PLUGIN });
+  const { dir, cleanup } = await makePluginDir({ 'document/plugin.json': DOCUMENT_PLUGIN });
   const restore = stubFetch(DIRECTORY_BODY);
-  const workspaceDir = await mkdtemp(join(tmpdir(), 'liveai-novel-ws-'));
+  const workspaceDir = await mkdtemp(join(tmpdir(), 'liveai-document-ws-'));
   try {
     const registry = new PluginRegistry(dir);
     registry.load();
     const context = { ...fakeContext(), workspace: new Workspace(workspaceDir) };
-    const result = await registry.execute('novel_directory', { book_id: 'b1' }, context);
+    const result = await registry.execute('document_directory', { book_id: 'b1' }, context);
     assert.ok(result?.ok);
     // flattened across both volumes, schema default count=2 applied, truncation noted
     assert.equal(
@@ -361,12 +361,12 @@ test('list flattens volumes[].chapters, applies schema default max, saves full J
       '第一章 雨｜c1\n第二章 灯｜c2\n…（共 3 条，只列了前 2 条）',
     );
     // full directory JSON saved into the scope workspace
-    const saved = JSON.parse(await readFile(join(workspaceDir, 'novels', 'b1_directory.json'), 'utf-8')) as typeof DIRECTORY_BODY.data;
+    const saved = JSON.parse(await readFile(join(workspaceDir, 'documents', 'b1_directory.json'), 'utf-8')) as typeof DIRECTORY_BODY.data;
     assert.equal(saved.volumes[1].chapters[0].item_id, 'c3');
-    assert.ok(result?.output.includes('novels/b1_directory.json'));
+    assert.ok(result?.output.includes('documents/b1_directory.json'));
 
     // explicit count overrides the default
-    const full = await registry.execute('novel_directory', { book_id: 'b1', count: 10 }, context);
+    const full = await registry.execute('document_directory', { book_id: 'b1', count: 10 }, context);
     assert.ok(full?.output.includes('第三章 桥｜c3'));
     assert.ok(!full?.output.includes('只列了前'));
   } finally {
@@ -377,24 +377,24 @@ test('list flattens volumes[].chapters, applies schema default max, saves full J
 });
 
 test('in-band error code surfaces msg_path; content saved as de-tagged txt', async () => {
-  const { dir, cleanup } = await makePluginDir({ 'novel/plugin.json': NOVEL_PLUGIN });
-  const workspaceDir = await mkdtemp(join(tmpdir(), 'liveai-novel-ws-'));
+  const { dir, cleanup } = await makePluginDir({ 'document/plugin.json': DOCUMENT_PLUGIN });
+  const workspaceDir = await mkdtemp(join(tmpdir(), 'liveai-document-ws-'));
   let restore = stubFetch({ code: 0, error: 'tab 不能为空' });
   try {
     const registry = new PluginRegistry(dir);
     registry.load();
     const context = { ...fakeContext(), workspace: new Workspace(workspaceDir) };
-    const failure = await registry.execute('novel_content', { book_id: 'b1', item_id: 'c1' }, context);
+    const failure = await registry.execute('document_content', { book_id: 'b1', item_id: 'c1' }, context);
     assert.equal(failure?.ok, false);
     assert.ok(failure?.output.includes('tab 不能为空'));
 
     restore();
     restore = stubFetch({ code: 1, data: { item_id: 'c1', content: '<style>.volumePicture img { bd-object-fit: screen; }</style><p>第一行。</p><p>第二行&amp;第三行。</p>' } });
-    const ok = await registry.execute('novel_content', { book_id: 'b1', item_id: 'c1' }, context);
+    const ok = await registry.execute('document_content', { book_id: 'b1', item_id: 'c1' }, context);
     assert.ok(ok?.ok);
     assert.ok(ok?.output.includes('已取到（c1）。'));
-    assert.ok(ok?.output.includes('novels/b1/c1.txt'));
-    const txt = await readFile(join(workspaceDir, 'novels', 'b1', 'c1.txt'), 'utf-8');
+    assert.ok(ok?.output.includes('documents/b1/c1.txt'));
+    const txt = await readFile(join(workspaceDir, 'documents', 'b1', 'c1.txt'), 'utf-8');
     // style block content must not leak into the plain text
     assert.equal(txt, '第一行。\n第二行&第三行。');
   } finally {
@@ -405,8 +405,8 @@ test('in-band error code surfaces msg_path; content saved as de-tagged txt', asy
 });
 
 test('save.send forwards the saved text verbatim when the flag is truthy', async () => {
-  const { dir, cleanup } = await makePluginDir({ 'novel/plugin.json': NOVEL_PLUGIN });
-  const workspaceDir = await mkdtemp(join(tmpdir(), 'liveai-novel-ws-'));
+  const { dir, cleanup } = await makePluginDir({ 'document/plugin.json': DOCUMENT_PLUGIN });
+  const workspaceDir = await mkdtemp(join(tmpdir(), 'liveai-document-ws-'));
   const restore = stubFetch({ code: 1, data: { item_id: 'c1', content: '<p>第一行。</p>\n<p>第二行。</p>' } });
   const sent: string[] = [];
   const context = {
@@ -429,14 +429,14 @@ test('save.send forwards the saved text verbatim when the flag is truthy', async
     registry.load();
 
     // forward=true → one call saves AND delivers verbatim (packed into one message)
-    const forwarded = await registry.execute('novel_content', { book_id: 'b1', item_id: 'c1', forward: true }, context);
+    const forwarded = await registry.execute('document_content', { book_id: 'b1', item_id: 'c1', forward: true }, context);
     assert.ok(forwarded?.ok);
     assert.equal(forwarded?.sentToUser, true);
     assert.deepEqual(sent, ['第一行。\n第二行。']);
     assert.ok(forwarded?.output.includes('已把原文发给用户'));
 
     // default (forward=false) → saves only, sends nothing
-    const savedOnly = await registry.execute('novel_content', { book_id: 'b1', item_id: 'c1' }, context);
+    const savedOnly = await registry.execute('document_content', { book_id: 'b1', item_id: 'c1' }, context);
     assert.ok(savedOnly?.ok);
     assert.equal(savedOnly?.sentToUser, undefined);
     assert.equal(sent.length, 1);
@@ -448,10 +448,10 @@ test('save.send forwards the saved text verbatim when the flag is truthy', async
 });
 
 test('save_each batch: per-chapter save + verbatim send; one bad chapter degrades to a note line', async () => {
-  // 「再取五章」型请求：一次调用批量取发，替代循环 novel_content——
+  // 「再取五章」型请求：一次调用批量取发，替代循环 document_content——
   // agent 循环每调一次工具都全量重发 prompt，五连发就是五份全价上下文。
-  const { dir, cleanup } = await makePluginDir({ 'novel/plugin.json': NOVEL_PLUGIN });
-  const workspaceDir = await mkdtemp(join(tmpdir(), 'liveai-novel-ws-'));
+  const { dir, cleanup } = await makePluginDir({ 'document/plugin.json': DOCUMENT_PLUGIN });
+  const workspaceDir = await mkdtemp(join(tmpdir(), 'liveai-document-ws-'));
   const restore = stubFetch({
     code: 1,
     data: {
@@ -481,12 +481,12 @@ test('save_each batch: per-chapter save + verbatim send; one bad chapter degrade
     registry.load();
 
     // forward 默认 true → 逐章存盘 + 逐章原文直发
-    const batched = await registry.execute('novel_chapters', { book_id: 'b1', item_ids: 'c1,c2,c3' }, context);
+    const batched = await registry.execute('document_chapters', { book_id: 'b1', item_ids: 'c1,c2,c3' }, context);
     assert.ok(batched?.ok, batched?.output);
     assert.equal(batched?.sentToUser, true);
     assert.deepEqual(sent, ['一。', '二。'], 'two good chapters sent verbatim, bad chapter not sent');
-    assert.equal(await readFile(join(workspaceDir, 'novels', 'b1', 'c1.txt'), 'utf-8'), '一。');
-    assert.equal(await readFile(join(workspaceDir, 'novels', 'b1', 'c2.txt'), 'utf-8'), '二。');
+    assert.equal(await readFile(join(workspaceDir, 'documents', 'b1', 'c1.txt'), 'utf-8'), '一。');
+    assert.equal(await readFile(join(workspaceDir, 'documents', 'b1', 'c2.txt'), 'utf-8'), '二。');
     assert.ok(batched?.output.includes('《第一章 雨》已存并发给用户'));
     assert.ok(batched?.output.includes('《第二章 灯》已存并发给用户'));
     // 坏章标题回退到 key，逐章报失败不影响整体结果
@@ -499,11 +499,11 @@ test('save_each batch: per-chapter save + verbatim send; one bad chapter degrade
       code: 1,
       data: { c1: { item_id: 'c1', title: '第一章 雨', content: '<p>一。</p>' } },
     });
-    const savedOnly = await registry.execute('novel_chapters', { book_id: 'b1', item_ids: 'c1', forward: false }, context);
+    const savedOnly = await registry.execute('document_chapters', { book_id: 'b1', item_ids: 'c1', forward: false }, context);
     assert.ok(savedOnly?.ok);
     assert.equal(savedOnly?.sentToUser, undefined);
     assert.equal(sent.length, 2);
-    assert.ok(savedOnly?.output.includes('novels/b1/c1.txt'));
+    assert.ok(savedOnly?.output.includes('documents/b1/c1.txt'));
   } finally {
     restore();
     await rm(workspaceDir, { recursive: true, force: true });
@@ -514,14 +514,14 @@ test('save_each batch: per-chapter save + verbatim send; one bad chapter degrade
 test('crippled success body (code ok but missing template field) surfaces real upstream error, not 参数缺失 jargon', async () => {
   // 2026-10-05 雪球连环「data.title缺失」事故：fq 上游抖动时回 200+code 成功
   // 但 data 是 {error:...}——模板取 data.title 扑空，模型原样转述黑话给用户。
-  const { dir, cleanup } = await makePluginDir({ 'novel/plugin.json': NOVEL_PLUGIN });
-  const workspaceDir = await mkdtemp(join(tmpdir(), 'liveai-novel-ws-'));
+  const { dir, cleanup } = await makePluginDir({ 'document/plugin.json': DOCUMENT_PLUGIN });
+  const workspaceDir = await mkdtemp(join(tmpdir(), 'liveai-document-ws-'));
   const restore = stubFetch({ code: 1, data: { error: '上游暂时拉不到章节内容' } });
   try {
     const registry = new PluginRegistry(dir);
     registry.load();
     const context = { ...fakeContext(), workspace: new Workspace(workspaceDir) };
-    const failure = await registry.execute('novel_content', { book_id: 'b1', item_id: 'c1' }, context);
+    const failure = await registry.execute('document_content', { book_id: 'b1', item_id: 'c1' }, context);
     assert.equal(failure?.ok, false);
     assert.ok(failure?.output.includes('data.item_id'), 'names the missing field');
     assert.ok(failure?.output.includes('上游暂时拉不到章节内容'), 'surfaces data.error');

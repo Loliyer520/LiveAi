@@ -82,7 +82,7 @@ export interface AssembleInput {
 const HISTORY_RECENT_ROLES_KEEP = 30;
 
 /**
- * 早期聊天记录转写的字符封顶（保尾）。超长会话（如小说陪读）500 条历史
+ * 早期聊天记录转写的字符封顶（保尾）。超长会话（如长文阅读）500 条历史
  * 渲染出 20 万+ 字符短聊，占掉每轮 prompt 的八成多，且每轮全量重读。更早
  * 的内容有分段摘要 + memory_search 兜底，转写里留最近一段就够。
  * 截断点对齐到 TRANSCRIPT_SLIDE_GRID 网格：窗口起点只在跨格时前移一次，

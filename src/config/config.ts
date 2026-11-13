@@ -65,24 +65,11 @@ export interface TtsConfig {
   readonly timeoutMs: number;
 }
 
-export interface NovelCmdConfig {
-  /**
-   * 启用「小说阅读指令机」的 scope 键列表（"private:123456" 形态）。
-   * 这些会话里搜书/选/目录/看/下一章 等整句指令直接由指令机应答，不走模型。
-   */
-  readonly scopes: readonly string[];
-  /** fq-novel 服务基址。 */
-  readonly baseUrl: string;
-  /** 互备基址链（主线路挂了依次改走，默认=经跳板隧道到 183 的 /fq 代理）。 */
-  readonly fallbackBaseUrls: readonly string[];
-}
-
 export interface LiveAiRuntimeConfig {
   readonly napcat: NapcatConfig;
   readonly ai: AiConfig;
   readonly storage: StorageConfig;
   readonly tts: TtsConfig;
-  readonly novelCmd: NovelCmdConfig;
 }
 
 export interface LiveAiConfig extends LiveAiRuntimeConfig {
@@ -153,22 +140,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, projectRoot: st
     timeoutMs: num(env.LIVEAI_TTS_TIMEOUT_MS) ?? num(ttsFile.timeout_ms) ?? 90_000,
   });
 
-  // novel_command 段：小说阅读指令机（指定会话不走模型直接应答搜书/看章）。
-  // scopes 空 = 不启用。env 用逗号分隔多个 scope。
-  const novelCmdFile = (fileConfig.novel_command ?? {}) as Record<string, unknown>;
-  const novelCmdScopesRaw = env.LIVEAI_NOVEL_CMD_SCOPES ?? (
-    Array.isArray(novelCmdFile.scopes) ? novelCmdFile.scopes.map((value) => String(value)).join(',') : ''
-  );
-  const novelCmd: NovelCmdConfig = Object.freeze({
-    scopes: Object.freeze(
-      novelCmdScopesRaw.split(',').map((value) => value.trim()).filter((value) => /^(private|group):\d+$/.test(value)),
-    ),
-    baseUrl: (env.LIVEAI_NOVEL_CMD_URL ?? str(novelCmdFile.base_url) ?? 'http://127.0.0.1:7640').replace(/\/+$/, ''),
-    // 2026-11-03 原 7641 隧道（经跳板到 183）已删；默认无兜底，需要时 env/配置给
-    fallbackBaseUrls: (env.LIVEAI_NOVEL_CMD_FALLBACK_URLS ?? str(novelCmdFile.fallback_base_urls) ?? '')
-      .split(',').map((value) => value.trim().replace(/\/+$/, '')).filter(Boolean),
-  });
-
   // webui 段：管理面板监听与鉴权（env 优先，其次 config.json，最后默认）。
   const webuiFile = (fileConfig.webui ?? {}) as Record<string, unknown>;
   const host = env.LIVEAI_HOST?.trim() || str(webuiFile.host) || '127.0.0.1';
@@ -177,7 +148,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, projectRoot: st
   const webuiReadonlyToken = env.LIVEAI_WEBUI_READONLY_TOKEN ?? str(webuiFile.readonly_token) ?? '';
   const logLevel = parseLogLevel(env.LIVEAI_LOG_LEVEL);
 
-  return Object.freeze({ host, port, logLevel, webuiToken, webuiReadonlyToken, napcat, ai, storage, tts, novelCmd });
+  return Object.freeze({ host, port, logLevel, webuiToken, webuiReadonlyToken, napcat, ai, storage, tts });
 }
 
 function readJsonConfig(path: string): Record<string, unknown> {
