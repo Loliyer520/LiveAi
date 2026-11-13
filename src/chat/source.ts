@@ -9,6 +9,8 @@ import { sourceLabel } from './types.js';
 
 export function sourceKindOf(message: ChatMessage): SourceKind {
   const raw = message.rawData as Record<string, unknown>;
+  if (message.chatType === 'domain' && message.chatId === 'mc' && raw.source === 'minecraft_chat') return 'minecraft_chat';
+  if (message.chatType === 'app' && raw.source === 'mobile_app') return 'mobile_app';
   if (message.userId === 0 && raw.source === 'admin_webui') return 'admin_webui';
   if (message.userId === 0 && raw.source === 'dev_agent_task_report') return 'internal_task';
   if (message.userId === 0 && raw.source === 'agent_message') return 'internal_task';
@@ -27,6 +29,9 @@ export function sourceKindOf(message: ChatMessage): SourceKind {
 }
 
 export function sourceLabelOf(message: ChatMessage): string {
+  if (sourceKindOf(message) === 'minecraft_chat') {
+    return `${sourceLabel('minecraft_chat')}（${message.rawData.mc_whisper === true ? '游戏私聊' : '游戏公共频道'}）`;
+  }
   return sourceLabel(sourceKindOf(message));
 }
 

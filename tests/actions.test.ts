@@ -396,3 +396,18 @@ test('extract_archive via tool unpacks a zip written into the workspace', async 
     await cleanup();
   }
 });
+
+
+test('app file text uses the app transport and remains visible without QQ delivery', async () => {
+  const { context, repo, sent, cleanup } = await makeActionContext();
+  let routed = '';
+  const appContext: ToolContext = { ...context, scopeType: 'app', scopeId: 'test-app', sendTextOverride: async text => { routed = text; return {}; } };
+  try {
+    await executeActionTool({ name: 'file_write', arguments: { path: 'hello.txt', content: '只发给手机用户' } }, appContext);
+    const result = await executeActionTool({ name: 'send_file_excerpt', arguments: { path: 'hello.txt', from: 1, to: 1 } }, appContext);
+    assert.ok(result?.ok);
+    assert.equal(routed, '只发给手机用户');
+    assert.deepEqual(sent, []);
+    assert.equal(repo.getMessages('app', 'test-app')[0]?.raw_source, 'app_ai');
+  } finally { await cleanup(); }
+});

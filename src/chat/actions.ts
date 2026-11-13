@@ -514,6 +514,7 @@ export async function sendLinesVerbatim(
         message_ref: msgRef,
         timestamp: Date.now() / 1000,
         source_label: sourceLabel,
+        ...(context.scopeType === 'app' ? { raw_source: 'app_ai' } : {}),
       };
       context.repo.appendMessage(context.scopeType, context.scopeId, entry);
       sent += 1;

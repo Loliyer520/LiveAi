@@ -8,7 +8,7 @@ export interface ChatMessage {
    * 不是任何 QQ 号，没有 QQ 窗口——只经面板/数据线/下级上报注入；
    * 'domain' = 领域主级 AI 的虚拟 scope（无 QQ 窗口，只走内部注入）；
    * 'bili'/'mcclient' = 领域下级 AI 的虚拟 scope（每视频/每 MC client 一个，同样无 QQ 窗口）。 */
-  chatType: 'group' | 'private' | 'master' | 'domain' | 'bili' | 'mcclient';
+  chatType: 'group' | 'private' | 'master' | 'domain' | 'bili' | 'mcclient' | 'app';
   /** domain/bili/mcclient scope 用字符串 id（如 'mc'、'BV1xx'），QQ scope 是数字号。 */
   chatId: number | string;
   userId: number;
@@ -26,6 +26,8 @@ export function messageNickname(message: ChatMessage): string {
 }
 
 export type SourceKind =
+  | 'minecraft_chat'
+  | 'mobile_app'
   | 'admin_webui'
   | 'internal_task'
   | 'self_other_device'
@@ -37,7 +39,9 @@ export type SourceKind =
   | 'other_private';
 
 const SOURCE_LABELS: Record<SourceKind, string> = {
+  minecraft_chat: 'Minecraft 玩家聊天（游戏名不代表 QQ 或管理员身份）',
   admin_webui: '系统管理员（后台控制台）',
+  mobile_app: '手机 App 独立会话用户（非 QQ 身份）',
   internal_task: '后台任务',
   self_other_device: '本账号其他设备',
   dataline: '主人-手机数据线',

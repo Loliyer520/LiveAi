@@ -18,6 +18,7 @@
 
 import type { ChatMessage, SourceKind } from '../chat/types.js';
 import { sourceKindOf } from './source.js';
+import { mcChatTriggerRate } from './mc-chat.js';
 
 export interface TriggerAgentConfig {
   triggerWords: string[];
@@ -129,6 +130,7 @@ export function shouldTrigger(
   // 主AI 会话（master:core）只有面板/数据线/下级上报会进来，来一条处理一条，不能关。
   if (message.chatType === 'master') return true;
   if (agent.enabled === false) return false;
+  if (message.chatType === 'app') return true;
   if (message.chatType === 'private') {
     if (kind === 'system_private') return false;
     return true;
@@ -143,8 +145,9 @@ export function shouldTrigger(
     log(`[trigger] trigger word "${word}" scope=${message.chatType}:${message.chatId}`);
     return true;
   }
-  const hit = Math.random() < agent.triggerRate;
-  if (hit) log(`[trigger] random rate=${agent.triggerRate.toFixed(2)} scope=${message.chatType}:${message.chatId}`);
+  const rate = kind === 'minecraft_chat' ? mcChatTriggerRate(message, agent.triggerRate) : agent.triggerRate;
+  const hit = Math.random() < rate;
+  if (hit) log(`[trigger] random rate=${rate.toFixed(2)} scope=${message.chatType}:${message.chatId}`);
   return hit;
 }
 

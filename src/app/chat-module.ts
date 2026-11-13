@@ -68,6 +68,7 @@ import { configureMcBot, configureStickers, configureTts } from '../chat/tools.j
 import { configureMediaSpool } from '../chat/media-spool.js';
 import { configureImageCache } from '../chat/image-cache.js';
 import { configureMcPresence, mcPresenceStatus, startMcPresencePolling, stopMcPresencePolling } from '../chat/mc-presence.js';
+import { McChatBridge } from '../chat/mc-chat.js';
 import { configureGlobalIdentity, registerIdentityChannel } from '../store/global-identity.js';
 import { configurePersonaRefs } from '../store/persona-refs.js';
 import { MASTER_SCOPE_KEY } from '../chat/types.js';
@@ -102,6 +103,7 @@ export class ChatModule implements LiveAiModule {
   /** Minecraft 边车连接信息（管理面板代理探测用）。 */
   readonly mcBotUrl: string;
   readonly mcBotToken: string;
+  private readonly mcChat: McChatBridge;
 
   constructor(config: LiveAiConfig) {
     this.archive = new MessageArchive(join(config.storage.stateDir, 'archive'));
@@ -231,13 +233,14 @@ export class ChatModule implements LiveAiModule {
     configureMcBot(mcBotUrl, mcBotToken);
     this.mcBotUrl = mcBotUrl;
     this.mcBotToken = mcBotToken;
+    this.mcChat = new McChatBridge(mcBotUrl, mcBotToken, (message) => this.orchestrator.handleMessage(message));
     // 真实 MC 的在场情报：低频轮询边车 /status，任何会话都能用它回答
     // 「你进服了吗/看到我上线了吗」。
     configureMcPresence(mcBotUrl, mcBotToken);
     registerIdentityChannel({
       name: 'mc',
-      description: '真实 Minecraft 服务器（角色 BingTang 游玩的 26.2 本地服）的在线状态与玩家名单；'
-        + 'BingTang 就是你在游戏里的身体（由服务器边车操控，你没有另一个游戏客户端）；'
+      description: '真实 Minecraft 服务器（角色 DeepLive 游玩的 26.2 本地服）的在线状态与玩家名单；'
+        + 'DeepLive 就是你在游戏里的身体（由服务器边车操控，你没有另一个游戏客户端）；'
         + '进服/游戏操作由 Minecraft 中枢（domain:mc）的 mc_* 工具执行',
       status: mcPresenceStatus,
     });
@@ -252,6 +255,7 @@ export class ChatModule implements LiveAiModule {
     this.orchestrator.start();
     this.bot.start();
     startMcPresencePolling();
+    this.mcChat.start();
     this.scheduleStickerRefresh();
     this.startBridgeProbe();
   }
@@ -267,6 +271,7 @@ export class ChatModule implements LiveAiModule {
       clearInterval(this.bridgeProbeTimer);
       this.bridgeProbeTimer = null;
     }
+    this.mcChat.stop();
     await this.orchestrator.stop();
     await this.summarizer.drainKnownScopes();
     await this.relations.flush();

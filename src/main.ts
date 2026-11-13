@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { Host } from './host/host.js';
 import { loadConfig } from './config/config.js';
+import { MobileSessions } from './api/mobile-sessions.js';
 import { HealthServer } from './api/health-server.js';
 import { ChatModule } from './app/chat-module.js';
 import { NapcatRuntime } from './napcat/runtime.js';
@@ -61,6 +62,11 @@ export async function createApplication(env: NodeJS.ProcessEnv = process.env): P
       usage: usageStats,
       injectAdmin: (text) => chat.orchestrator.handleAdminWebuiMessage(text),
       masterHistory: () => chat.repo.getMessages(MASTER_SCOPE_TYPE, MASTER_SCOPE_ID),
+      mobile: {
+        sessions: new MobileSessions(join(config.storage.stateDir, 'mobile-sessions.json')),
+        history: (id) => chat.repo.getMessages('app', id),
+        inject: (id, text) => chat.orchestrator.handleMobileMessage(id, text),
+      },
       modelsConfigPath: config.storage.modelsConfigPath,
       reloadModels: () => chat.models.load(),
       // 回合/工具日志（可观测页）

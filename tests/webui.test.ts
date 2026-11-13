@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request } from 'node:http';
+import { MobileSessions } from '../src/api/mobile-sessions.js';
 import { HealthServer } from '../src/api/health-server.js';
 import { ScopeRepository } from '../src/store/repository.js';
 import { KnowledgeBase } from '../src/knowledge/kb.js';
@@ -81,6 +82,11 @@ async function makeFixture(token = '', readonlyToken = ''): Promise<Fixture> {
     usage,
     injectAdmin: (text) => adminInbox.push(text),
     masterHistory: () => repo.getMessages('private', '123456789'),
+    mobile: {
+      sessions: new MobileSessions(join(dir, 'state', 'mobile-sessions.json')),
+      history: (id) => repo.getMessages('app', id),
+      inject: (id, text) => { repo.appendMessage('app', id, { user_id: -1, nickname: '手机用户', text, timestamp: Date.now() / 1000, source_kind: 'mobile_app' }); },
+    },
     modelsConfigPath: modelsPath,
     reloadModels: async () => undefined,
     kb: new KnowledgeBase(join(dir, 'knowledge'), 'private:123456789'),
@@ -507,4 +513,35 @@ test('面板内嵌 JS 可解析（白屏回归：字符串引号错配曾致整�
   for (const code of blocks) {
     assert.ok(!code.includes('`'), '内嵌 JS 不得含反引号');
   }
+});
+
+
+test('mobile sessions isolate conversations and never expose panel history or internal reports', async () => {
+  const fixture = await makeFixture('admin-secret', 'readonly-secret');
+  try {
+    assert.equal((await call(fixture.port, 'POST', '/api/mobile/sessions', {}, 'readonly-secret')).statusCode, 403);
+    assert.equal((await call(fixture.port, 'POST', '/api/mobile/sessions')).statusCode, 401);
+    const create = async () => {
+      const result = await call(fixture.port, 'POST', '/api/mobile/sessions', {}, 'admin-secret');
+      assert.equal(result.statusCode, 200);
+      return JSON.parse(result.body) as { sessionId: string; token: string };
+    };
+    const a = await create(); const b = await create();
+    assert.notEqual(a.sessionId, b.sessionId);
+    const send = await call(fixture.port, 'POST', '/api/mobile/chat', { text: '我的独立消息', sessionId: b.sessionId }, a.token);
+    assert.equal(send.statusCode, 200);
+    fixture.repo.appendMessage('app', a.sessionId, { user_id: 0, nickname: '后台任务', text: '主AI秘密回传', timestamp: 3, source_kind: 'internal_task' });
+    fixture.repo.appendMessage('app', a.sessionId, { user_id: 0, nickname: '后台主AI', text: '主AI直接发言', timestamp: 4, source_label: 'master-direct' });
+    fixture.repo.appendMessage('app', a.sessionId, { user_id: 987654321, nickname: 'AI', text: '会话AI的回复', timestamp: 5, raw_source: 'app_ai' });
+    const own = JSON.parse((await call(fixture.port, 'GET', '/api/mobile/chat', undefined, a.token)).body);
+    assert.deepEqual(own.messages.map((m: {text:string}) => m.text), ['我的独立消息', '会话AI的回复']);
+    const other = JSON.parse((await call(fixture.port, 'GET', `/api/mobile/chat?sessionId=${a.sessionId}`, undefined, b.token)).body);
+    assert.deepEqual(other.messages, []);
+    for (const path of ['/api/chat', '/api/models/config', '/api/status']) {
+      assert.equal((await call(fixture.port, 'GET', path, undefined, a.token)).statusCode, 403);
+    }
+    assert.equal((await call(fixture.port, 'GET', '/api/mobile/chat', undefined, 'admin-secret')).statusCode, 401);
+    assert.equal((await call(fixture.port, 'POST', '/api/mobile/chat', { text: '越站' }, a.token, {origin:'https://evil.example'})).statusCode, 403);
+    assert.deepEqual(fixture.adminInbox, []);
+  } finally { await fixture.cleanup(); }
 });

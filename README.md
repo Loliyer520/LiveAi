@@ -48,6 +48,10 @@ DeepLive 首先需要拥有一个稳定、可观测、能够优雅启动和关�
 
 ## 核心功能
 
+### Android 手机客户端
+
+`mobile/` 提供基于 CWS 手机端原生输入方案的独立 Flutter 客户端：QQ 式消息列表和聊天页、连接设置、前台未读提醒，通过专用 `/api/mobile/chat` 对接独立 `app:<会话ID>` 用户会话，后台主 AI 不展示给用户。使用独立包名，不覆盖原有 CWS/LiveAi App。连接说明、构建方法及首版限制见 [mobile/README.md](mobile/README.md)。
+
 ### 1. WebUI
 
 WebUI 是配置和观察 DeepLive 的主要入口，目标能力包括：

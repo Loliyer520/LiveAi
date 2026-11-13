@@ -63,6 +63,22 @@ export function configureMcBot(baseUrl: string, token: string): void {
   mcBotToken = token;
 }
 
+/** Route game-origin send_message back to the same connected game, not QQ/master. */
+export async function sendMinecraftText(text: string, expectedConnection: string, recipient?: string): Promise<Record<string, never>> {
+  const status = await mcBotCall('/status');
+  if (!status.ok || !status.message.split('\n').includes(expectedConnection)) {
+    throw new Error('Minecraft 连接已变化，取消向其他服务器发送旧回复');
+  }
+  const line = text.replace(/[\r\n]+/g, ' ').trim();
+  if (!line || line.length > 240 || line.startsWith('/')) throw new Error('游戏回复须为 1~240 字的普通聊天，不能以 / 开头');
+  if (recipient && !/^[A-Za-z0-9_]{1,16}$/.test(recipient)) throw new Error('无效 Minecraft 收件人');
+  const result = await mcBotCall(recipient
+    ? `/command?command=${encodeURIComponent(`/tell ${recipient} ${line}`)}`
+    : `/chat?message=${encodeURIComponent(line)}`);
+  if (!result.ok) throw new Error(result.message || 'Minecraft 聊天发送失败');
+  return {};
+}
+
 /** 调边车 HTTP 接口；返回 {ok,message} 或抛错。 */
 async function mcBotCall(path: string): Promise<{ ok: boolean; message: string; pngBase64?: string }> {
   const response = await fetch(`${mcBotBaseUrl}${path}`, {
@@ -383,7 +399,7 @@ export const CHAT_TOOL_SCHEMAS: ToolSchema[] = [
       '订阅/退订「自我情报频道」，并查频道的推送记录。你有多个分身/领域身份（频道列表见下），'
       + '默认不订阅=上下文里不注入它们的动态（省 token，也跟你无关就别惦记）；'
       + '本会话聊到相关话题（比如有人喊你玩 MC）时再订阅，并用 events 翻推送记录补课；话题过去了可以退订。'
-      + '频道：mc=真实 Minecraft 服务器（角色 BingTang 游玩的 26.2 本地服）的在线状态与玩家名单。'
+      + '频道：mc=真实 Minecraft 服务器（角色 DeepLive 游玩的 26.2 本地服）的在线状态与玩家名单。'
       + '回答「你进服了吗/看到我上线了吗/现在能玩了吗」之前，必须先 action=status 或 events 查 mc 频道；'
       + '没有工具结果，绝对不许声称自己进去了/连不上/掉线了，也不要自演进服过程。'
       + 'action: status=看各频道当前状态+自己的订阅；subscribe/unsubscribe=订阅/退订（channel）；events=查最近推送记录（channel 可选，limit 默认 20）。',
@@ -718,7 +734,8 @@ export const CHAT_TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'trigger_config',
     description:
-      '调整自己在本会话群里的触发设置（私聊必回，只在群聊有意义）。'
+      '调整自己在本会话的触发设置（适用于群聊和 Minecraft；私聊必回）。'
+      + 'Minecraft 基于基础接话率、聊天内容、人数和近一分钟活跃度自动调整；直接喊名/私聊必触发，set_rate=0 关闭随机接话。'
       + 'action=set_rate 设随机接话率（rate 0~1，越小越安静，默认 0.01）；'
       + 'action=add_word / remove_word 增删自己的触发词（word）；'
       + 'action=list 查看当前设置。被嫌吵就调低，混熟了想活跃再调高。',
@@ -862,7 +879,7 @@ const MASTER_ONLY_TOOL_SCHEMAS: ToolSchema[] = [
     parameters: {
       type: 'object',
       properties: {
-        target_scope_type: { type: 'string', description: '目标类型 group / private / domain / bili / mcclient' },
+        target_scope_type: { type: 'string', description: '目标类型 group / private / domain / bili / mcclient / app（手机独立会话）' },
         target_scope_id: { type: 'string', description: '目标 ID（群号、QQ 号、领域 id 如 mc、或 bvid / client 名）' },
         instruction: { type: 'string', description: '给目标的完整指令' },
       },
@@ -1055,6 +1072,8 @@ const HUB_TOOL_SCHEMAS: ToolSchema[] = [
  */
 const MASTER_ONLY_TOOL_NAMES = new Set(MASTER_ONLY_TOOL_SCHEMAS.map((schema) => schema.name));
 
+const APP_UNSUPPORTED_TOOLS = new Set(['recall_message', 'group_mute', 'schedule_image', 'send_image', 'send_tts', 'send_video', 'send_sticker']);
+
 export function chatToolSchemas(scopeKey: string, isMaster: boolean): ToolSchema[] {
   const domain = domainDefForScope(scopeKey);
   const builtin: ToolSchema[] = isMaster
@@ -1088,6 +1107,12 @@ export function chatToolSchemas(scopeKey: string, isMaster: boolean): ToolSchema
       required: ['until', 'reason'],
     },
   });
+  if (scopeKey.startsWith('app:')) {
+    const appTools = new Set([...CHAT_TOOL_SCHEMAS, ...ACTION_TOOL_SCHEMAS].map((schema) => schema.name));
+    for (let i = builtin.length - 1; i >= 0; i--) {
+      if (!appTools.has(builtin[i]!.name) || APP_UNSUPPORTED_TOOLS.has(builtin[i]!.name)) builtin.splice(i, 1);
+    }
+  }
   const reserved = new Set(builtin.map((schema) => schema.name));
   const pluginSchemas = pluginRegistry()?.toolSchemas(scopeKey, isMaster, reserved) ?? [];
   return [...builtin, ...pluginSchemas];
@@ -1138,6 +1163,7 @@ export async function executeChatTool(
   context.executedTools.push(call.name);
   const args = call.arguments ?? {};
   const toolName = call.name;
+  if (context.scopeType === 'app' && APP_UNSUPPORTED_TOOLS.has(call.name)) return { ok: false, output: '手机 App 当前仅支持文字消息，此工具尚未接入 App。' };
   switch (call.name) {
     case 'sleep': {
       if (context.scopeType !== 'private' || !context.privateSleep) return { ok: false, output: 'sleep 仅限私聊。' };
@@ -1220,6 +1246,7 @@ export async function executeChatTool(
             message_ref: ref,
             timestamp: Date.now() / 1000,
             source_label: '',
+            ...(context.scopeType === 'app' ? { raw_source: 'app_ai' } : {}),
           };
           context.repo.appendMessage(context.scopeType, context.scopeId, entry);
         } catch (error) {
@@ -1875,7 +1902,7 @@ export async function executeChatTool(
       const query = String(args.query ?? '').trim();
       if (!query) return { ok: false, output: 'query 为空。' };
       const scope = String(args.scope ?? 'current').trim().toLowerCase();
-      const scopeKeys = scope === 'all' ? [] : [`${context.scopeType}:${context.scopeId}`];
+      const scopeKeys = scope === 'all' && context.scopeType !== 'app' ? [] : [`${context.scopeType}:${context.scopeId}`];
       const days = Number(args.days ?? 0);
       const from = Number.isFinite(days) && days > 0 ? Date.now() / 1000 - days * 86400 : undefined;
       const limit = Number(args.limit ?? 12);
@@ -2033,8 +2060,8 @@ export async function executeChatTool(
       const targetId = String(args.target_scope_id ?? '').trim();
       const instruction = String(args.instruction ?? '').trim();
       if (!targetType || !targetId || !instruction) return { ok: false, output: 'target_scope_type / target_scope_id / instruction 都不能为空。' };
-      if (!['group', 'private', 'domain', 'bili', 'mcclient'].includes(targetType)) {
-        return { ok: false, output: `target_scope_type 只能是 group / private / domain / bili / mcclient，收到: ${targetType}` };
+      if (!['group', 'private', 'domain', 'bili', 'mcclient', 'app'].includes(targetType)) {
+        return { ok: false, output: `target_scope_type 只能是 group / private / domain / bili / mcclient / app，收到: ${targetType}` };
       }
       if (targetType === 'domain' && domainDefForScope(`domain:${targetId}`) === null) {
         return {

@@ -135,12 +135,12 @@ export class ScopeRepository {
     }
     const agents: AgentRecord[] = [];
     for (const file of files) {
-      const match = /^(group|private)_(\d+)\.json$/.exec(file);
-      if (!match) continue;
+      const match = /^(group|private|app)_([\w-]+)\.json$/.exec(file);
+      if (!match || (match[1] !== 'app' && !/^\d+$/.test(match[2]!))) continue;
       agents.push(this.getOrCreateAgent(match[1]!, match[2]!));
     }
     return agents.sort((a, b) =>
-      a.scopeType === b.scopeType ? Number(a.scopeId) - Number(b.scopeId) : a.scopeType.localeCompare(b.scopeType),
+      a.scopeType === b.scopeType ? (a.scopeType === 'app' ? a.scopeId.localeCompare(b.scopeId) : Number(a.scopeId) - Number(b.scopeId)) : a.scopeType.localeCompare(b.scopeType),
     );
   }
 

@@ -18,6 +18,8 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve, sep } from 'node:path';
+import { mobileVisibleHistory, type MobileSessions } from './mobile-sessions.js';
+import type { HistoryEntry } from '../chat/types.js';
 import type { AgentRecord } from '../store/repository.js';
 import type { UsageSnapshot } from '../models/usage.js';
 import type { KbEntry, KbMount, KbPendingItem, KbPermission } from '../knowledge/kb.js';
@@ -65,6 +67,7 @@ export interface WebuiDeps {
   readonly injectAdmin: (text: string) => void;
   /** 主AI会话历史（master:core，上级 agent 的虚拟会话），面板对话轮询用。 */
   readonly masterHistory: () => { user_id: number; nickname: string; text: string; timestamp: number }[];
+  readonly mobile?: { sessions: MobileSessions; history: (sessionId: string) => HistoryEntry[]; inject: (sessionId: string, text: string) => void };
   /** models_config.json 的绝对路径与热重载。 */
   readonly modelsConfigPath: string;
   readonly reloadModels: () => Promise<void>;
@@ -188,6 +191,32 @@ export async function handleWebui(
     return;
   }
 
+  // User-facing transport authenticates ONLY a scoped session token. No panel fallback.
+  if (url.pathname === '/api/mobile/chat') {
+    const bearer = /^Bearer (.+)$/i.exec(String(request.headers.authorization ?? ''))?.[1] ?? '';
+    const sessionId = deps.mobile?.sessions.resolve(bearer);
+    if (!sessionId) { sendJson(response, 401, { error: 'invalid mobile session token' }); return; }
+    if (request.method !== 'GET' && isCrossSiteRequest(request)) {
+      sendJson(response, 403, { error: 'cross-site request rejected' }); return;
+    }
+    if (request.method === 'GET') {
+      const messages = mobileVisibleHistory(deps.mobile!.history(sessionId));
+      sendJson(response, 200, { sessionId, messages }); return;
+    }
+    if (request.method === 'POST') {
+      const body = (await readBody(request)) as Record<string, unknown>;
+      const text = String(body.text ?? '').trim();
+      if (!text || text.length > 4000) { sendJson(response, 400, { error: '消息为空或超过 4000 字' }); return; }
+      deps.mobile!.inject(sessionId, text);
+      sendJson(response, 200, { ok: true }); return;
+    }
+    sendJson(response, 405, { error: 'method not allowed' }); return;
+  }
+
+  const appBearer = /^Bearer (.+)$/i.exec(String(request.headers.authorization ?? ''))?.[1] ?? '';
+  if (deps.mobile?.sessions.resolve(appBearer)) {
+    sendJson(response, 403, { error: 'mobile session token cannot access management APIs' }); return;
+  }
   const role = authorize(request, url, deps);
   if (role === null) {
     sendJson(response, 401, { error: 'unauthorized' });
@@ -216,6 +245,11 @@ export async function handleWebui(
   }
 
   try {
+    if (request.method === 'POST' && url.pathname === '/api/mobile/sessions') {
+      if (!deps.mobile) { sendJson(response, 503, { error: 'mobile sessions unavailable' }); return; }
+      // Provisioning is admin-only. The returned token grants access to ONE App scope.
+      sendJson(response, 200, deps.mobile.sessions.create()); return;
+    }
     // ── 首页 ────────────────────────────────────────────────────────────────
     if (request.method === 'GET' && url.pathname === '/api/status') {
       const agents = deps.repo.listAgents();

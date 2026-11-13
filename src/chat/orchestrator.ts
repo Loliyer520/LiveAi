@@ -48,7 +48,7 @@ import { ScopeSendLedger } from '../bot/idempotency.js';
 import { MessageDebounce } from './message-debounce.js';
 import { PrivateIdle } from './private-idle.js';
 import { GroupRolesCache } from './group-roles.js';
-import { chatToolSchemas, executeChatTool, refreshStickerIndex, type StickerRefreshResult, type ToolContext, type ToolResult } from './tools.js';
+import { chatToolSchemas, executeChatTool, refreshStickerIndex, sendMinecraftText, type StickerRefreshResult, type ToolContext, type ToolResult } from './tools.js';
 import { TaskScheduler, type ScheduledTask } from './scheduler.js';
 import type { NovelCommandHandler } from './novel-cmd.js';
 import { embedImageAsDataUrl, extractImageRefs } from './images.js';
@@ -64,7 +64,7 @@ const MAX_TOOL_ITERATIONS = 12;
 const MAX_SCHEDULED_TURN_RETRIES = 2;
 const SCHEDULED_RETRY_BASE_MS = 1_000;
 /** 面向用户发消息的工具：执行前过一道「新消息拦截」（仿真人先看一眼再说）。 */
-const SEND_INTERLOCK_TOOLS = new Set(['send_message', 'send_image', 'send_video', 'send_sticker']);
+const SEND_INTERLOCK_TOOLS = new Set(['send_message', 'send_image', 'send_video', 'send_sticker', 'mc_chat']);
 const SOFT_ERROR_PATTERNS = [
   'timeout', 'timed out', 'status=5', 'connection', 'overloaded', 'rate limit',
   '429', '502', '503', '504', 'empty content',
@@ -395,7 +395,7 @@ export class AiOrchestrator {
 
       const triggered = shouldTrigger(message, cleaned, agent);
       // Even a non-triggering group message extends an already waiting batch.
-      if ((message.userId > 0 || sourceKind === 'admin_webui') && sourceKind !== 'internal_task') {
+      if ((message.userId > 0 || sourceKind === 'admin_webui' || sourceKind === 'mobile_app' || sourceKind === 'minecraft_chat') && sourceKind !== 'internal_task') {
         this.messageDebounce.touch(scopeKey);
       }
       this.touchGroupWindow(message, scopeKey, scopeId);
@@ -430,7 +430,7 @@ export class AiOrchestrator {
     let current: TurnItem | null = item;
     while (current !== null) {
       if (current.kind === 'message' && current.message !== null
-        && (current.message.userId > 0 || sourceKindOf(current.message) === 'admin_webui') && !current.silentEvent
+        && (current.message.userId > 0 || sourceKindOf(current.message) === 'admin_webui' || sourceKindOf(current.message) === 'mobile_app' || sourceKindOf(current.message) === 'minecraft_chat') && !current.silentEvent
         && sourceKindOf(current.message) !== 'internal_task') {
         const quiet = this.messageDebounce.wait(scopeKey);
         if (quiet) {
@@ -734,7 +734,12 @@ export class AiOrchestrator {
           // 无 QQ 窗口的虚拟 scope（domain 中枢 / bili 视频下级 / mcclient 下级）：
           // send_message 改道汇报给对应中枢（domain→主AI，bili→哔哩中枢，
           // mcclient→MC 中枢），由中枢决定下一步（回主人/再委派/存知识库）。
-          sendTextOverride: isMasterScope
+          sendTextOverride: scopeType === 'domain' && scopeId === 'mc' && item.message?.rawData.source === 'minecraft_chat'
+            ? (line) => sendMinecraftText(line, String(item.message!.rawData.mc_connection),
+              item.message!.rawData.mc_whisper === true ? String(item.message!.rawData.mc_username) : undefined)
+            : scopeType === 'app'
+            ? () => Promise.resolve({})
+            : isMasterScope
             ? this.masterChannel === 'dataline'
               ? (line) => this.bot.sendDatalineText(line)
               : () => Promise.resolve({})
@@ -1220,7 +1225,7 @@ export class AiOrchestrator {
     // let the scheduler retry instead of producing a turn whose send/tools are
     // guaranteed to fail while the bridge is offline. Test doubles may omit
     // `connected`; only an explicit false means definitely unavailable.
-    if (!this.running || this.bot.connected === false) return false;
+    if (!this.running || (this.bot.connected === false && !task.originScope.startsWith('app:'))) return false;
     if (task.kind === 'send_image') return this.fireScheduledImage(task);
     if (task.kind === 'watchdog') {
       this.injectInternalMessage(
@@ -1377,7 +1382,18 @@ export class AiOrchestrator {
     this.handleMessage(message);
   }
 
-  /** 管理面板主AI对话入口：以「系统管理员（后台控制台）」身份把消息注入主AI会话。 */
+  /** App is an ordinary child scope, never the admin/master channel. */
+  handleMobileMessage(sessionId: string, text: string): void {
+    if (!/^[a-f0-9-]{36}$/.test(sessionId)) throw new Error('Invalid mobile session');
+    this.handleMessage({
+      chatType: 'app', chatId: sessionId, userId: -1,
+      text, rawMessage: text, sender: { nickname: '手机用户', user_id: -1 },
+      messageId: `app_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+      mentionsSelf: false, timestamp: Date.now() / 1000, rawData: { source: 'mobile_app' },
+    });
+  }
+
+  /** 管理面板主AI对话入口；与 App 用户会话分开。 */
   handleAdminWebuiMessage(text: string): void {
     const content = String(text ?? '').trim();
     if (content === '') return;
@@ -1438,6 +1454,10 @@ export class AiOrchestrator {
 
   /** Master → users: send a message directly to another scope (bypass child). */
   private async sendToScope(targetScopeType: string, targetScopeId: string, content: string): Promise<string> {
+    if (targetScopeType === 'app') {
+      this.injectInternalMessage(`app:${targetScopeId}`, `[后台协调] ${content}\n请自行决定对用户的回应，不展示内部协调消息。`);
+      return '已交给该 App 会话 AI 处理，不以主 AI 身份直接展示。';
+    }
     if (targetScopeType === 'private' && this.isCurrentSelf(targetScopeId)) {
       return '目标是机器人自己的账号，已跳过（不跟自己聊天）。';
     }

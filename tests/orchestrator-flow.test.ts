@@ -24,6 +24,41 @@ import { IntelCollector } from '../src/relations/collector.js';
 import type { NapcatBot } from '../src/bot/napcat.js';
 import type { ChatMessage } from '../src/chat/types.js';
 import { configureImageCache } from '../src/chat/image-cache.js';
+import { configureMcBot } from '../src/chat/tools.js';
+
+test('Minecraft speech wakes MC domain and send_message replies in game without QQ or master relay', async () => {
+  const harness = await makeHarness([
+    { tool: 'send_message', input: { content: '在，一起玩吧' } },
+    { tool: 'stay_silent', input: {} },
+  ]);
+  const modelFetch = globalThis.fetch;
+  const gameSent: string[] = [];
+  const online = '在线：DeepLive @ 127.0.0.1:25565（26.2 / 协议 776，Rust 后端，离线）';
+  configureMcBot('http://mc-sidecar.test', 'test');
+  globalThis.fetch = (async (url, init) => {
+    if (String(url).startsWith('http://mc-sidecar.test')) {
+      const target = new URL(String(url));
+      if (target.pathname === '/status') return Response.json({ ok: true, message: online });
+      assert.equal(target.pathname, '/chat'); gameSent.push(target.searchParams.get('message')!);
+      return Response.json({ ok: true, message: 'sent' });
+    }
+    return modelFetch(url, init);
+  }) as typeof fetch;
+  try {
+    harness.orchestrator.handleMessage({
+      chatType: 'domain', chatId: 'mc', userId: -123, text: 'DeepLive 在吗', rawMessage: 'DeepLive 在吗',
+      sender: { nickname: 'Minecraft:player' }, messageId: 'mc:test:1', mentionsSelf: true,
+      timestamp: Date.now() / 1000, rawData: { source: 'minecraft_chat', mc_connection: online, mc_username: 'player' },
+    });
+    await waitFor(() => gameSent.length === 1);
+    assert.deepEqual(gameSent, ['在，一起玩吧']);
+    assert.equal(harness.sent.length, 0); assert.equal(harness.datalineSent.length, 0);
+    assert.ok(harness.repo.getMessages('domain', 'mc').some((entry) => entry.source_kind === 'minecraft_chat'));
+    assert.ok(!harness.repo.getMessages('master', 'core').some((entry) => entry.text.includes('在，一起玩吧')));
+  } finally {
+    await harness.cleanup(); configureMcBot('http://127.0.0.1:7660', '');
+  }
+});
 
 interface Harness {
   orchestrator: AiOrchestrator;
@@ -1302,4 +1337,29 @@ test('请示回执：domain_message 直回来源会话即算回执，子AI收到
   } finally {
     await harness.cleanup();
   }
+});
+
+
+test('mobile user gets a separate child context and reply transport without master or QQ output', async () => {
+  const id = 'a28f7d24-155c-493b-aef9-166a91beef70';
+  const harness = await makeHarness([
+    { tool: 'send_message', input: { content: '独立会话的回答' } },
+    { tool: 'stay_silent', input: {} },
+  ]);
+  try {
+    harness.repo.appendMessage('master', 'core', { user_id: 0, nickname: '后台', text: '隐藏的主AI上下文', timestamp: 1 });
+    harness.orchestrator.handleMobileMessage(id, '手机用户的消息');
+    await waitFor(() => harness.repo.getMessages('app', id).some(e => e.raw_source === 'app_ai'));
+    const history = harness.repo.getMessages('app', id);
+    assert.ok(history.some(e => e.text === '手机用户的消息' && e.user_id === -1));
+    assert.ok(history.some(e => e.text === '独立会话的回答' && e.raw_source === 'app_ai'));
+    assert.equal(harness.sent.length, 0);
+    assert.equal(harness.datalineSent.length, 0);
+    assert.ok(!harness.repo.getMessages('master', 'core').some(e => e.text === '手机用户的消息'));
+    const request = JSON.stringify(harness.modelRequests[0]);
+    assert.ok(!request.includes('隐藏的主AI上下文'));
+    assert.ok(request.includes('你是独立的用户会话 AI'));
+    const tools = harness.modelRequests[0]!.tools as {name: string}[];
+    assert.ok(!tools.some(t => ['delegate_to_child', 'message_scope', 'send_image'].includes(t.name)));
+  } finally { await harness.cleanup(); }
 });
