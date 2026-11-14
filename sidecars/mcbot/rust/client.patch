@@ -1,0 +1,398 @@
+diff --git a/crates/client/src/live.rs b/crates/client/src/live.rs
+index d87f77f..9e1b9f5 100644
+--- a/crates/client/src/live.rs
++++ b/crates/client/src/live.rs
+@@ -1826,6 +1826,34 @@ fn refresh_recipe_replay(data: &mut Shared) {
+         replay.refresh(data.ui.recipe_collections_generation, craftable);
+     }
+ }
++/// 外部控制面（bot op）排队、由主循环直发的方块/实体动作。
++/// 不经过鼠标/视角模拟层，直接构造原版交互包。
++enum PendingBlockAction {
++    /// 挖方块：先发 START，停留 hold_ms 后再发 STOP。
++    Dig {
++        pos: [i32; 3],
++        face: u8,
++        hold_ms: u64,
++        started: Option<Instant>,
++    },
++    /// 右键方块：命中点取目标面中心，发 use_on（放方块/开箱子/用物品）。
++    UseOn { pos: [i32; 3], face: u8 },
++    /// 攻击实体：直接发攻击包 + 挥手。
++    Attack { entity: i32 },
++}
++
++/// 附近实体快照（`entities` bot op 用）；主循环约每 4 tick 刷新一次。
++#[derive(Clone)]
++pub struct EntityInfo {
++    pub id: i32,
++    pub kind: u32,
++    pub name: String,
++    pub position: [f64; 3],
++    /// 客户端从实体元数据同步的生命值；非生物实体是生成时的占位初值。
++    pub health: f32,
++    pub max_health: f32,
++}
++
+ struct Shared {
+     social: crate::chat_social::State,
+     social_hold: Option<Arc<crate::chat_social::HeldSystemMessage>>,
+@@ -1889,6 +1917,10 @@ struct Shared {
+     dialog_effects: crate::server_dialog::EffectQueue,
+     book_updates: VecDeque<(u64, u8, Vec<String>, Option<String>)>,
+     sign_updates: VecDeque<Vec<u8>>,
++    /// 外部控制面直发的方块/实体动作（bot op 排队，主循环排空）。
++    pending_block_actions: VecDeque<PendingBlockAction>,
++    /// 附近实体只读快照，供 `entities` op / 攻击目标选择。
++    entity_roster: Vec<EntityInfo>,
+     sign_previews: VecDeque<(u64, [i32; 3], bool, mc_game::signs::Prediction)>,
+     editing_sign: Option<([i32; 3], u32)>,
+     maps: mc_game::maps::Store,
+@@ -2023,6 +2055,8 @@ impl Shared {
+             dialog_effects: Default::default(),
+             book_updates: Default::default(),
+             sign_updates: Default::default(),
++            pending_block_actions: Default::default(),
++            entity_roster: Vec::new(),
+             sign_previews: Default::default(),
+             editing_sign: None,
+             maps: mc_game::maps::Store::new(mc_game::maps::reserved_budget(options.budget)),
+@@ -3118,6 +3152,14 @@ impl LiveSession {
+         data.inventory_actions
+             .push(InventoryAction::QuickMove(slot, button));
+     }
++    /// 数字键交换：把 `slot` 与快捷栏 `button` 格互换（GUI 悬停按 1-9 的同款动作）。
++    pub fn inventory_swap(&self, slot: i16, button: u8) {
++        self.shared
++            .lock()
++            .unwrap()
++            .inventory_actions
++            .push(InventoryAction::Swap(slot, button));
++    }
+     pub fn request_respawn(&self) {
+         self.shared.lock().unwrap().respawn_requested = true;
+     }
+@@ -3493,6 +3535,48 @@ impl LiveSession {
+         state.editing_sign = None;
+         Ok(())
+     }
++    /// 直发挖方块（headless 控制面）：排队后由主循环发 START，hold_ms 后发 STOP。
++    pub fn dig_at(&self, pos: [i32; 3], face: u8, hold_ms: u64) -> Result<()> {
++        let mut data = self.shared.lock().unwrap();
++        if data.pending_block_actions.len() >= 16 {
++            return Err("Block action queue exceeds budget".into());
++        }
++        data.pending_block_actions
++            .push_back(PendingBlockAction::Dig {
++                pos,
++                face,
++                hold_ms,
++                started: None,
++            });
++        Ok(())
++    }
++    /// 直发右键方块（放方块/开箱子/用物品）：命中点取目标面中心。
++    pub fn use_at(&self, pos: [i32; 3], face: u8) -> Result<()> {
++        let mut data = self.shared.lock().unwrap();
++        if data.pending_block_actions.len() >= 16 {
++            return Err("Block action queue exceeds budget".into());
++        }
++        data.pending_block_actions
++            .push_back(PendingBlockAction::UseOn { pos, face });
++        Ok(())
++    }
++    /// 直发攻击实体：无需瞄准或转动视角。
++    pub fn attack_entity(&self, entity: i32) -> Result<()> {
++        if entity < 0 {
++            return Err("Negative attack entity ID".into());
++        }
++        let mut data = self.shared.lock().unwrap();
++        if data.pending_block_actions.len() >= 16 {
++            return Err("Block action queue exceeds budget".into());
++        }
++        data.pending_block_actions
++            .push_back(PendingBlockAction::Attack { entity });
++        Ok(())
++    }
++    /// 附近实体快照（主循环约每 4 tick 刷新）：id/kind/name/position。
++    pub fn entities(&self) -> Vec<EntityInfo> {
++        self.shared.lock().unwrap().entity_roster.clone()
++    }
+     pub fn plain_chat_suggestions(
+         &self,
+         id: i32,
+@@ -4432,6 +4516,22 @@ struct Restart {
+     models: ModelLibrary,
+     options: LiveOptions,
+ }
++/// 给定方块坐标与朝向，返回该面中心的世界坐标点（use_on 包的 cursor 位置）。
++fn face_point(pos: [i32; 3], face: u8) -> [f64; 3] {
++    let (dx, dy, dz) = match face {
++        0 => (0.5, 0.0, 0.5), // down
++        1 => (0.5, 1.0, 0.5), // up
++        2 => (0.5, 0.5, 0.0), // north (-Z)
++        3 => (0.5, 0.5, 1.0), // south (+Z)
++        4 => (0.0, 0.5, 0.5), // west (-X)
++        _ => (1.0, 0.5, 0.5), // east (+X)
++    };
++    [
++        f64::from(pos[0]) + dx,
++        f64::from(pos[1]) + dy,
++        f64::from(pos[2]) + dz,
++    ]
++}
+ #[rustfmt::skip]
+ fn run(
+     mut conn: mc_protocol::pump::PacketPump,
+@@ -5162,6 +5262,7 @@ fn run(
+             }
+         }
+     }};}
++    let mut roster_tick: u64 = 0;
+     while !stop.load(Ordering::Acquire) {
+         if let Some(packet)=secure_chat.poll_key(crate::auth::chat::Stamp::now()?,world.is_some())? {conn.send(&packet)?;}
+         drain_chat_deliveries(&mut secure_chat,&chat_types,&pack_layout.language,&dialog_registry,&shared)?;
+@@ -6807,7 +6908,9 @@ fn run(
+                         if *id==entity_id { !(play && remote_entities.supports_local_mount(update.vehicle,entity_id)) }
+                         else { remote_entities.get(*id).is_some_and(|entity|mc_game::entities::rendered_kind(entity.kind)) && !(play && remote_entities.supports_rider_position(update.vehicle,*id)) }
+                     });
+-                    if visible_rider { return Err("Passenger relationship decoded, but mounted player/entity seat transforms and controls are not implemented".into()); }
++                    // headless 侧车没有渲染层：骑乘座位的视觉变换缺失不影响物理/方块访问，
++                    // 直接放行（曾在蜘蛛骑士生成时把整个客户端打死，bot 掉线）。
++                    if visible_rider { eprintln!("LIVE_PASSENGERS unsupported seat transforms ignored"); }
+                     let mounted=applied.mounted;
+                     let mut data=shared.lock().unwrap();
+                     data.ui.mounted_vehicle=mounted;
+@@ -8646,6 +8749,122 @@ fn run(
+             }
+         }
+         while let Some(packet)=shared.lock().unwrap().sign_updates.pop_front() {conn.send(&packet)?;eprintln!("SIGN_UPDATE_SENT bytes={}",packet.len());}
++        // 外部控制面直发动作：不经过鼠标/视角层，直接构造原版交互包。
++        // 序号从 Interactor 的待确认链分配，服务端确认仍由 acknowledge 消费。
++        roster_tick = roster_tick.wrapping_add(1);
++        if roster_tick & 3 == 0 {
++            let roster: Vec<EntityInfo> = remote_entities
++                .all_entities()
++                .map(|e| EntityInfo {
++                    id: e.id,
++                    kind: e.kind,
++                    name: match mc_game::mob_names::key(e.kind) {
++                        Some(key) => key.to_owned(),
++                        None if e.kind == PLAYER_KIND => "player".to_owned(),
++                        // 非生物实体也常出现在周边（掉落物/下落方块），给个可读名便于过滤。
++                        None if e.kind == mc_game::entities::ITEM_KIND => "item".to_owned(),
++                        None if e.kind == mc_game::entities::FALLING_BLOCK_KIND => "falling_block".to_owned(),
++                        None if e.kind == mc_game::entities::EXPERIENCE_ORB_KIND => "xp_orb".to_owned(),
++                        None => String::new(),
++                    },
++                    position: e.position,
++                    health: e.collision_health,
++                    max_health: e.max_health,
++                })
++                .collect();
++            shared.lock().unwrap().entity_roster = roster;
++        }
++        loop {
++            enum Step {
++                StartDig([i32; 3], u8),
++                FinishDig([i32; 3], u8),
++                UseOn([i32; 3], u8),
++                Attack(i32),
++                Wait,
++            }
++            let now = Instant::now();
++            let step = {
++                let mut data = shared.lock().unwrap();
++                let (start_dig, finish_dig, use_on, attack) =
++                    match data.pending_block_actions.front() {
++                        None => (None, None, None, None),
++                        Some(PendingBlockAction::Dig {
++                            pos,
++                            face,
++                            hold_ms,
++                            started,
++                        }) => match *started {
++                            None => (Some((*pos, *face)), None, None, None),
++                            Some(t)
++                                if now.duration_since(t).as_millis() as u64 >= *hold_ms =>
++                            {
++                                (None, Some((*pos, *face)), None, None)
++                            }
++                            Some(_) => (None, None, None, None),
++                        },
++                        Some(PendingBlockAction::UseOn { pos, face }) => {
++                            (None, None, Some((*pos, *face)), None)
++                        }
++                        Some(PendingBlockAction::Attack { entity }) => {
++                            (None, None, None, Some(*entity))
++                        }
++                    };
++                if start_dig.is_some()
++                    && let Some(PendingBlockAction::Dig { started, .. }) =
++                        data.pending_block_actions.front_mut()
++                {
++                    *started = Some(now);
++                }
++                if finish_dig.is_some() || use_on.is_some() || attack.is_some() {
++                    data.pending_block_actions.pop_front();
++                }
++                if let Some((pos, face)) = start_dig {
++                    Step::StartDig(pos, face)
++                } else if let Some((pos, face)) = finish_dig {
++                    Step::FinishDig(pos, face)
++                } else if let Some((pos, face)) = use_on {
++                    Step::UseOn(pos, face)
++                } else if let Some(entity) = attack {
++                    Step::Attack(entity)
++                } else {
++                    Step::Wait
++                }
++            };
++            match step {
++                Step::Wait => break,
++                Step::StartDig(pos, face) => {
++                    let sequence = interactor.allocate_sequence()?;
++                    conn.send(&mc_game::interaction::dig_packet(0, pos, face, sequence))?;
++                    eprintln!("DIG_AT_START pos={pos:?} face={face} seq={sequence}");
++                }
++                Step::FinishDig(pos, face) => {
++                    let sequence = interactor.allocate_sequence()?;
++                    conn.send(&mc_game::interaction::dig_packet(2, pos, face, sequence))?;
++                    eprintln!("DIG_AT_DONE pos={pos:?} face={face} seq={sequence}");
++                }
++                Step::UseOn(pos, face) => {
++                    let state = world
++                        .as_ref()
++                        .and_then(|world| world.block_state(pos[0], pos[1], pos[2]))
++                        .unwrap_or(0);
++                    let hit = Hit {
++                        pos,
++                        face,
++                        point: face_point(pos, face),
++                        inside: false,
++                        state,
++                    };
++                    let sequence = interactor.allocate_sequence()?;
++                    conn.send(&mc_game::interaction::use_on_packet(hit, sequence))?;
++                    eprintln!("USE_AT pos={pos:?} face={face} seq={sequence}");
++                }
++                Step::Attack(entity) => {
++                    conn.send(&mc_game::interaction::attack_entity_packet(entity)?)?;
++                    conn.send(&[63, 0])?;
++                    eprintln!("ATTACK_ENTITY id={entity}");
++                }
++            }
++        }
+         loop {
+             let update=shared.lock().unwrap().book_updates.pop_front();
+             let Some((expected_generation,slot,pages,title))=update else {break;};
+@@ -10228,7 +10447,12 @@ fn run(
+                     let mut actions = data.actions;
+                     let admitted=key_context.is_none_or(|p|!p.screen&&!p.overlay);
+                     if key_context.is_some_and(|p|p.screen){data.key_clicks=Default::default();data.actions.pick_item=None;}
+-                    let clicks=if admitted{data.key_clicks.take_bounded()?}else{Default::default()};
++                    let mut clicks=if admitted{data.key_clicks.take_bounded()?}else{Default::default()};
++                    // 无头 bot：同 tick 多个 attack/use 点击本无意义（一挥一 tick），
++                    // 世界停转时操作堆积会触发 Repeated stateful attack 致命错误，钳到 1。
++                    if clicks.attack>1{eprintln!("CLICK_CLAMP attack {} -> 1",clicks.attack);clicks.attack=1;}
++                    if clicks.use_item>1{eprintln!("CLICK_CLAMP use {} -> 1",clicks.use_item);clicks.use_item=1;}
++                    if clicks.pick>1{clicks.pick=1;}
+                     actions.attack_click=clicks.attack>0;actions.use_click=clicks.use_item>0;
+                     if clicks.pick<=0{actions.pick_item=None;}
+                     data.controls.look = [0.; 2];
+@@ -11242,22 +11466,9 @@ let key=tracking_anchor(entity_id,entity_id,local_player_uuid,shared.lock().unwr
+             hurt_ticks = hurt_ticks.saturating_sub(1);
+             remote_entities.controlled_boat = remote_entities.local_boat_controller(entity_id);
+             remote_entities.validate_boat_controllers()?;
+-            for (id, vehicle) in remote_entities.riding.links() {
+-                let rendered = id == entity_id
+-                    || remote_entities
+-                        .get(id)
+-                        .is_some_and(|entity| mc_game::entities::rendered_kind(entity.kind));
+-                if rendered
+-                    && !(play
+-                        && if id == entity_id {
+-                            remote_entities.supports_local_mount(vehicle, entity_id)
+-                        } else {
+-                            remote_entities.supports_rider_position(vehicle, id)
+-                        })
+-                {
+-                    return Err("Mounted player/entity pose, seat or control is not implemented for this state".into());
+-                }
+-            }
++            // headless 侧车不渲染座位变换：骑乘关系（蜘蛛骑士/鸡骑士/僵尸马等）
++            // 只影响视觉姿态，不影响物理和方块访问，放行不报错——此前这里会把整个
++            // 客户端打死（实机 11-06：野外刷出骑乘怪 → bot 瞬间掉线）。热路径不打日志。
+             let local_collision = if remote_entities.local_entity_identity()?.is_some() {
+                 Some(mc_game::entities::LocalPlayerCollision::from_player(
+                     entity_id,
+@@ -12689,6 +12900,20 @@ let key=tracking_anchor(entity_id,entity_id,local_player_uuid,shared.lock().unwr
+                 data.camera_world = Some(snapshot);
+             }
+         }
++        // headless（无窗口、无 frame request）也要发布世界快照：bot 的 scan op
++        // 靠它直读客户端区块缓存（RCON 一格一探要几分钟）。capture 按
++        // generation/revision 缓存，世界没变时是 Arc 克隆，零拷贝。
++        if play && let Some(world) = world.as_ref() {
++            let snapshot = world_snapshots.capture(world, generation);
++            let mut data = shared.lock().unwrap();
++            if data
++                .camera_world
++                .as_ref()
++                .is_none_or(|old| !Arc::ptr_eq(old, &snapshot))
++            {
++                data.camera_world = Some(snapshot);
++            }
++        }
+         if resource_state.upload.is_some() {
+             let data = shared.lock().unwrap();
+             entities_dirty |= data.pack_reload.is_none();
+diff --git a/crates/client/src/main.rs b/crates/client/src/main.rs
+index 8ff2b50..88a01dd 100644
+--- a/crates/client/src/main.rs
++++ b/crates/client/src/main.rs
+@@ -23,6 +23,7 @@ mod totem_activation;
+ mod totem_hud_gpu_tests;
+ mod auth;
+ mod session_probe;
++mod bot;
+ mod client_chat;
+ mod chat_social;
+ mod player_skin_service;
+@@ -13949,6 +13950,7 @@ fn run() -> Result<()> {
+             eprintln!("Ping: {:.2} ms", ping.as_secs_f64() * 1000.);
+         }
+         Some("session-probe") => session_probe::command(&args[1..])?,
++        Some("bot") => bot::command(&args[1..])?,
+         Some("photon-cache-check") if args.len()==2 => {
+             let cache=photon_cache::Bundle::read(std::path::Path::new(&args[1]))?;
+             println!("PHOTON_CACHE_DATA_OK profile={} world={} programs={} spirv_bytes={} manifest_sha256={} GPU_started=false full_photon=false",cache.info.profile,cache.info.world,cache.info.programs,cache.info.spirv_bytes,cache.info.manifest_sha256);
+diff --git a/crates/client/src/session_probe.rs b/crates/client/src/session_probe.rs
+index 993cb0f..7cc1c9f 100644
+--- a/crates/client/src/session_probe.rs
++++ b/crates/client/src/session_probe.rs
+@@ -166,7 +166,7 @@ fn explicit_config(path: &std::path::Path) -> std::result::Result<Config, &'stat
+     }
+     Ok(config)
+ }
+-fn options(
++pub(crate) fn options(
+     config: &Config,
+     auth: Option<Arc<AuthSession>>,
+     progress: Progress,
+diff --git a/crates/game/src/interaction.rs b/crates/game/src/interaction.rs
+index db69324..c82cd57 100644
+--- a/crates/game/src/interaction.rs
++++ b/crates/game/src/interaction.rs
+@@ -1886,6 +1886,11 @@ impl Interactor {
+     pub fn current_sequence(&self) -> i32 {
+         self.sequence
+     }
++    /// 外部控制面（headless bot）直发方块动作时分配序号：与内部 use/dig 共用
++    /// 同一条未确认链，服务端的确认包仍走 `acknowledge`。
++    pub fn allocate_sequence(&mut self) -> Result<i32> {
++        self.sequence()
++    }
+     pub fn take_trident_release(&mut self) -> Option<(ItemStack, crate::trident::ReleaseState)> {
+         self.trident_release.take()
+     }

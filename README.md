@@ -24,6 +24,11 @@ DeepLive 参考 OpenClaw、DeepSeek Harness 的设计思路，以**长期记忆�
 
 插件均为声明式 HTTP 工具（`data/plugins/<name>/plugin.json`），改文件 + `plugin_manage reload` 热加载，见 `data/plugins/README.md`。
 
+Minecraft 插件需要单独启动边车，源码已随仓库放在 [`sidecars/mcbot/`](sidecars/mcbot/README.md)。
+新部署先执行 `npm --prefix sidecars/mcbot ci`、`npm --prefix sidecars/mcbot start`，
+再将边车生成的 token 配入 `data/plugins/secrets.json` 的 `MCBOT_TOKEN`。
+26.2 另需构建仓库内的 Rust 适配并准备官方资源/运行资料，详见边车文档；只启动 DeepLive 主进程不会自动提供边车。
+
 ## 项目目标
 
 DeepLive 是一个由单一宿主进程管理的模块化 Node.js 应用，连接以下几类能力：

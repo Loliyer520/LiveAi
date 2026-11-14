@@ -1,0 +1,14 @@
+node_modules/
+config.json
+server-profiles.json
+mc-accounts.json
+behaviors.json
+runtime/
+bin/
+.cache/
+.env
+.env.*
+*.log
+*.bak*
+test-server/
+test-server-26.2/

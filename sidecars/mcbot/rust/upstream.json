@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/ls-jl/MC26.2_RustClient.git",
+  "revision": "73f9c8796c806e4b1c9d4f4b0daf4e144b6bfb5d",
+  "license": "MIT (upstream workspace declaration)",
+  "localFiles": {
+    "bot.rs": "crates/client/src/bot.rs"
+  },
+  "patch": "client.patch"
+}

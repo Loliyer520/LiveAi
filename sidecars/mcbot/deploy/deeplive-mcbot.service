@@ -1,0 +1,17 @@
+[Unit]
+Description=DeepLive Minecraft sidecar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/LiveAi/sidecars/mcbot
+ExecStart=/usr/bin/env node /opt/LiveAi/sidecars/mcbot/server.js
+# Optional RCON for a server you administer:
+# Environment=MC_SERVER_PROPERTIES=/path/to/minecraft/server.properties
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

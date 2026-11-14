@@ -1,0 +1,25 @@
+{
+  "name": "@deeplive/mcbot",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Minecraft Java sidecar for DeepLive (Mineflayer + Rust 26.2 LiveSession + HTTP)",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test scheduler.test.mjs rust-backend.test.mjs behaviors.test.mjs auth-prompt.test.mjs server-profiles.test.mjs auth-flow.test.mjs kick-reason.test.mjs join-hook.test.mjs deployment.test.mjs",
+    "test:live": "node --test rust-live.test.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "build:rust": "node scripts/build-rust.mjs"
+  },
+  "dependencies": {
+    "mineflayer": "^4.39.0",
+    "mineflayer-collectblock": "^1.6.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "prismarine-viewer": "^1.33.0",
+    "minecraft-protocol": "^1.68.0",
+    "vec3": "^0.1.10"
+  },
+  "engines": {
+    "node": ">=22.16"
+  }
+}
